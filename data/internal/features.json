@@ -1,0 +1,820 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-13",
+  "entries": [
+
+    {
+      "feature_id": "recommend",
+      "display_name": "Recommend",
+      "category": "toolbar",
+      "location_hint": "Top toolbar",
+      "short_description": "Given a budget, what should you buy?",
+      "long_description": "Recommend turns the AI's open BUY predictions into a buy list you can actually act on. The window shows three options side by side: ALL IN (one big position), A FEW (a small concentrated set), and DIVERSIFY (spread across more names). It doesn't run new analysis — it summarizes what your scans have already turned up. The better and more recent your scans, the more useful Recommend is.",
+      "keywords": ["recommend", "what should i buy", "budget", "what to buy", "all in", "a few", "diversify", "buy list", "what to invest in"],
+      "aliases": ["Buy Picks", "Recommendations"],
+      "prerequisites": ["ai_module_loaded", "open_buy_predictions"],
+      "unmet_prerequisite_hints": {
+        "open_buy_predictions": "Recommend works from the AI's open BUY calls. Run a Scan first to give it something to recommend from."
+      },
+      "related_feature_ids": ["scan", "scan_all", "predictions_log", "path_concept"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "scan_all",
+      "display_name": "Scan All",
+      "category": "toolbar",
+      "location_hint": "Top toolbar",
+      "short_description": "Run a scan across all 5 paths in one go.",
+      "long_description": "Scan All runs a full multi-path sweep with one model. It walks through every analysis path (slow_safe, moderate, aggressive, lottery, penny_lottery) one at a time, and for each path it scans adaptively — stopping once it finds 5 BUYs, with a 15-candidate floor before it's allowed to stop. Total time is typically 30 to 90 minutes depending on your model and universe. You can cancel at any time using the Stop button.",
+      "keywords": ["scan all", "all paths", "full scan", "long scan", "everything", "sweep"],
+      "prerequisites": ["ai_module_loaded", "discover_module_loaded"],
+      "related_feature_ids": ["scan", "stop_resume", "path_concept", "recommend"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "scan",
+      "display_name": "Scan",
+      "category": "toolbar",
+      "location_hint": "Top toolbar (right-click for the full Discover panel)",
+      "short_description": "Run a multi-model scan against the latest data snapshot.",
+      "long_description": "Scan asks several AI models the same question — which stocks in the universe look like buys right now? — using the latest cached data. You configure which models participate in Settings → AI → Models to run. Right-click the button instead of left-clicking to open the full Discover panel, which gives you direct control over universe, path, and model selection before the scan runs.",
+      "keywords": ["scan", "discover", "multi model", "what's worth buying", "find stocks"],
+      "prerequisites": ["ai_module_loaded", "discover_module_loaded", "at_least_one_voice"],
+      "unmet_prerequisite_hints": {
+        "at_least_one_voice": "Scan needs at least one AI voice. Add a cloud provider in Settings → AI Sources."
+      },
+      "related_feature_ids": ["scan_all", "discover_panel", "setting_models_to_run", "consensus_voting"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "track_record",
+      "display_name": "Track Record",
+      "category": "toolbar",
+      "location_hint": "Top toolbar",
+      "short_description": "How accurate the AI's predictions have been over time.",
+      "long_description": "Track Record shows how the AI has actually performed — paper accuracy on its predictions plus your real trade history side by side. The Accuracy Matrix breaks results down per model and per path, so you can see which voices have earned trust and which haven't. Use this to decide which models to weight more heavily, and to keep yourself honest about whether the AI is actually helping.",
+      "keywords": ["track record", "accuracy", "history", "performance", "how well", "did the ai work", "hit rate"],
+      "related_feature_ids": ["accuracy_matrix", "trade_history", "predictions_log"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "look_up",
+      "display_name": "Look Up",
+      "category": "toolbar",
+      "location_hint": "Top toolbar",
+      "short_description": "Get a quick AI read on any stock you type in.",
+      "long_description": "Look Up is the fastest way to ask the AI about one specific stock. Type a ticker, pick an analysis path, and you get a quick read back. There's also an optional full consensus mode for when you want the deep dive — multiple voices weighing in instead of one. Use Look Up when you've got a stock in mind and just want to know what the AI thinks.",
+      "keywords": ["look up", "lookup", "specific stock", "what does the ai think", "ticker", "ask about", "check a stock"],
+      "aliases": ["Lookup", "Stock Lookup"],
+      "prerequisites": ["ai_module_loaded"],
+      "related_feature_ids": ["consensus_voting", "path_concept", "ai_chat"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "ai_chat",
+      "display_name": "AI Chat",
+      "category": "toolbar",
+      "location_hint": "Top toolbar",
+      "short_description": "Free-form conversation with an AI. No portfolio context unless turned on.",
+      "long_description": "AI Chat opens a separate window for an open-ended conversation with one AI model. It's the right surface when your question doesn't fit a stock-specific tool — \"explain dollar-cost averaging\", \"what's a good stop-loss strategy\", or anything else you'd ask a smart friend who knows markets. By default the AI doesn't see your portfolio; you can turn that on in Settings if you want it to know what you own. Inside AI Chat, typing /faq before your question runs the built-in FAQ instead of calling the model.",
+      "keywords": ["ai chat", "chat", "conversation", "talk to ai", "ask a question", "free form"],
+      "prerequisites": ["ai_module_loaded"],
+      "related_feature_ids": ["faq_slash_command", "setting_ai_behavior", "look_up"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "stop_resume",
+      "display_name": "Stop / Resume",
+      "category": "toolbar",
+      "location_hint": "Top toolbar",
+      "short_description": "Toggle the background auto-refresh scheduler on or off.",
+      "long_description": "Stop / Resume controls the background scheduler that re-checks your holdings on its own. When the scheduler is running, the button shows Stop; when paused, it shows Resume. Use Stop to halt anything currently in flight (a long Scan All, for example) and to keep the AI quiet until you're ready to bring it back.",
+      "keywords": ["stop", "resume", "pause", "halt", "cancel", "background", "scheduler"],
+      "related_feature_ids": ["ai_badge", "setting_ai_behavior"],
+      "since_version": "v4.14.1.2"
+    },
+
+    {
+      "feature_id": "menu",
+      "display_name": "Menu (≡)",
+      "category": "toolbar",
+      "location_hint": "Top toolbar (rightmost)",
+      "short_description": "Help, Settings, and Exit.",
+      "long_description": "The hamburger menu (≡) at the right edge of the toolbar opens a small dropdown with three things: Help, Settings, and Exit. Settings is where you tune the AI's behavior, models, providers, paths, and almost every other persistent preference.",
+      "keywords": ["menu", "hamburger", "settings menu", "options"],
+      "aliases": ["Hamburger", "Options Menu"],
+      "related_feature_ids": ["setting_simple_advanced_toggle"]
+    },
+
+    {
+      "feature_id": "ai_badge",
+      "display_name": "AI Badge",
+      "category": "panel",
+      "location_hint": "Top-right header strip",
+      "short_description": "Click to pause or resume the AI globally.",
+      "long_description": "The AI badge in the top-right header shows whether the AI is currently allowed to run. Click it to pause or resume. When paused, Run Consensus, Look Up, Scan, and similar AI actions all become no-ops until you resume. Useful when you want to read the screen quietly without the AI starting new work.",
+      "keywords": ["ai badge", "pause", "resume", "stop ai", "quiet", "ai indicator"],
+      "related_feature_ids": ["ai_mode_pill", "stop_resume"]
+    },
+
+    {
+      "feature_id": "ai_mode_pill",
+      "display_name": "AI Mode Pill",
+      "category": "panel",
+      "location_hint": "Top-right header strip, left of the AI badge",
+      "short_description": "Shows which AI sources are currently allowed: Local, API, or Hybrid.",
+      "long_description": "The AI Mode pill shows which AI sources can run right now. Local means only local Ollama models. API means only cloud providers. Hybrid means cloud is primary, with Ollama as a fallback when cloud is exhausted. Change the mode through the ≡ menu → AI Mode.",
+      "keywords": ["ai mode", "local", "api", "hybrid", "which ai", "cloud or local"],
+      "related_feature_ids": ["inference_mode_dialog", "setting_ai_sources", "ai_badge"]
+    },
+
+    {
+      "feature_id": "freshness_indicator",
+      "display_name": "Freshness Indicator",
+      "category": "panel",
+      "location_hint": "Top-right header strip",
+      "short_description": "Shows when the underlying market data was last refreshed.",
+      "long_description": "The freshness indicator tells you how recently the market data feeding the app was last updated. A green dot means data is fresh (under 24 hours), yellow means it's getting stale (1 to 7 days), red means it's old (over 7 days). The clock next to it shows current local time. If you're seeing red, AI calls are still possible but the data they're reasoning over may not reflect today's market.",
+      "keywords": ["freshness", "data age", "last refresh", "stale", "old data", "when did data update"],
+      "related_feature_ids": ["freshness_states_concept", "setting_auto_refresh"]
+    },
+
+    {
+      "feature_id": "teacher_ai_corner_indicator",
+      "display_name": "Teacher AI Corner Indicator",
+      "category": "panel",
+      "location_hint": "Top-right corner of the main window",
+      "short_description": "Click for a quick built-in FAQ answer to any question.",
+      "long_description": "The small indicator in the top-right corner is the entry point to Teacher AI — the built-in FAQ helper. Click it (or press Ctrl+`) to summon a question box; type your question and Teacher AI will look for a matching answer in the bundled FAQ. No model call, no cost, instant. Use it when you want quick guidance about how Tired Market itself works.",
+      "keywords": ["corner indicator", "teacher ai", "help", "faq", "how do i", "what does this do"],
+      "aliases": ["Help Corner", "FAQ Indicator"],
+      "related_feature_ids": ["hotkey_summon_teacher_ai", "hotkey_tutorial_mode", "faq_slash_command"]
+    },
+
+    {
+      "feature_id": "portfolio_summary_card",
+      "display_name": "Portfolio Summary Card",
+      "category": "panel",
+      "location_hint": "Top of the main window",
+      "short_description": "Your total holdings value, cash, and realized P&L at a glance.",
+      "long_description": "The portfolio summary card shows the headline numbers for your account — total holdings value, cash on hand, and realized profit and loss from positions you've already closed. Clicking the dollar total opens Trade History so you can see the closed positions behind the realized number. The card updates automatically as your holdings change.",
+      "keywords": ["portfolio", "summary", "total value", "cash", "p&l", "profit and loss", "realized"],
+      "related_feature_ids": ["trade_history", "ticker_bar", "holding_cards"]
+    },
+
+    {
+      "feature_id": "choices_summary_strip",
+      "display_name": "Choices Summary Strip",
+      "category": "panel",
+      "location_hint": "Below the portfolio summary",
+      "short_description": "One-line summary of your current price ranges and trading style.",
+      "long_description": "The choices strip is a one-line summary that reads \"Looking for: [your price ranges] · [your style]\". It tells the AI what kind of stocks you actually want to see — for example, penny + aggressive vs. mid-cap + conservative. The whole strip is clickable; clicking opens the full Choices modal so you can adjust either side.",
+      "keywords": ["choices", "looking for", "price range", "style", "preferences"],
+      "related_feature_ids": ["choices_modal"]
+    },
+
+    {
+      "feature_id": "ticker_bar",
+      "display_name": "Per-Share Ticker Bar",
+      "category": "panel",
+      "location_hint": "Below the action button row",
+      "short_description": "Live per-share price and daily change for each holding.",
+      "long_description": "The ticker bar runs across the screen showing the current per-share price and today's percent change for every position you hold. It's the at-a-glance \"what's moving\" view, separate from the full holding cards below it.",
+      "keywords": ["ticker bar", "prices", "per share", "today's change", "daily change", "live prices"],
+      "related_feature_ids": ["portfolio_summary_card", "holding_cards", "freshness_indicator"]
+    },
+
+    {
+      "feature_id": "holding_cards",
+      "display_name": "Holding Cards",
+      "category": "panel",
+      "location_hint": "Main window, below the ticker bar",
+      "short_description": "Per-position cards with consensus, sell triggers, and actions.",
+      "long_description": "Each position you own gets a card. The card shows the position snapshot (shares, entry price, current value, profit/loss), a consensus block summarizing what the AI voices say to do, and a plan block with the AI's most recent target and stop-loss. Action buttons let you re-run consensus, remove the position, or sell. Locked positions show as a smaller collapsed card with no AI activity.",
+      "keywords": ["holding card", "position", "my stock", "consensus", "target", "stop", "sell trigger"],
+      "aliases": ["Position Card"],
+      "related_feature_ids": ["consensus_voting", "verdict_owned_concept", "freshness_states_concept", "add_holding_form"]
+    },
+
+    {
+      "feature_id": "add_holding_form",
+      "display_name": "Add Holding Form",
+      "category": "panel",
+      "location_hint": "Pinned at the bottom of the main window",
+      "short_description": "Add a new position: ticker, shares, entry price, path.",
+      "long_description": "The add-holding form sits pinned at the bottom of the main window so it's always reachable. Fill in the ticker, your share count, your entry price, and pick an analysis path for that position. Adding a holding triggers an initial AI read so you've got something to look at right away.",
+      "keywords": ["add holding", "add position", "new stock", "buy", "enter position"],
+      "related_feature_ids": ["holding_cards", "path_concept"]
+    },
+
+    {
+      "feature_id": "activity_log",
+      "display_name": "Activity Log",
+      "category": "panel",
+      "location_hint": "Right side of the main window",
+      "short_description": "Running log of AI observations and app events.",
+      "long_description": "The activity log is the running journal of what the app and the AI have been doing — when scans started and finished, which models ran, what verdicts came back, errors, warnings, manual actions. Each entry is colored by severity (green for normal, amber for warnings, red for errors, muted gray for background info). Scroll up to read the history; new entries always appear at the bottom.",
+      "keywords": ["activity log", "log", "history", "what did the ai do", "errors", "messages"],
+      "related_feature_ids": ["signals_log", "ai_badge"]
+    },
+
+    {
+      "feature_id": "choices_modal",
+      "display_name": "Choices",
+      "category": "dialog",
+      "location_hint": "Click the Choices summary strip to open",
+      "short_description": "Pick what kinds of stocks the AI should be looking for.",
+      "long_description": "The Choices dialog lets you tell the AI what you actually want to see in scan results. You pick one or more price ranges (Penny under $1, Penny-to-Mid $1–$10, Mid $10–$50, High $50+) and a trading style (Conservative, Moderate, Aggressive, Day-trade). The app warns when your picks contradict each other — for example, picking Penny stocks plus a Conservative style rarely makes sense and is flagged so you can decide whether you really meant it.",
+      "keywords": ["choices", "preferences", "filter", "price range", "style", "penny", "what stocks"],
+      "related_feature_ids": ["choices_summary_strip", "scan", "discover_panel"],
+      "since_version": "v4.15.0"
+    },
+
+    {
+      "feature_id": "discover_panel",
+      "display_name": "Discover Panel",
+      "category": "dialog",
+      "location_hint": "Right-click the Scan button on the toolbar",
+      "short_description": "The full UI for configuring and running a scan.",
+      "long_description": "The Discover panel is the full-control version of Scan. Left-clicking the Scan button just runs with current settings; right-clicking opens this panel, where you pick the universe (Dow 30 through Russell 3000 or ITOT), the analysis path, the models to use, and any other parameters before launching. Results appear in the panel with their freshness and verdict so you can sort and review without leaving the window.",
+      "keywords": ["discover", "discover panel", "scan options", "universe", "configure scan"],
+      "prerequisites": ["ai_module_loaded", "discover_module_loaded"],
+      "related_feature_ids": ["scan", "scan_all", "universe_options", "setting_models_to_run"]
+    },
+
+    {
+      "feature_id": "trade_history",
+      "display_name": "Trade History",
+      "category": "dialog",
+      "location_hint": "Click the dollar total in the portfolio summary card, or open from Track Record",
+      "short_description": "Closed positions with per-trade profit and loss.",
+      "long_description": "Trade History is a standalone window listing every position you've closed, with the realized profit or loss per trade. It's the detail behind the realized P&L number in the portfolio summary. Use it to look back at what you've actually done — separate from what the AI predicted (that lives in Track Record).",
+      "keywords": ["trade history", "closed positions", "realized", "p&l", "past trades", "what i sold"],
+      "related_feature_ids": ["portfolio_summary_card", "track_record"],
+      "since_version": "v4.13.58"
+    },
+
+    {
+      "feature_id": "accuracy_matrix",
+      "display_name": "Accuracy Matrix",
+      "category": "dialog",
+      "location_hint": "Inside Track Record",
+      "short_description": "Per-model hit rate broken down by path and verdict.",
+      "long_description": "The Accuracy Matrix is a grid showing how often each AI model has been right, sliced by analysis path and by verdict type. Some models are reliable on slow_safe but bad on lottery; some have a good BUY hit rate but a poor SELL hit rate. The matrix surfaces those patterns so you can decide which voices to trust on which kinds of calls.",
+      "keywords": ["accuracy", "matrix", "hit rate", "model performance", "which model is best"],
+      "related_feature_ids": ["track_record", "consensus_voting", "predictions_log"],
+      "since_version": "v4.13.35"
+    },
+
+    {
+      "feature_id": "api_providers_manager",
+      "display_name": "API Providers",
+      "category": "dialog",
+      "location_hint": "Settings → AI Sources, or the API key management button",
+      "short_description": "Manage cloud AI provider keys and see their health.",
+      "long_description": "The API Providers manager is where you add, edit, and enable cloud AI voices (Groq, Gemini, Mistral, Cerebras, GitHub Models, SambaNova). Each provider shows its current health: whether it's working, whether it's in cooldown after rate-limit errors, and how close it is to the daily cap. Disable a provider here to stop it from being called without losing the key.",
+      "keywords": ["api providers", "cloud ai", "providers", "api keys", "groq", "gemini", "mistral", "manage keys"],
+      "related_feature_ids": ["setting_ai_sources", "inference_mode_dialog", "provider_groq", "provider_gemini", "provider_mistral", "provider_cerebras", "provider_github", "provider_sambanova"],
+      "since_version": "v4.13.40"
+    },
+
+    {
+      "feature_id": "inference_mode_dialog",
+      "display_name": "Inference Mode",
+      "category": "dialog",
+      "location_hint": "≡ menu → AI Mode",
+      "short_description": "Pick which AI sources are allowed: Local, API, or Hybrid.",
+      "long_description": "Inference Mode controls whether the AI calls run on local Ollama models, cloud providers, or both. Local means cloud is off entirely. API means local is off entirely. Hybrid means cloud is the primary path and Ollama is the fallback when cloud is exhausted. The current selection is shown in the AI Mode pill at the top of the main window.",
+      "keywords": ["inference mode", "ai mode", "local vs cloud", "hybrid", "where does ai run"],
+      "related_feature_ids": ["ai_mode_pill", "api_providers_manager", "setting_ai_sources"],
+      "since_version": "v4.13.43"
+    },
+
+    {
+      "feature_id": "data_providers_manager",
+      "display_name": "Data Providers",
+      "category": "dialog",
+      "location_hint": "Settings → Data section",
+      "short_description": "Configure keyed data sources like Finnhub.",
+      "long_description": "The Data Providers manager covers the data side of Tired Market — the providers feeding quotes, news, fundamentals, and other market data into the app. Most data sources work without keys, but a few (like Finnhub) accept an API key for higher quotas or extra fields. This dialog is where you paste those keys and enable or disable each source.",
+      "keywords": ["data providers", "finnhub", "data sources", "data keys"],
+      "related_feature_ids": ["data_mode_dialog"],
+      "since_version": "v4.13.55"
+    },
+
+    {
+      "feature_id": "data_mode_dialog",
+      "display_name": "Data Mode",
+      "category": "dialog",
+      "location_hint": "Settings → Data section",
+      "short_description": "Choose how data requests are routed: api, free, or hybrid.",
+      "long_description": "Data Mode controls how the app routes its data requests. \"api\" prefers keyed providers when available. \"free\" sticks to free sources only. \"hybrid\" mixes both — keyed providers when configured, free sources to fill the gaps. Most users can leave this on the default; change it if you want to be explicit about which data lanes are live.",
+      "keywords": ["data mode", "data routing", "api free hybrid", "where does data come from"],
+      "related_feature_ids": ["data_providers_manager"],
+      "since_version": "v4.13.55"
+    },
+
+    {
+      "feature_id": "setting_simple_advanced_toggle",
+      "display_name": "Simple / Advanced Toggle",
+      "category": "setting",
+      "location_hint": "Settings dialog, top",
+      "short_description": "Hide or show the advanced settings sections.",
+      "long_description": "Simple mode shows only the essentials — Analysis Path and Display. Advanced mode adds AI Model, UPS, AI Behavior, AI Sources, Auto-refresh, Data & Backups, and Storage & Cleanup. Start in Simple if the dialog feels overwhelming; switch to Advanced when you want to tune things.",
+      "keywords": ["simple", "advanced", "show all settings", "hide settings"],
+      "related_feature_ids": ["setting_analysis_path", "setting_display"]
+    },
+
+    {
+      "feature_id": "setting_analysis_path",
+      "display_name": "Analysis Path",
+      "category": "setting",
+      "location_hint": "Settings → Analysis Path",
+      "short_description": "Pick the default risk profile the AI uses to think about stocks.",
+      "long_description": "The Analysis Path setting controls how the AI analyzes your positions and what kinds of stocks it considers in scans. Five paths are available (slow_safe, moderate, aggressive, lottery, penny_lottery). You can also change path on a per-position basis from the holding card.",
+      "keywords": ["path", "analysis path", "risk", "default style", "how aggressive"],
+      "related_feature_ids": ["path_concept", "path_slow_safe", "path_moderate", "path_aggressive", "path_lottery", "path_penny_lottery"]
+    },
+
+    {
+      "feature_id": "setting_ups_power",
+      "display_name": "UPS / Power Monitoring",
+      "category": "setting",
+      "location_hint": "Settings → UPS (Advanced; only if power module is installed)",
+      "short_description": "Pause AI on battery and optionally auto-save and close.",
+      "long_description": "If you have an uninterruptible power supply (UPS) and the optional power module is installed, this section detects when you're running on battery and pauses AI work automatically. You can also enable auto-save-and-close at a critical battery threshold so the app doesn't get killed mid-write. The app does not shut down Windows itself — your OS handles that part.",
+      "keywords": ["ups", "battery", "power", "outage", "auto save", "auto close"],
+      "related_feature_ids": ["ai_badge"]
+    },
+
+    {
+      "feature_id": "setting_ai_behavior",
+      "display_name": "AI Behavior",
+      "category": "setting",
+      "location_hint": "Settings → AI Behavior (Advanced)",
+      "short_description": "Background scheduler, gaming auto-pause, recently-analyzed, prefilter, chat context.",
+      "long_description": "The AI Behavior section bundles the toggles that shape how the AI acts in the background. You can enable the background scheduler that re-checks holdings on a cadence, pause AI automatically when the app detects a game is running, include or exclude tickers analyzed in the last 24 hours from new scans, tune prefilter strictness so the AI re-ranks candidates by its own track record, and turn on portfolio context for AI Chat.",
+      "keywords": ["ai behavior", "scheduler", "gaming", "auto pause", "prefilter", "chat context"],
+      "related_feature_ids": ["stop_resume", "setting_auto_refresh", "setting_models_to_run"]
+    },
+
+    {
+      "feature_id": "setting_ai_sources",
+      "display_name": "AI Sources",
+      "category": "setting",
+      "location_hint": "Settings → AI Sources (Advanced)",
+      "short_description": "At-a-glance summary of how many AI voices you've got configured.",
+      "long_description": "AI Sources shows three chips: how many local models are participating in consensus, how many cloud providers are enabled, and the total number of voices. Green chips mean active, red means zero. Consensus needs at least three voices to be meaningful — if you see fewer, this section will warn you and link you to where you can add more.",
+      "keywords": ["ai sources", "voices", "providers", "models", "how many ai"],
+      "unmet_prerequisite_hints": {
+        "at_least_one_voice": "No AI sources configured. Add a cloud provider so the app has a voice to call.",
+        "at_least_three_voices": "Only 1 AI voice configured. Consensus needs 3+ voices to be meaningful. Add more cloud providers."
+      },
+      "related_feature_ids": ["api_providers_manager", "consensus_voting", "setting_models_to_run"]
+    },
+
+    {
+      "feature_id": "setting_models_to_run",
+      "display_name": "Models to Run",
+      "category": "setting",
+      "location_hint": "Settings → AI Behavior → Models to run (Advanced)",
+      "short_description": "Pick which local Ollama models participate in Scan consensus.",
+      "long_description": "Models to Run is the multi-select list of installed local models that participate when you run Scan. \"Use Recommended\" picks strong general-purpose reasoning models and skips finance-specialized, uncensored, or chat-only variants. \"Show all models\" reveals the full list including the ones that aren't recommended by default. This setting only affects local models; cloud providers are managed separately in AI Sources.",
+      "keywords": ["models to run", "consensus models", "which models", "scan models"],
+      "related_feature_ids": ["scan", "setting_ai_model", "setting_ai_sources"]
+    },
+
+    {
+      "feature_id": "setting_auto_refresh",
+      "display_name": "Auto-refresh",
+      "category": "setting",
+      "location_hint": "Settings → AI Behavior → Auto-refresh (Advanced)",
+      "short_description": "When data refreshes automatically, optionally run one model.",
+      "long_description": "Auto-refresh controls what happens when the app's background data refresh fires. You can pick \"(none)\" to refresh data without firing any AI, or pick a single model to run on each refresh. This is independent of the Scan consensus list — Scan and Auto-refresh make different decisions about which model to use.",
+      "keywords": ["auto refresh", "background refresh", "scheduled scan"],
+      "related_feature_ids": ["stop_resume", "setting_ai_behavior"]
+    },
+
+    {
+      "feature_id": "setting_display",
+      "display_name": "Display",
+      "category": "setting",
+      "location_hint": "Settings → Display",
+      "short_description": "Desktop notifications and sound alerts.",
+      "long_description": "Display covers the two notification toggles: desktop notifications (the small popups your OS shows when something noteworthy happens) and sound alerts (an audible chime). Both are off by default; turn them on if you want the app to interrupt you when scans finish or alerts fire.",
+      "keywords": ["display", "notifications", "sounds", "alerts", "popup"]
+    },
+
+    {
+      "feature_id": "setting_auto_scan_launch",
+      "display_name": "Auto-scan on Launch",
+      "category": "setting",
+      "location_hint": "Settings → AI Behavior → Auto-scan (Advanced)",
+      "short_description": "Run a holdings consensus check automatically when the app starts.",
+      "long_description": "When this is on, the app runs Run Consensus on your tradable holdings as soon as it launches, so you have fresh AI takes ready when you sit down. Off by default — turning it on costs an AI call per holding at startup, which adds up if you have a lot of positions or expensive providers configured.",
+      "keywords": ["auto scan", "launch", "startup scan", "fresh on start"],
+      "related_feature_ids": ["setting_ai_behavior", "consensus_voting"]
+    },
+
+    {
+      "feature_id": "setting_data_backups",
+      "display_name": "Data & Backups",
+      "category": "setting",
+      "location_hint": "Settings → Data & Backups (Advanced)",
+      "short_description": "Where data lives and how backups work.",
+      "long_description": "Data & Backups shows the path to the app's data folder and lets you toggle automatic backup-on-exit, which keeps the last N copies of your data folder so you can roll back if something goes wrong. Buttons here let you open the data folder in Explorer or trigger a backup manually right now.",
+      "keywords": ["backups", "data folder", "auto backup", "manual backup"],
+      "related_feature_ids": ["setting_storage_cleanup"]
+    },
+
+    {
+      "feature_id": "setting_storage_cleanup",
+      "display_name": "Storage & Cleanup",
+      "category": "setting",
+      "location_hint": "Settings → Storage & Cleanup (Advanced)",
+      "short_description": "Disk usage breakdown and retention controls.",
+      "long_description": "Storage & Cleanup shows how much disk space the app is using, broken down by category — main data, backups, prediction backups, snapshots. You can set how many backups to keep before old ones are auto-pruned, and you can see when the last cleanup ran and how much it freed.",
+      "keywords": ["storage", "cleanup", "disk space", "retention", "prune backups"],
+      "related_feature_ids": ["setting_data_backups"]
+    },
+
+    {
+      "feature_id": "path_concept",
+      "display_name": "Analysis Paths",
+      "category": "concept",
+      "short_description": "The five risk profiles the AI can use when analyzing stocks.",
+      "long_description": "A path tells the AI what kind of stock-picking philosophy to use. Five paths are available: Slow & Safe (compound returns over years, established names), Moderate (balanced, the default), Aggressive (active picking, momentum, real drawdown risk), Lottery (microcap speculation, $1–$10), and Penny Lottery (sub-dollar plays, highest risk). The same stock can look like a buy on one path and a pass on another — paths shape the question, not just the answer. You can set a default path in Settings and override it per holding or per scan.",
+      "keywords": ["path", "paths", "risk profile", "what is a path", "how do paths work"],
+      "aliases": ["Paths", "Trading Style", "Analysis Style"],
+      "related_feature_ids": ["path_slow_safe", "path_moderate", "path_aggressive", "path_lottery", "path_penny_lottery", "setting_analysis_path"]
+    },
+
+    {
+      "feature_id": "path_slow_safe",
+      "display_name": "Slow & Safe",
+      "category": "concept",
+      "short_description": "Compound returns over years. High probability, long timeline.",
+      "long_description": "Compound returns over years. High probability, long timeline. AI biases toward established companies, dividend payers, ETFs. Avoids speculation. Pick this path when your timeframe is years, not weeks, and you'd rather miss a big mover than ride a blowup.",
+      "keywords": ["slow safe", "long term", "etf", "dividend", "established", "blue chip", "low risk"],
+      "related_feature_ids": ["path_concept", "path_moderate", "setting_analysis_path"]
+    },
+
+    {
+      "feature_id": "path_moderate",
+      "display_name": "Moderate",
+      "category": "concept",
+      "short_description": "Balanced approach. The default.",
+      "long_description": "Balanced approach. AI considers established companies AND select growth opportunities. Some risk for better returns. Default. Pick this path when you want the AI to consider a wider set than Slow & Safe but still avoid the riskier microcaps and momentum plays.",
+      "keywords": ["moderate", "balanced", "default", "middle", "growth"],
+      "related_feature_ids": ["path_concept", "path_slow_safe", "path_aggressive", "setting_analysis_path"]
+    },
+
+    {
+      "feature_id": "path_aggressive",
+      "display_name": "Aggressive",
+      "category": "concept",
+      "short_description": "Active stock picking, momentum plays, sector rotation. Real risk of drawdowns.",
+      "long_description": "Active stock picking, momentum plays, sector rotation. AI looks for shorter-term opportunities. Real risk of drawdowns. Pick this path when you're comfortable with volatility and want the AI to look beyond the established blue-chips for stronger near-term moves.",
+      "keywords": ["aggressive", "active", "momentum", "sector rotation", "short term", "drawdown", "volatile", "risky"],
+      "related_feature_ids": ["path_concept", "path_moderate", "path_lottery", "setting_analysis_path"]
+    },
+
+    {
+      "feature_id": "path_lottery",
+      "display_name": "Lottery Ticket",
+      "category": "concept",
+      "short_description": "Microcap speculation, $1–$10 range. Most lose; the wins are big.",
+      "long_description": "Microcap speculation, $1–$10 range. AI looks for high-upside / high-risk picks with real volume. Most lose; the wins are big. Calibrate framing to the actual price band — a $9 stock is not the same risk profile as a $1 stock. Use this path knowing that any individual pick is more likely to fail than succeed; the math only works if the wins are large enough to cover the losses.",
+      "keywords": ["lottery", "microcap", "small cap", "speculation", "high risk", "5x", "10x"],
+      "related_feature_ids": ["path_concept", "path_aggressive", "path_penny_lottery", "setting_analysis_path"]
+    },
+
+    {
+      "feature_id": "path_penny_lottery",
+      "display_name": "Penny Lottery",
+      "category": "concept",
+      "short_description": "Sub-dollar plays, $0.10–$2.00. Highest noise of any path.",
+      "long_description": "True sub-dollar plays, $0.10–$2.00. Pump-prone, thin-volume stocks where most picks lose, but a true 5x–10x is possible. Highest noise of any path. Use sparingly. The AI's hit rate on this path is by design lower than the others — the trade is accuracy for upside size.",
+      "keywords": ["penny lottery", "penny stocks", "sub dollar", "pump", "thin volume", "highest risk"],
+      "related_feature_ids": ["path_concept", "path_lottery", "setting_analysis_path"]
+    },
+
+    {
+      "feature_id": "verdict_owned_concept",
+      "display_name": "Verdicts for Owned Positions",
+      "category": "concept",
+      "short_description": "What BUY MORE, HOLD, SELL, and TRIM mean on positions you already own.",
+      "long_description": "When you ask the AI about a stock you already own, it returns one of four directions: BUY MORE (add to the position), HOLD (keep what you have), SELL (close the whole position), or TRIM (sell part). Along with the direction it gives a target price (where you'd ideally like to see it go), a stop-loss (the price where the thesis breaks), a timeframe (how long it expects this to play out), and a confidence level (LOW, MODERATE, or HIGH). These are the inputs for your own judgment, not orders to place trades.",
+      "keywords": ["verdicts owned", "buy more", "hold", "sell", "trim", "what does the ai say", "directions"],
+      "related_feature_ids": ["verdict_buy_more", "verdict_hold_owned", "verdict_sell", "verdict_trim", "consensus_voting", "confidence_levels"]
+    },
+
+    {
+      "feature_id": "verdict_buy_more",
+      "display_name": "BUY MORE",
+      "category": "concept",
+      "short_description": "Add to a position you already own.",
+      "long_description": "BUY MORE means the AI thinks the position is still attractive at current prices and adding to it makes sense. Comes with a target, stop, timeframe, and confidence — read all four before acting on it. A LOW-confidence BUY MORE is a much weaker signal than a HIGH-confidence one.",
+      "keywords": ["buy more", "add", "increase position", "double down"],
+      "related_feature_ids": ["verdict_owned_concept", "confidence_levels"]
+    },
+
+    {
+      "feature_id": "verdict_hold_owned",
+      "display_name": "HOLD (owned)",
+      "category": "concept",
+      "short_description": "Keep what you have. Neither add nor sell right now.",
+      "long_description": "HOLD on an owned position means the AI doesn't see a reason to add or sell — the thesis is intact but not compelling enough to bet more on. Often the right call when nothing has changed materially. Comes with target and stop so you know the levels the thesis depends on.",
+      "keywords": ["hold", "keep", "stay", "do nothing"],
+      "related_feature_ids": ["verdict_owned_concept", "verdict_watch"]
+    },
+
+    {
+      "feature_id": "verdict_sell",
+      "display_name": "SELL",
+      "category": "concept",
+      "short_description": "Close the whole position.",
+      "long_description": "SELL means the AI thinks the thesis is broken or the risk-reward has flipped against you and the position should be closed entirely. Comes with reasoning so you can decide whether you agree. SELL doesn't include a target or stop — \"now\" is the implied price.",
+      "keywords": ["sell", "close", "exit", "out"],
+      "related_feature_ids": ["verdict_owned_concept", "verdict_trim"]
+    },
+
+    {
+      "feature_id": "verdict_trim",
+      "display_name": "TRIM",
+      "category": "concept",
+      "short_description": "Sell part of the position, keep the rest.",
+      "long_description": "TRIM means the AI thinks you should reduce the position — take some off the table — but not close it entirely. Often used when a stock has run up and the risk-reward is no longer as good as it was, but the underlying thesis is still alive.",
+      "keywords": ["trim", "partial sell", "take some off", "reduce"],
+      "related_feature_ids": ["verdict_owned_concept", "verdict_sell"]
+    },
+
+    {
+      "feature_id": "verdict_fresh_concept",
+      "display_name": "Verdicts for Fresh Candidates",
+      "category": "concept",
+      "short_description": "What BUY, WATCH, and AVOID mean on stocks you don't own yet.",
+      "long_description": "When the AI looks at a stock you don't own, it returns one of three directions: BUY (worth opening a position), WATCH (interesting but not compelling enough to act on now), or AVOID (bad idea at this price — overvalued, broken, or actively dangerous). BUY also comes with a buy-zone (entry price range), target, stop, timeframe, and confidence. WATCH and AVOID give reasoning but no levels.",
+      "keywords": ["verdicts fresh", "buy", "watch", "avoid", "candidates", "new stocks"],
+      "related_feature_ids": ["verdict_buy", "verdict_watch", "verdict_avoid", "consensus_voting", "confidence_levels"]
+    },
+
+    {
+      "feature_id": "verdict_buy",
+      "display_name": "BUY",
+      "category": "concept",
+      "short_description": "Worth opening a position. Comes with a buy-zone.",
+      "long_description": "BUY on a fresh candidate means the AI thinks the stock is attractive enough to consider opening a new position. It includes a buy-zone (the price range that's a good entry), a target, a stop-loss, a timeframe, and a confidence level. The buy-zone is the key new piece — outside that range, the call may not apply.",
+      "keywords": ["buy", "open position", "new buy", "candidate"],
+      "related_feature_ids": ["verdict_fresh_concept", "confidence_levels"]
+    },
+
+    {
+      "feature_id": "verdict_watch",
+      "display_name": "WATCH",
+      "category": "concept",
+      "short_description": "Has merit but isn't compelling enough to act on now.",
+      "long_description": "WATCH means the stock has merit but isn't compelling enough to add now. Maybe wait for a pullback, a catalyst, or more confirmation. The AI is saying it's interesting but the timing isn't right — track it rather than buy it.",
+      "keywords": ["watch", "wait", "monitor", "later"],
+      "related_feature_ids": ["verdict_fresh_concept", "verdict_hold_owned"]
+    },
+
+    {
+      "feature_id": "verdict_avoid",
+      "display_name": "AVOID",
+      "category": "concept",
+      "short_description": "Bad idea at this price. Skip it.",
+      "long_description": "AVOID means the stock is a bad idea at this price — overvalued, broken technicals, no catalyst, or actively dangerous. Skip it. The AI is being honest that nothing in the available data argues for buying.",
+      "keywords": ["avoid", "skip", "bad", "no", "overvalued", "broken"],
+      "related_feature_ids": ["verdict_fresh_concept"]
+    },
+
+    {
+      "feature_id": "consensus_voting",
+      "display_name": "Consensus Voting",
+      "category": "concept",
+      "short_description": "How Tired Market combines multiple AI opinions into one verdict.",
+      "long_description": "Tired Market doesn't trust a single AI. When you run a consensus check, the app asks several AI voices the same question independently, then combines their votes into one verdict. Each voice gives a direction (BUY MORE, HOLD, SELL, or TRIM for positions you own; BUY, WATCH, or AVOID for fresh candidates), a target price, a stop-loss, a timeframe, and a confidence level (LOW, MODERATE, or HIGH). The consensus card shows the aggregated answer plus how many voices agreed. Three or more voices is the minimum for consensus to be meaningful.",
+      "keywords": ["consensus", "voting", "votes", "multiple ai", "how does ai work", "verdict", "agreement", "models agree", "what does the ai say"],
+      "aliases": ["Multi-Model Consensus", "AI Voting"],
+      "prerequisites": ["at_least_three_voices"],
+      "unmet_prerequisite_hints": {
+        "at_least_three_voices": "Consensus needs 3+ AI voices to be meaningful. Add more cloud providers in Settings → AI Sources, or install more local models."
+      },
+      "related_feature_ids": ["verdict_owned_concept", "verdict_fresh_concept", "confidence_levels", "setting_ai_sources"],
+      "since_version": "v4.13.0"
+    },
+
+    {
+      "feature_id": "confidence_levels",
+      "display_name": "Confidence Levels",
+      "category": "concept",
+      "short_description": "LOW, MODERATE, and HIGH — how strongly the AI stands behind a call.",
+      "long_description": "Every AI verdict comes with a confidence level: LOW, MODERATE, or HIGH. Most calls land in LOW or MODERATE — the AI is asked to be honest, not enthusiastic. HIGH should be rare and worth paying attention to. A LOW-confidence BUY is a much weaker signal than a HIGH-confidence one and should be weighted accordingly. Confidence is part of the signal, not extra detail you can ignore.",
+      "keywords": ["confidence", "low", "moderate", "high", "how sure", "certainty"],
+      "related_feature_ids": ["consensus_voting", "verdict_owned_concept", "verdict_fresh_concept"]
+    },
+
+    {
+      "feature_id": "universe_options",
+      "display_name": "Universe Options",
+      "category": "concept",
+      "short_description": "The list of stocks scans choose from, from Dow 30 up to the total US market.",
+      "long_description": "A scan can run against several different universes, ordered from smallest to largest: Dow 30 (~30 stocks), NASDAQ-100 (~100), S&P 500 (~500), Russell 1000 (~1000), Russell 2000 (~2000), Russell 3000 (~3000, the default), and ITOT (the total US market). Bigger universes find more candidates but take longer and cost more in AI calls. The default Russell 3000 is the broadest list that still excludes the most illiquid microcaps; ITOT goes further.",
+      "keywords": ["universe", "stocks list", "dow", "nasdaq", "s&p", "russell", "itot", "what stocks does it look at"],
+      "related_feature_ids": ["scan", "discover_panel"]
+    },
+
+    {
+      "feature_id": "freshness_states_concept",
+      "display_name": "Freshness States",
+      "category": "concept",
+      "short_description": "fresh / stale / old / never — the four data-age buckets.",
+      "long_description": "Freshness dots in the app come in four colors. Fresh (green) means data is under 24 hours old. Stale (yellow) means 1 to 7 days. Old (red) means over 7 days. Never (gray) means the AI hasn't analyzed this position yet. The dot tells you at a glance whether you're looking at current information or something the AI hasn't revisited in a while.",
+      "keywords": ["freshness", "fresh", "stale", "old", "never", "data age", "dot color"],
+      "related_feature_ids": ["freshness_indicator", "holding_cards"]
+    },
+
+    {
+      "feature_id": "cache_fill_modes",
+      "display_name": "Cache Fill Modes",
+      "category": "concept",
+      "short_description": "How each data lane decides to fetch: bulk, incremental, direct, skip, keyless.",
+      "long_description": "Each data type (quotes, news, fundamentals, filings, etc.) has its own \"lane\" with a fill mode. \"bulk\" does a full initial fetch. \"incremental\" fills in pieces over time. \"direct\" means you have an API key and the lane fetches with it. \"skip\" means the lane is turned off. \"keyless\" is the fallback when a lane has no config row. Most users never need to think about this — the app picks sensible defaults based on which keys you've configured.",
+      "keywords": ["fill modes", "cache", "bulk", "incremental", "direct", "skip", "data fetch"],
+      "related_feature_ids": ["data_providers_manager", "data_mode_dialog"]
+    },
+
+    {
+      "feature_id": "predictions_log",
+      "display_name": "Predictions Log",
+      "category": "concept",
+      "short_description": "Every AI prediction the app has made, kept for accuracy tracking.",
+      "long_description": "Every time the AI makes a call — BUY, HOLD, SELL, AVOID, anything — it gets recorded in the predictions log along with the model, the path, the verdict, the levels, and the timestamp. The Track Record window reads from this log to compute hit rates. Recommend reads from it to find the currently open BUY calls. The log is what makes accountability possible — without it the AI's claims would be unfalsifiable.",
+      "keywords": ["predictions", "predictions log", "history", "what did the ai predict"],
+      "related_feature_ids": ["track_record", "accuracy_matrix", "recommend"]
+    },
+
+    {
+      "feature_id": "signals_log",
+      "display_name": "Signals Log",
+      "category": "concept",
+      "short_description": "The persistent activity history file (signals.jsonl).",
+      "long_description": "The signals log is the append-only file (data/signals.jsonl) where the app writes everything notable that happens — AI observations, consensus rollups, quotes, news pings, fundamentals updates, errors. It's the data behind the Activity Log panel and is also what survives across app restarts. You don't normally need to look at the file directly, but it's there if you ever want to inspect the raw history.",
+      "keywords": ["signals log", "signals.jsonl", "activity history", "raw log"],
+      "related_feature_ids": ["activity_log", "predictions_log"]
+    },
+
+    {
+      "feature_id": "disclaimer_first_launch",
+      "display_name": "First-Launch Disclaimer",
+      "category": "concept",
+      "short_description": "The one-time disclaimer shown the first time you launch the app.",
+      "long_description": "The very first time Tired Market starts, a small splash window appears with a short disclaimer: this is a tool that points you toward stocks it thinks may go up, it shows its reasoning, and it's wrong sometimes. Use its analysis as one input among several; do your own research; make your own decisions. Once you acknowledge it, the splash never appears again — you go straight to the main app on every future launch.",
+      "keywords": ["disclaimer", "first launch", "splash", "warning", "first time"]
+    },
+
+    {
+      "feature_id": "hotkey_summon_teacher_ai",
+      "display_name": "Ctrl+` (Summon Teacher AI)",
+      "category": "hotkey",
+      "short_description": "Press anywhere to summon the built-in FAQ helper.",
+      "long_description": "Ctrl + backtick (`) summons Teacher AI from anywhere in the app — same as clicking the corner indicator. A small input box appears; type your question, get a matching FAQ answer back. Skips silently if your typing focus is in a text field (so it doesn't fire while you're entering a ticker).",
+      "keywords": ["ctrl backtick", "ctrl `", "summon", "teacher ai", "help hotkey", "faq hotkey"],
+      "related_feature_ids": ["teacher_ai_corner_indicator", "hotkey_tutorial_mode", "faq_slash_command"]
+    },
+
+    {
+      "feature_id": "hotkey_tutorial_mode",
+      "display_name": "Ctrl+Shift+` (Tutorial Mode)",
+      "category": "hotkey",
+      "short_description": "Toggle tutorial mode for this session.",
+      "long_description": "Ctrl + Shift + backtick toggles tutorial mode on or off for the current session. When tutorial mode is on, intercepts that the app has previously suppressed (after you've acknowledged them) re-fire so you can see the explanations again. The toggle resets to off on every launch — it's a session-only state, not a persistent preference.",
+      "keywords": ["tutorial mode", "ctrl shift backtick", "show hints again", "intercept"],
+      "related_feature_ids": ["hotkey_summon_teacher_ai", "teacher_ai_corner_indicator"]
+    },
+
+    {
+      "feature_id": "faq_slash_command",
+      "display_name": "/faq Slash Command",
+      "category": "hotkey",
+      "short_description": "Inside AI Chat, type /faq <question> for a free FAQ answer instead of a model call.",
+      "long_description": "Inside the AI Chat window, typing /faq before your question routes the question to the built-in FAQ matcher instead of calling a model. No model, no Ollama, no cost. The result appears in the chat thread tagged as a FAQ answer (different color from a model reply) so you can tell at a glance where it came from. If there's no FAQ match, you get a short \"try rephrasing\" message — it does not silently fall back to the model.",
+      "keywords": ["/faq", "slash command", "faq in chat", "ai chat faq"],
+      "related_feature_ids": ["ai_chat", "teacher_ai_corner_indicator", "hotkey_summon_teacher_ai"]
+    },
+
+    {
+      "feature_id": "provider_groq",
+      "display_name": "Groq",
+      "category": "provider",
+      "location_hint": "Settings → AI Sources, or the API Providers manager",
+      "short_description": "Cloud AI voice. Fastest of the free providers, generous daily quota.",
+      "long_description": "Groq is a cloud AI provider that runs Llama models on custom hardware built for speed. In Tired Market it's a good first voice to add: free tier, a generous daily quota on the small model (llama-3.1-8b-instant gets ~14,400 calls per day), and replies come back noticeably faster than other cloud providers. The smaller 8B model is the default and what the daily quota is built around; larger models like the 70B are also available but are capped much tighter (~1,000 per day). Sign up takes about a minute — just an account and an API key to copy.",
+      "keywords": ["groq", "fast ai", "speed", "llama", "free ai", "cloud provider", "first ai", "which ai should i pick"],
+      "aliases": ["Groq Cloud", "Groq API"],
+      "prerequisites": ["api_key_configured"],
+      "unmet_prerequisite_hints": {
+        "api_key_configured": "Groq needs an API key. Sign up at console.groq.com/keys, then paste the key into Settings → AI Sources."
+      },
+      "related_feature_ids": ["api_providers_manager", "inference_mode_dialog", "provider_gemini", "provider_mistral", "provider_cerebras", "provider_github", "provider_sambanova", "consensus_voting"],
+      "since_version": "v4.13.40",
+      "recommendation_role": ["good_first_provider", "good_for_speed"]
+    },
+
+    {
+      "feature_id": "provider_gemini",
+      "display_name": "Google Gemini",
+      "category": "provider",
+      "location_hint": "Settings → AI Sources, or the API Providers manager",
+      "short_description": "Cloud AI voice. Long context window, generous free tier.",
+      "long_description": "Google Gemini is a cloud AI provider with a generous free tier (about 1,500 calls per day on the flash models) and an unusually long context window — useful when you want the AI to digest a lot of background at once. The default model is gemini-2.0-flash; gemini-1.5-pro is also available for deeper analysis at lower throughput. Sign up is quick: create an API key in Google AI Studio and paste it into Tired Market.",
+      "keywords": ["gemini", "google", "google ai", "long context", "flash"],
+      "aliases": ["Gemini", "Google AI"],
+      "prerequisites": ["api_key_configured"],
+      "unmet_prerequisite_hints": {
+        "api_key_configured": "Gemini needs an API key. Get one at aistudio.google.com/app/apikey, then paste it into Settings → AI Sources."
+      },
+      "related_feature_ids": ["api_providers_manager", "provider_groq", "consensus_voting"],
+      "since_version": "v4.13.40",
+      "recommendation_role": ["good_second_voice", "good_for_deep_analysis"]
+    },
+
+    {
+      "feature_id": "provider_mistral",
+      "display_name": "Mistral La Plateforme",
+      "category": "provider",
+      "location_hint": "Settings → AI Sources, or the API Providers manager",
+      "short_description": "Cloud AI voice. EU-based, free tier with token-based limits.",
+      "long_description": "Mistral La Plateforme is a French AI provider offering a free tier capped on tokens per month (about 1 billion) rather than requests per day, so the practical ceiling depends on how much text you're sending in and getting back. Default model is mistral-small-latest; larger and specialty models are available too. Useful as a second voice in consensus — different training and different perspective than the US providers.",
+      "keywords": ["mistral", "european", "eu", "french ai"],
+      "aliases": ["Mistral", "La Plateforme"],
+      "prerequisites": ["api_key_configured"],
+      "unmet_prerequisite_hints": {
+        "api_key_configured": "Mistral needs an API key. Get one at console.mistral.ai, then paste it into Settings → AI Sources."
+      },
+      "related_feature_ids": ["api_providers_manager", "provider_groq", "consensus_voting"],
+      "since_version": "v4.13.40",
+      "recommendation_role": ["good_second_voice"]
+    },
+
+    {
+      "feature_id": "provider_cerebras",
+      "display_name": "Cerebras",
+      "category": "provider",
+      "location_hint": "Settings → AI Sources, or the API Providers manager",
+      "short_description": "Cloud AI voice. Extremely fast inference, capped at 30 calls per minute.",
+      "long_description": "Cerebras runs Llama models on its own wafer-scale chips and is one of the fastest inference providers available — often well over a thousand tokens per second per response. The free tier is generous on tokens (about 1 million per day) but capped at 30 requests per minute, which makes it best for individual deep reads rather than high-throughput fan-out. Default model is llama3.1-8b; llama3.1-70b is also available.",
+      "keywords": ["cerebras", "fast", "wafer scale", "llama", "speed"],
+      "prerequisites": ["api_key_configured"],
+      "unmet_prerequisite_hints": {
+        "api_key_configured": "Cerebras needs an API key. Get one at cloud.cerebras.ai, then paste it into Settings → AI Sources."
+      },
+      "related_feature_ids": ["api_providers_manager", "provider_groq", "consensus_voting"],
+      "since_version": "v4.13.40",
+      "recommendation_role": ["good_for_speed", "specialty"]
+    },
+
+    {
+      "feature_id": "provider_github",
+      "display_name": "GitHub Models",
+      "category": "provider",
+      "location_hint": "Settings → AI Sources, or the API Providers manager",
+      "short_description": "Cloud AI voice via GitHub. 50 calls/day per model, includes gpt-4o.",
+      "long_description": "GitHub Models lets you call hosted AI models — including frontier ones like gpt-4o — through a GitHub Personal Access Token. The free tier is 50 calls per day per model per user, which is moderate and usable but not high-volume. Default model is gpt-4o (a strong reasoning model); gpt-4o-mini and Phi-3.5 are also available. Setup is slightly different from other providers: you need a GitHub PAT with the \"models\" scope, not a typical API key.",
+      "keywords": ["github models", "github", "gpt 4o", "openai through github", "phi"],
+      "aliases": ["GitHub", "GitHub AI"],
+      "prerequisites": ["api_key_configured"],
+      "unmet_prerequisite_hints": {
+        "api_key_configured": "GitHub Models needs a Personal Access Token with the 'models' scope. Get one at github.com/marketplace/models, then paste it into Settings → AI Sources."
+      },
+      "related_feature_ids": ["api_providers_manager", "provider_groq", "consensus_voting"],
+      "since_version": "v4.13.40",
+      "recommendation_role": ["good_for_deep_analysis", "specialty"]
+    },
+
+    {
+      "feature_id": "provider_sambanova",
+      "display_name": "SambaNova",
+      "category": "provider",
+      "location_hint": "Settings → AI Sources, or the API Providers manager",
+      "short_description": "Cloud AI voice. Strong models but very tight quota — 20 calls/day total.",
+      "long_description": "SambaNova hosts strong models (DeepSeek-V3.1, Llama-3.3-70B, gpt-oss-120b) but its free tier is unusually tight — about 20 calls per day total across all models, not per model. That makes it best used as a \"special occasion\" voice: save it for holdings consensus where each call matters, rather than wiring it into high-volume scans. The model quality is high enough that a single SambaNova vote in a consensus rollup is worth having.",
+      "keywords": ["sambanova", "deepseek", "deep seek", "tight quota", "special occasion"],
+      "prerequisites": ["api_key_configured"],
+      "unmet_prerequisite_hints": {
+        "api_key_configured": "SambaNova needs an API key. Get one at cloud.sambanova.ai, then paste it into Settings → AI Sources."
+      },
+      "related_feature_ids": ["api_providers_manager", "provider_groq", "consensus_voting"],
+      "since_version": "v4.13.40",
+      "recommendation_role": ["good_for_deep_analysis", "specialty"]
+    }
+
+  ]
+}

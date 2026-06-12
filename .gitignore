@@ -1,0 +1,58 @@
+# Live local state — never commit
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.log
+data/*.log.*
+data/*.jsonl
+data/app.lock
+data/api_provider_usage.json
+data/event_detector_state.json
+data/lane_pacing.json
+data/model_registry.json
+data/portfolio.json
+
+# Live config (use the .example pattern — committed examples, gitignored live files)
+data/api_providers.json
+data/config.json
+
+# Backups
+*.bak
+*.bak.*
+*.pre_*.bak
+*.HOLD
+*.BACKUP
+
+# Build / cache
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+
+# Audit / dev scaffolding
+_audit_*.py
+_run_audit*.py
+_suite*.txt
+source_backup_*.py
+_apply_*.py
+_verify_*.py
+_trace_*.py
+_probe_*.py
+_build_*.py
+_archive/
+_backups/
+_backup_*/
+_cleanbuild_staging/
+_release/
+outputs/
+updates/
+extracts/
+design/
+data/backups/
+data/data_backups/
+data/logs/
+
+# OS junk
+Thumbs.db
+.DS_Store

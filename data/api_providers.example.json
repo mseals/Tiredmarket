@@ -1,0 +1,171 @@
+{
+  "providers": [
+    {
+      "id": "b1158f8c",
+      "name": "Groq",
+      "preset": "groq",
+      "format": "openai_compat",
+      "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+      "api_key": "",
+      "model": "llama-3.1-8b-instant",
+      "enabled": false,
+      "created_at": "2026-05-06T13:49:49.307868",
+      "updated_at": "2026-06-08T21:05:25.706432",
+      "last_discovered_at": "2026-06-08T21:05:25.706422",
+      "models": [
+        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
+        "mixtral-8x7b-32768"
+      ]
+    },
+    {
+      "id": "0603c47b",
+      "name": "Google Gemini",
+      "preset": "google",
+      "format": "google",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/models",
+      "api_key": "",
+      "model": "gemini-2.5-flash-lite",
+      "enabled": false,
+      "created_at": "2026-05-06T14:15:36.712161",
+      "updated_at": "2026-06-08T21:05:26.243023",
+      "last_discovered_at": "2026-06-08T21:05:26.243005",
+      "models": [
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash"
+      ]
+    },
+    {
+      "id": "eb1587d0",
+      "name": "Mistral La Plateforme",
+      "preset": "mistral",
+      "format": "openai_compat",
+      "endpoint": "https://api.mistral.ai/v1/chat/completions",
+      "api_key": "",
+      "model": "mistral-small-latest",
+      "enabled": false,
+      "created_at": "2026-05-06T14:23:21.792560",
+      "updated_at": "2026-06-08T21:05:26.784741",
+      "last_discovered_at": "2026-06-08T21:05:26.784729",
+      "models": [
+        "mistral-small-latest",
+        "mistral-medium-latest"
+      ]
+    },
+    {
+      "id": "8536e963",
+      "name": "Cerebras",
+      "preset": "cerebras",
+      "format": "openai_compat",
+      "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+      "api_key": "",
+      "model": "gpt-oss-120b",
+      "enabled": false,
+      "created_at": "2026-05-06T16:18:47.145581",
+      "updated_at": "2026-06-07T12:42:23.607927",
+      "last_discovered_at": "2026-06-07T12:42:23.607911",
+      "models": [
+        "gpt-oss-120b"
+      ]
+    },
+    {
+      "id": "13d21fe4",
+      "name": "GitHub Models",
+      "preset": "github_models",
+      "format": "openai_compat",
+      "endpoint": "https://models.inference.ai.azure.com/chat/completions",
+      "api_key": "",
+      "model": "gpt-4o",
+      "enabled": false,
+      "created_at": "2026-05-06T16:21:37.568209",
+      "updated_at": "2026-06-07T16:35:04.901466",
+      "last_discovered_at": "2026-06-07T16:35:04.901458",
+      "models": [
+        "gpt-4o"
+      ]
+    },
+    {
+      "id": "c213156d",
+      "name": "SambaNova",
+      "preset": "sambanova",
+      "format": "openai_compat",
+      "endpoint": "https://api.sambanova.ai/v1/chat/completions",
+      "api_key": "",
+      "model": "DeepSeek-V3.1",
+      "enabled": false,
+      "created_at": "2026-05-06T16:46:56.670810",
+      "updated_at": "2026-06-07T12:42:25.415813",
+      "last_discovered_at": "2026-06-07T12:42:25.415807",
+      "models": [
+        "DeepSeek-V3.1"
+      ]
+    },
+    {
+      "id": "3c4900d1",
+      "name": "Zhipu AI (Z.AI)",
+      "preset": "zhipu",
+      "format": "openai_compat",
+      "endpoint": "https://api.z.ai/api/paas/v4/chat/completions",
+      "api_key": "",
+      "model": "glm-4.5-flash",
+      "enabled": false,
+      "created_at": "2026-05-18T15:44:30.911790",
+      "updated_at": "2026-06-07T12:42:26.522771",
+      "last_discovered_at": "2026-06-07T12:42:26.522761",
+      "models": [
+        "glm-4.5-flash",
+        "glm-4.7-flash"
+      ]
+    },
+    {
+      "id": "7e7e4a05",
+      "name": "OpenRouter",
+      "preset": "openrouter",
+      "format": "openai_compat",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "api_key": "",
+      "model": "meta-llama/llama-3.3-70b-instruct:free",
+      "enabled": false,
+      "created_at": "2026-05-18T15:45:00.373045",
+      "updated_at": "2026-05-18T19:03:16.408937",
+      "last_discovered_at": null,
+      "models": [
+        "meta-llama/llama-3.3-70b-instruct:free"
+      ]
+    },
+    {
+      "id": "5aa74ae8",
+      "name": "Cloudflare Workers AI",
+      "preset": "cloudflare",
+      "format": "openai_compat",
+      "endpoint": "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1/chat/completions",
+      "api_key": "",
+      "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "enabled": false,
+      "created_at": "2026-06-07T16:37:12.547690",
+      "updated_at": "2026-06-07T17:31:19.632529",
+      "last_discovered_at": "2026-06-07T17:31:19.632521",
+      "models": [
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "@cf/qwen/qwq-32b"
+      ]
+    },
+    {
+      "id": "065ac300",
+      "name": "Cloudflare Workers AI",
+      "preset": "cloudflare",
+      "format": "openai_compat",
+      "endpoint": "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1/chat/completions",
+      "api_key": "",
+      "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "enabled": false,
+      "created_at": "2026-06-07T16:40:49.029600",
+      "updated_at": "2026-06-07T16:40:49.029600",
+      "last_discovered_at": null,
+      "models": [
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "@cf/qwen/qwq-32b"
+      ]
+    }
+  ]
+}

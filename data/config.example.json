@@ -1,0 +1,58 @@
+{
+  "analysis_path": "band_50_up",
+  "recommend_filters": {
+    "lottery": {
+      "min_consensus": 1,
+      "price_min": 0.0,
+      "price_max": 0.0,
+      "min_volume": 0,
+      "min_rr": 1.0,
+      "conviction": "all"
+    },
+    "band_5_10": {
+      "min_consensus": 1,
+      "price_min": 0.0,
+      "price_max": 0.0,
+      "min_volume": 0,
+      "min_rr": 1.0,
+      "conviction": "all"
+    },
+    "band_10_50": {
+      "min_consensus": 1,
+      "price_min": 0.0,
+      "price_max": 0.0,
+      "min_volume": 0,
+      "min_rr": 1.0,
+      "conviction": "all"
+    },
+    "band_50_up": {
+      "min_consensus": 1,
+      "price_min": 0.0,
+      "price_max": 0.0,
+      "min_volume": 0,
+      "min_rr": 1.0,
+      "conviction": "all"
+    }
+  },
+  "recommend_last_cash": "Any",
+  "use_eligibility_price_band_gate": true,
+  "use_unified_multi_path_prompts": true,
+  "use_concurrent_scan_dispatch": false,
+  "use_filter_recommend": true,
+  "use_recommend_exclude_owned": true,
+  "use_watch_no_rescind": true,
+  "use_fill_backoff": true,
+  "use_fairness_skip_empty": true,
+  "use_accuracy_weighted_consensus": true,
+  "use_count_badge": true,
+  "background_scheduler_enabled": true,
+  "auto_refresh_enabled": true,
+  "auto_refresh_interval_hours": 1,
+  "ui_mode": "dark",
+  "ai_paused": false,
+  "sec_contact_email": "",
+  "ai_chat_portfolio_context": false,
+  "last_price_tier": "Any",
+  "show_portfolio_watching_indicator": true,
+  "recommend_cooldown_days": 7
+}
