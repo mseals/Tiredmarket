@@ -194,6 +194,27 @@ def _direction_from_response(response: str) -> str:
     return ''
 
 
+def _direction_family(d) -> str:
+    """v4.14.6.23-outdated-fix: collapse direction strings into a family
+    for like-vs-like agreement comparison in is_consensus_outdated.
+
+    BUY-family — 'BUY', 'BUY MORE', 'BUYMORE' — all map to 'BUY'.
+    Everything else (HOLD, TRIM, SELL, AVOID, NO_CALL, …) keeps its
+    upper-case canonical string. Used by is_consensus_outdated to ask
+    "did the prediction and consensus winner actually disagree?" — the
+    previous hardcoded BUY-family literal at line 3243 treated EVERY
+    non-BUY winner (including HOLD vs HOLD) as a thesis break.
+
+    Mirrors tm_consensus._normalize_direction's canonicalization
+    behavior for BUY MORE / BUYMORE without taking a cross-module
+    import dependency.
+    """
+    u = (d or '').strip().upper()
+    if u in ('BUY', 'BUY MORE', 'BUYMORE'):
+        return 'BUY'
+    return u
+
+
 def _summarize_consensus(consensus: dict) -> tuple[str, str]:
     """Turn a consensus dict into (verdict_line, target_line) for the card.
 
@@ -3240,7 +3261,25 @@ class PortfolioPanel:
             from collections import Counter as _C
             counts = _C(str(v.get('direction', '')).upper() for v in committed)
             winner = counts.most_common(1)[0][0]
-            if winner not in ('BUY', 'BUY MORE', 'BUYMORE'):
+            # v4.14.6.23-outdated-fix: real same-direction comparison.
+            # Pre-fix this was a hardcoded BUY-family literal that treated
+            # every non-BUY winner (HOLD, TRIM, AVOID, SELL) as a thesis
+            # break — including the HOLD-vs-HOLD agreement case, which
+            # is why a same-day HOLD rerun still rendered OUTDATED.
+            # _find_buy_prediction_for_triggers (line 308-362) accepts
+            # HOLD/TRIM predictions as the trigger source, so the
+            # OUTDATED check must compare prediction direction against
+            # winner — not hardcode BUY as the only "agreement."
+            # BUY family (BUY / BUY MORE / BUYMORE) collapses to one
+            # bucket so a BUY → BUY MORE rerun reads as agreement.
+            # Defensive: an empty/missing prediction.direction will
+            # never equal a real winner family, so the function returns
+            # OUTDATED — that's intentional ("no direction recorded →
+            # let the fresh consensus rule the badge").
+            pred_dir = _direction_family(
+                (prediction or {}).get('direction'))
+            winner_fam = _direction_family(winner)
+            if winner_fam != pred_dir:
                 return True, winner
             return False, ''
         except Exception:
