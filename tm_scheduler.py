@@ -498,40 +498,53 @@ class EventDetector:
                 news = self.cache.news_features(ticker)
                 if news and isinstance(news, dict):
                     new_news_count = news.get('article_count', 0)
-                    # v4.14.5.14-phantom-news-fix Part A: suppress on
-                    # first observation (last_news_count is None means
-                    # we've never seen this ticker in-process AND no
-                    # persisted baseline was loaded — every restart
-                    # used to fire "<total> new" for every tradable
-                    # holding because the in-memory dict reset to 0).
-                    # Record the baseline without emitting an event;
-                    # the next tick will compute a real delta. Part B
-                    # then persists `_last_state` so subsequent restarts
-                    # skip the "first observation" branch entirely.
-                    if last_news_count is None:
-                        pass  # baseline recorded via state update below
-                    elif new_news_count > last_news_count:
-                        delta = new_news_count - last_news_count
-                        # In reduced mode, only fire on substantial news
-                        threshold = 1 if mode == MODE_ACTIVE else 3
-                        if delta >= threshold:
-                            # v4.14.5.14-phantom-news-fix Part C: the old
-                            # "<N> new news articles in last 30 min" line
-                            # claimed a freshness window that doesn't
-                            # exist — the 30 min is the check cadence, not
-                            # a per-article filter. RSS feeds routinely
-                            # publish back-catalog items that legitimately
-                            # bump the merged scan count. Reword to
-                            # describe what the delta actually IS.
-                            events.append({
-                                'ticker': ticker,
-                                'reason': f"{delta} more headline"
-                                          f"{'s' if delta>1 else ''} "
-                                          f"than at last check (checked "
-                                          f"every 30 min)",
-                                'severity': 'major' if delta >= 3 else 'minor',
-                                'event_type': 'news',
-                            })
+                # v4.14.6.21-news-identity: count GENUINELY NEW
+                # ingestions instead of comparing raw totals. The persist
+                # path (tired_market.save_news_batch) dedups on
+                # (ticker, url) so a row only exists once per URL at its
+                # true first-seen `timestamp`. Counting rows with
+                # `timestamp > last_news_check` therefore = number of
+                # never-before-seen headlines since the last check.
+                # Back-catalog republications, source-feed bounce, and
+                # merge-window swings no longer inflate the count.
+                #
+                # First-observation suppression is preserved: if
+                # last_news_check is None this branch never runs
+                # (should_check_news was set on the None path but
+                # last_news_count being None still gates the event
+                # below, same first-pass semantics as before).
+                #
+                # last_news_count is still written below for
+                # backward/diagnostic compatibility but no longer
+                # gates the event.
+                fresh_since_anchor = 0
+                anchor = last_news_check
+                if (self.db is not None and last_news_count is not None
+                        and anchor):
+                    try:
+                        row = self.db.conn.execute(
+                            "SELECT COUNT(*) FROM news_cache "
+                            "WHERE ticker=? AND timestamp > ?",
+                            (ticker, anchor)).fetchone()
+                        if row and row[0] is not None:
+                            fresh_since_anchor = int(row[0])
+                    except Exception:
+                        fresh_since_anchor = 0
+                if last_news_count is None:
+                    pass  # first observation — baseline only
+                elif fresh_since_anchor > 0:
+                    threshold = 1 if mode == MODE_ACTIVE else 3
+                    if fresh_since_anchor >= threshold:
+                        events.append({
+                            'ticker': ticker,
+                            'reason': (
+                                f"{fresh_since_anchor} new headline"
+                                f"{'s' if fresh_since_anchor>1 else ''} "
+                                f"since last check"),
+                            'severity': ('major' if fresh_since_anchor >= 3
+                                          else 'minor'),
+                            'event_type': 'news',
+                        })
             except Exception:
                 pass
 
