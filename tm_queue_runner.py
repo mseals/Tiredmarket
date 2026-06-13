@@ -875,6 +875,15 @@ def _run_event_driven_sweep(app) -> int:
                 pass
         if not tickers:
             continue
+        # v4.14.6.24-fill-terminal: a real event firing on this path is
+        # the strongest possible "something changed" signal — wake any
+        # structurally-short flag before dispatch so the next fill cycle
+        # is ready to resume. Cheap; idempotent if not flagged.
+        try:
+            _clear_structurally_short(
+                app, path, reason='event-driven dispatch')
+        except Exception:
+            pass
         try:
             run_one_pass_for_triggers(
                 app, path, tickers,
@@ -1584,6 +1593,156 @@ def _path_actionable_displayed(app, path: str) -> tuple:
     return (actionable, hidden, total)
 
 
+# v4.14.6.24-fill-terminal: terminal "structurally short" state for
+# bands that can't be filled from the current eligible universe + a
+# post-dispatch grace window so freshly-dispatched-but-unvoted picks
+# don't restart the cycle. Pre-fix: when consensus hid N of 10
+# displayed rows, fill-mode saw `actionable < target` and re-dispatched
+# every cooldown tick (capping at 60min on the zero-progress ladder)
+# even when the eligible universe genuinely couldn't produce more
+# BUYable candidates — ~10 AI calls/h per stuck path forever. This
+# adds a SECOND gate: once the cooldown ladder has plateaued AND the
+# universe is empty of fresh candidates, flag the path terminal and
+# skip from `_fill_needed` until a real change (a Layer 2 vote flips,
+# a new universe candidate appears, an event fires, OR a 24h failsafe
+# expires). All wake checks are cache-only (no AI dispatch) — same
+# pattern as the `_actionable_vote_cache` read-only gate above.
+_FILL_POST_DISPATCH_GRACE_SECONDS = 10 * 60         # 600s — give Layer 2 a chance to vote before re-evaluating
+_FILL_TERMINAL_AT_STREAK = 5                        # promote to terminal after this many ladder steps
+_FILL_TERMINAL_FAILSAFE_SECONDS = 24 * 60 * 60      # 24h safety re-check even when nothing observable changed
+_FILL_TERMINAL_PEEK_INTERVAL_SECONDS = 5 * 60       # throttle the candidate-peek wake-check
+
+
+def _displayed_validation_signature(app, path: str):
+    """SHA-1 of (ticker, votes_json, validated_at) across this path's
+    displayed-tier rows. Changes whenever Layer 2 writes a new vote OR
+    membership shifts — the cheap wake-up trigger for a structurally-
+    short band. Cache-only, NO AI."""
+    try:
+        conn = _conn(app)
+        if conn is None:
+            return None
+        with _db_lock(app):
+            rows = conn.execute(
+                "SELECT rc.ticker, COALESCE(v.votes_json,''), "
+                "       COALESCE(v.validated_at,0) "
+                "FROM recommend_cache rc "
+                "LEFT JOIN recommend_cache_validation v "
+                "  ON v.ticker = rc.ticker AND v.path = rc.path "
+                "WHERE rc.path = ? AND rc.tier = 'displayed'",
+                (path,)).fetchall()
+        import hashlib as _hl
+        return _hl.sha1(str(sorted(
+            (str(r[0]).upper(), str(r[1]), int(r[2] or 0))
+            for r in rows
+        )).encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def _set_structurally_short(app, path: str, reason: str) -> None:
+    """Promote a path to the terminal structurally-short state. Idempotent
+    (a second call on an already-flagged path is a no-op). Snapshots the
+    displayed-tier validation signature so a later Layer 2 vote change
+    wakes the path automatically. Best-effort; never raises."""
+    try:
+        ss = getattr(app, '_fill_structurally_short', None)
+        if ss is None:
+            ss = {}
+            app._fill_structurally_short = ss
+        if path in ss:
+            return
+        ss[path] = {
+            'set_at': time.time(),
+            'val_signature': _displayed_validation_signature(app, path),
+            'last_candidate_check': time.time(),
+            'reason': reason,
+        }
+        _log_amber(
+            app,
+            f"[fill-mode] {path}: structurally short ({reason}) — "
+            f"pausing AI dispatch until candidates / consensus / "
+            f"recency change. 24h failsafe re-check.")
+    except Exception:
+        pass
+
+
+def _clear_structurally_short(app, path: str, reason: str = '') -> None:
+    """Wake a structurally-short path. Used by both the internal
+    wake-check inside `_should_skip_structurally_short` and the
+    event-driven sweep hook (a real event on this path always wakes).
+    """
+    try:
+        ss = getattr(app, '_fill_structurally_short', None) or {}
+        if path in ss:
+            ss.pop(path, None)
+            if reason:
+                _log_muted(
+                    app,
+                    f"[fill-mode] {path}: structurally-short cleared "
+                    f"({reason}).")
+    except Exception:
+        pass
+
+
+def _should_skip_structurally_short(app, path: str) -> bool:
+    """Wake-aware skip predicate. Returns True iff path is in terminal
+    state AND no wake condition is met (caller skips the path from
+    `_fill_needed`). Wake conditions, all cache-only / NO AI dispatch:
+
+      1. Failsafe: ≥ 24h since terminal — re-check unconditionally
+         (covers the "something changed but my signals missed it"
+         long tail).
+      2. Displayed-tier validation/membership signature changed —
+         Layer 2 wrote a vote, or recommend_cache row swapped.
+      3. `_layered_candidate_batch` peek returns ≥ 1 candidate —
+         covers BOTH (a) new universe candidate became eligible, and
+         (b) a previously-judged ticker's verdict-recency window
+         expired (it re-enters the candidate set). Throttled to once
+         per `_FILL_TERMINAL_PEEK_INTERVAL_SECONDS` so the peek's DB
+         work doesn't run every tick.
+
+    On any wake, the flag is cleared and the function returns False so
+    the caller proceeds with one normal dispatch cycle. Subsequent
+    cycles re-evaluate: if `_run_fill_mode` again finds 0 actionable
+    gain AND no candidates, the terminal flag is re-applied — no
+    perma-loop risk.
+    """
+    ss = getattr(app, '_fill_structurally_short', None) or {}
+    info = ss.get(path)
+    if not info:
+        return False
+    now = time.time()
+    set_at = float(info.get('set_at') or 0)
+    if (now - set_at) >= _FILL_TERMINAL_FAILSAFE_SECONDS:
+        _clear_structurally_short(
+            app, path,
+            reason=f"failsafe re-check at {int((now-set_at)/3600)}h")
+        return False
+    try:
+        cur_sig = _displayed_validation_signature(app, path)
+        if cur_sig is not None and cur_sig != info.get('val_signature'):
+            _clear_structurally_short(
+                app, path,
+                reason='displayed validation/membership changed')
+            return False
+    except Exception:
+        pass
+    last_check = float(info.get('last_candidate_check') or 0)
+    if (now - last_check) >= _FILL_TERMINAL_PEEK_INTERVAL_SECONDS:
+        info['last_candidate_check'] = now
+        try:
+            cand, _ = _layered_candidate_batch(app, path, limit=1)
+            if cand:
+                _clear_structurally_short(
+                    app, path,
+                    reason='new candidate eligible')
+                return False
+        except Exception:
+            pass
+    return True
+
+
 def _fill_needed(app) -> list:
     """(path, deficit_score, displayed, bench, dtarget, bfloor) for
     every fill_enabled path below target. Displayed shortfall is
@@ -1688,6 +1847,28 @@ def _fill_needed(app) -> list:
                 _until = float(_cooldowns_fn.get(path, 0) or 0)
                 if _until and _now_fn < _until:
                     continue
+            # v4.14.6.24-fill-terminal: post-dispatch grace window. After
+            # dispatching a batch, give Layer 2 a chance to vote before
+            # re-evaluating "actionable < target" — otherwise an AVOID
+            # vote drops actionable count and the path re-enters needs
+            # immediately, restarting the cycle. Cache-only; the path
+            # is neither "filled" nor "needs fill" during the window —
+            # it's "awaiting votes."
+            _last_disp = getattr(app, '_fill_last_dispatch', None) or {}
+            _last_ts = float(_last_disp.get(path, 0) or 0)
+            if (_last_ts > 0
+                    and (_now_fn - _last_ts)
+                        < _FILL_POST_DISPATCH_GRACE_SECONDS):
+                continue
+            # v4.14.6.24-fill-terminal: terminal "structurally short"
+            # skip. Once a path has plateaued at the cooldown ladder
+            # AND the universe is empty of fresh candidates, the path
+            # is flagged terminal (see promotion sites in
+            # _run_fill_mode). The wake-check is cache-only and self-
+            # clears on signature change, candidate availability, or
+            # 24h failsafe — so a permanently-silent band is impossible.
+            if _should_skip_structurally_short(app, path):
+                continue
             needs.append((path, d_short * 3 + b_short, d, b,
                           dtarget, bfloor, _is_actionable_short))
 
@@ -2572,6 +2753,22 @@ def _run_fill_mode(app) -> None:
                 and _short_streak >= _ACTIONABLE_SHORT_MAX_CONSECUTIVE):
             _apply_zero_progress_cooldown(app, path, _short_streak,
                 reason='actionable-short cap reached')
+            # v4.14.6.24-fill-terminal: also promote to terminal here.
+            # The actionable-short cap fires when raw rows already
+            # meet target but consensus has hidden enough that
+            # actionable still doesn't — i.e. the dispatch found
+            # candidates but they're not converting. If on top of
+            # that the universe peek is also empty, there's nothing
+            # left to try; the hourly cooldown retry is wasted budget.
+            try:
+                _peek_cand, _ = _layered_candidate_batch(
+                    app, path, limit=1)
+                if not _peek_cand:
+                    _set_structurally_short(
+                        app, path,
+                        reason='actionable-short cap + universe swept')
+            except Exception:
+                pass
             cycles[path] = 0
             ass[path] = 0
             return
@@ -2604,6 +2801,22 @@ def _run_fill_mode(app) -> None:
             # for now," not "starving."
             no_cand[path] = now + _FILL_NO_CANDIDATES_COOLDOWN_SECONDS
             serviced[path] = tick_n
+            # v4.14.6.24-fill-terminal: if this path has ALREADY been
+            # struggling (zero-progress or actionable-short streak > 0)
+            # and the universe just gave us nothing, that's the
+            # terminal signal — the cycle has confirmed it can't fill.
+            # First-time no-candidates is benign (just "wait 5 min and
+            # try again"), so don't promote on a clean streak.
+            try:
+                _zps_v = int((getattr(app, '_fill_zero_progress_streak',
+                                       {}) or {}).get(path, 0) or 0)
+                _ass_v = int(ass.get(path, 0) or 0)
+                if (_zps_v + _ass_v) > 0:
+                    _set_structurally_short(
+                        app, path,
+                        reason='no candidates after prior struggle')
+            except Exception:
+                pass
             _nskip = int(getattr(app, '_fill_last_skip_count', 0))
             if _nskip > 0:
                 _log_routine(
@@ -2655,6 +2868,18 @@ def _run_fill_mode(app) -> None:
 
         run_one_pass_for_triggers(app, path, candidates,
                                   dispatch_label='fill-mode')
+
+        # v4.14.6.24-fill-terminal: stamp dispatch ts so _fill_needed's
+        # post-dispatch grace window can skip this path until Layer 2
+        # has a chance to vote (typical: ~5 min from dispatch to vote).
+        try:
+            _ldp = getattr(app, '_fill_last_dispatch', None)
+            if _ldp is None:
+                _ldp = {}
+                app._fill_last_dispatch = _ldp
+            _ldp[path] = time.time()
+        except Exception:
+            pass
 
         # Refresh recommend_cache so the new BUYs surface now (and the
         # deficit shrinks, closing the fill loop) instead of waiting
@@ -2712,6 +2937,28 @@ def _run_fill_mode(app) -> None:
                     # back fresh after its cooldown rather than carrying a
                     # near-cap counter into the next attempt.
                     cycles[path] = 0
+                    # v4.14.6.24-fill-terminal: terminal promotion. When
+                    # the zero-progress streak plateaus AND the universe
+                    # is empty of fresh candidates, the band is
+                    # structurally unfillable from the current eligible
+                    # set. Promote to terminal so the ~hourly cooldown
+                    # retry stops burning AI calls; wake-check in
+                    # `_fill_needed` will resume dispatch the moment a
+                    # signal genuinely changes.
+                    try:
+                        _new_streak = _prior + 1
+                        if _new_streak >= _FILL_TERMINAL_AT_STREAK:
+                            _peek_cand, _ = _layered_candidate_batch(
+                                app, path, limit=1)
+                            if not _peek_cand:
+                                _set_structurally_short(
+                                    app, path,
+                                    reason=(
+                                        f'Δactionable=0 streak '
+                                        f'{_new_streak}, universe '
+                                        f'swept'))
+                    except Exception:
+                        pass
         except Exception:
             pass
         _log_muted(
