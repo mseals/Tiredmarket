@@ -493,6 +493,10 @@ class MaintenanceWindow:
                 elif kind == 'apply_done':
                     res = evt[1]
                     self._on_apply_done(res)
+                elif kind == 'resume_verified':
+                    # v4.14.6.30: deferred liveness-check result.
+                    res = evt[1]
+                    self._on_resume_verified(res)
         except queue.Empty:
             pass
         finally:
@@ -629,14 +633,27 @@ class MaintenanceWindow:
             daemon=True).start()
 
     def _apply_worker(self, selected, options_by_id):
+        # v4.14.6.30: callback fires AFTER the deferred liveness check
+        # completes on the main thread. We just bridge it to the UI
+        # queue so all UI updates stay on the main thread.
+        def _on_verified(run):
+            try:
+                self._progress_q.put(('resume_verified', run))
+            except Exception:
+                pass
+
         try:
             res = self.engine.apply_selected(
-                selected, options_by_id=options_by_id)
+                selected, options_by_id=options_by_id,
+                on_resume_verified=_on_verified)
         except Exception as e:
             res = {
                 'results': [],
                 'log': [f'apply error: {type(e).__name__}: {e}'],
                 'pause_log': [], 'resume_log': [],
+                'resume_verified': {
+                    '_status': {'state': 'skipped',
+                                 'message': 'apply raised'}},
                 'manifest_path': '',
             }
         try:
@@ -645,6 +662,12 @@ class MaintenanceWindow:
             pass
 
     def _on_apply_done(self, res: dict):
+        # v4.14.6.30: cleanup is done, but the post-resume liveness
+        # check is still scheduled (~2.5s out, possibly +1.5s for a
+        # retry recheck). Save the partial result and show an interim
+        # "verifying" state. The final completion dialog fires from
+        # `_on_resume_verified` once the check completes — see below.
+        self._apply_result = res
         total_removed = sum(
             (r.get('removed', 0) or 0) + (r.get('archived', 0) or 0)
             for r in res.get('results', []))
@@ -654,6 +677,7 @@ class MaintenanceWindow:
         errs = []
         for r in res.get('results', []):
             errs.extend(r.get('errors') or [])
+        self._apply_totals = (total_removed, total_bytes, errs)
         self._log(f'--- APPLY complete: {total_removed:,} items / '
                   f'~{_human_bytes(total_bytes)} freed ---')
         if errs:
@@ -663,17 +687,141 @@ class MaintenanceWindow:
         mp = res.get('manifest_path')
         if mp:
             self._log(f'manifest saved: {mp}')
+
+        # Whether the engine is going to run a verification phase.
+        rv = res.get('resume_verified') or {}
+        rv_status = (rv.get('_status') or {}).get('state', 'pending')
+        if rv_status == 'pending':
+            self._log('verifying background tasks resumed…')
+            # Keep the buttons disabled — the run isn't really done yet.
+            # When verification completes, _on_resume_verified will
+            # re-enable + show the final dialog.
+        else:
+            # No verification scheduled (no daemons paused) — finalize
+            # right away.
+            self._finalize_apply_dialog(res)
+
+    def _on_resume_verified(self, res: dict):
+        """v4.14.6.30 — fired (on main thread) when the deferred
+        liveness check completes. Builds a summary of which daemons
+        are alive / recovered / DEAD / unverified, surfaces dead ones
+        prominently in the completion dialog, and finalizes UI state."""
+        verified = (res.get('resume_verified') or {})
+        # Strip the meta '_status' entry; the rest are real daemons.
+        daemon_entries = {
+            k: v for k, v in verified.items() if not k.startswith('_')
+        }
+        dead = [v.get('display', k) for k, v in daemon_entries.items()
+                if v.get('state') == 'DEAD']
+        recovered = [v.get('display', k)
+                     for k, v in daemon_entries.items()
+                     if v.get('state') == 'recovered_on_retry']
+        unverified = [v.get('display', k)
+                      for k, v in daemon_entries.items()
+                      if v.get('state') == 'unverified']
+        alive = [v.get('display', k)
+                 for k, v in daemon_entries.items()
+                 if v.get('state') == 'alive']
+
+        if dead:
+            self._log(
+                f'⚠ background task(s) did NOT resume: '
+                f'{", ".join(dead)}. Restart the app to restore them.')
+        if recovered:
+            self._log(
+                f'background task(s) recovered on retry: '
+                f'{", ".join(recovered)}.')
+        if unverified:
+            self._log(
+                f'background task(s) state could not be confirmed '
+                f'(module did not expose a thread handle): '
+                f'{", ".join(unverified)}.')
+        if alive and not dead:
+            self._log(
+                f'all background tasks resumed: {", ".join(alive)}.')
+
+        self._finalize_apply_dialog(res, dead=dead, recovered=recovered,
+                                    unverified=unverified, alive=alive)
+
+    def _finalize_apply_dialog(self, res: dict,
+                                dead=None, recovered=None,
+                                unverified=None, alive=None):
+        """Show the final completion dialog (replaces the original
+        in-line messagebox at the end of _on_apply_done). Distinguishes
+        ✅ all-resumed from ⚠ N-did-not-resume."""
+        dead = dead or []
+        recovered = recovered or []
+        unverified = unverified or []
+        alive = alive or []
+        # Re-tally totals (may have changed if rare race; use the saved
+        # totals when present).
+        if getattr(self, '_apply_totals', None) is not None:
+            total_removed, total_bytes, errs = self._apply_totals
+        else:
+            total_removed = sum(
+                (r.get('removed', 0) or 0) + (r.get('archived', 0) or 0)
+                for r in res.get('results', []))
+            total_bytes = sum(
+                int(r.get('bytes_freed', 0) or 0)
+                for r in res.get('results', []))
+            errs = []
+            for r in res.get('results', []):
+                errs.extend(r.get('errors') or [])
+        mp = res.get('manifest_path')
+
+        # Build the dialog text.
+        lines = [
+            f'{total_removed:,} items removed/archived.',
+            f'~{_human_bytes(total_bytes)} freed.',
+            '',
+        ]
+        if dead:
+            lines.append(
+                f'⚠ Background task(s) did NOT resume: '
+                f'{", ".join(dead)}.')
+            lines.append(
+                '  Restart the app to restore them.')
+        elif (alive or recovered) and not unverified:
+            lines.append('✅ All background tasks resumed.')
+        elif alive or recovered or unverified:
+            # Partial-confidence state: some alive, some unverified
+            # (no DEAD) — call it out honestly without alarm.
+            parts = []
+            if alive: parts.append(f'{len(alive)} alive')
+            if recovered: parts.append(f'{len(recovered)} recovered')
+            if unverified: parts.append(f'{len(unverified)} unverified')
+            lines.append(
+                f'Background tasks: {", ".join(parts)}.')
+            if unverified:
+                lines.append(
+                    '  (Unverified = module did not expose a thread '
+                    'handle; not a failure.)')
+        if recovered and not dead:
+            lines.append('')
+            lines.append(
+                f'Recovered on retry: {", ".join(recovered)}.')
+        if errs:
+            lines.append('')
+            lines.append(f'Errors: {len(errs)} (see log)')
+        if mp:
+            lines.append('')
+            lines.append(f'Manifest: {mp}')
+
         self._busy = False
         self.refresh_btn.configure(state='normal')
         self.excl_btn.configure(state='normal')
         self.close_btn.configure(state='normal')
-        messagebox.showinfo(
-            'Maintenance complete',
-            f'{total_removed:,} items removed/archived.\n'
-            f'~{_human_bytes(total_bytes)} freed.\n\n'
-            + (f'Errors: {len(errs)} (see log)\n' if errs else '')
-            + (f'Manifest: {mp}' if mp else ''),
-            parent=self.win)
+        title = (
+            'Maintenance complete — ⚠ tasks did not resume'
+            if dead else 'Maintenance complete')
+        # Use showwarning when something didn't come back so the
+        # platform icon matches the severity; showinfo otherwise.
+        if dead:
+            messagebox.showwarning(title, '\n'.join(lines),
+                                    parent=self.win)
+        else:
+            messagebox.showinfo(title, '\n'.join(lines),
+                                 parent=self.win)
 
 
 def open_maintenance_window(root: tk.Misc, app) -> MaintenanceWindow:

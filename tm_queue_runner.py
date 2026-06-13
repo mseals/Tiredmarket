@@ -251,7 +251,7 @@ def _runner_loop(app) -> None:
         fire list capped + prioritized; dispatched via
         run_one_pass_for_triggers.
 
-    Cfg flag flips manually (the user's choice) OR auto-flips after the
+    Cfg flag flips manually (Mike's choice) OR auto-flips after the
     14-day soak window stamped in cfg['event_driven_refresh_installed_at'].
     """
     stop_event = getattr(app, '_queue_runner_stop', None)
@@ -1161,7 +1161,7 @@ def run_one_pass_for_triggers(app, path: str,
     # v4.14.5.25: fold the unified-dispatch gated-skip count into the summary's
     # gated total. Without this, unified-path tickers gated at "0 eligible
     # paths" (0 AI calls) were counted as analyzed → the misleading
-    # "N analyzed via Groq" observed. The already-shipped honest wording
+    # "N analyzed via Groq" Mike saw. The already-shipped honest wording
     # (v4.14.5.14-queue-runner-log-honesty) then prints "all gated; 0 AI calls".
     _emit_summary_log(
         app, chosen, candidate_count=len(candidates),
@@ -1341,7 +1341,7 @@ _FILL_NORMAL_BATCH = 10           # steady-state per-pass candidate batch
 # overruns the per-minute token budget further before the limiter catches up,
 # and a shorter pass lets the deficit-yield rotation re-pick MORE often (fairer
 # interleave, so Speculative is reached sooner without crowding the high-value
-# paths). Conservative starting value — the user's single-provider tests refine it.
+# paths). Conservative starting value — Mike's single-provider tests refine it.
 _FILL_COLDSTART_BATCH = 30        # per-pass batch while far below target
 _FILL_COLDSTART_DEFICIT = 5       # displayed shortfall >= this == cold/catch-up
 
@@ -3088,7 +3088,7 @@ def _run_one_pass_body(app, rotation_path: str,
     timestamp across the cfg stamp and the queue-row insert."""
     # Pass-start heartbeat. Lands BEFORE the pick so a pick-failure
     # branch (which routes through _emit and may not log) still leaves
-    # a breadcrumb that the pass started. May 13 2026: the user's prior
+    # a breadcrumb that the pass started. May 13 2026: Mike's prior
     # session was a black hole for 45 min because all paths from
     # pick-failure suppressed activity-log output.
     _log_muted(app, "Queue runner pass starting...")
@@ -3132,7 +3132,7 @@ def _run_one_pass_body(app, rotation_path: str,
 
     # Pick-failure branch — three distinct reasons, three different
     # surface routes (one of them silent).
-    # v4.14.3.10: include rotation path in muted log lines so the user
+    # v4.14.3.10: include rotation path in muted log lines so Mike
     # can scan the activity log and see WHICH path got skipped. Do
     # NOT call _record_analysis_outcome here — picker state has
     # nothing to do with ticker freshness; falsely demoting tickers
@@ -3153,7 +3153,7 @@ def _run_one_pass_body(app, rotation_path: str,
             _set_run_outcome(app, 'no AI configured')
         elif reason == 'all_disabled':
             # May 13 2026: previously emitted system_event ONLY with no
-            # activity log breadcrumb. the user's session went silent for
+            # activity log breadcrumb. Mike's session went silent for
             # 45+ min while the runner correctly hit this branch every
             # 15 min — surface popups dismiss, log lines stick around.
             _log_muted(
@@ -3365,7 +3365,7 @@ def _run_one_pass_body(app, rotation_path: str,
     # router itself logs a similar line ('Scan single-provider mode:
     # rotating across N canonical model(s)') the first time it
     # dispatches under is_scan_run_active(). This runner-side
-    # announcement fires earlier and includes the path so the user sees
+    # announcement fires earlier and includes the path so Mike sees
     # the rotation start on the same line as the pass-start
     # heartbeat.
     _log_muted(
@@ -3982,7 +3982,18 @@ def _analyze_candidate(app, chosen: dict, ticker: str,
     Pre-v4.14.3.6 these three None-return paths were silent — every
     candidate looked identical to a real AI failure even when the cause
     was actually upstream of the AI call entirely. See the May 14
-    silent-failures investigation."""
+    silent-failures investigation.
+
+    v4.14.6.31: optional algorithmic tier-1 gate. The algo score + the
+    promote/skip decision are ALWAYS computed when shadow mode is on
+    (default) so the user can compare what the algo would have done
+    vs. what the AI did over a few days of normal use. When
+    cfg['use_algorithmic_tier1'] is True AND the algo says skip, this
+    function returns None BEFORE the per-candidate AI call — that's
+    where the rate-limit relief comes from. When the algo says promote
+    or the flag is off, the AI path runs as today. See
+    tm_algo_score.py for the scoring contract.
+    """
     if drop_reasons is None:
         drop_reasons = {}
 
@@ -3994,6 +4005,29 @@ def _analyze_candidate(app, chosen: dict, ticker: str,
     if hw is None:
         _bump('holdings_window_not_ready')
         return None
+
+    # ── v4.14.6.31: algorithmic tier-1 gate (shadow + optionally live) ──
+    cfg = getattr(app, 'cfg', None) or {}
+    algo_live = bool(cfg.get('use_algorithmic_tier1', False))
+    algo_shadow = bool(cfg.get('algo_tier1_shadow', True))
+    algo_decision = None  # populated by the gate when it runs
+    if algo_live or algo_shadow:
+        try:
+            algo_decision = _algo_gate_decide(app, chosen, ticker, path, cfg)
+        except Exception as e:
+            # Algo failure must NEVER break tier-1. Fall back to AI path.
+            algo_decision = {
+                'error': f'{type(e).__name__}: {e}',
+                'algo_would_promote': True,  # safe-fail: don't drop the candidate
+                'score': None, 'reasons': [],
+            }
+        # LIVE-mode action: drop the candidate before the AI call when
+        # the algo says skip. Shadow mode never acts — only logs.
+        if algo_live and not algo_decision.get('algo_would_promote', True):
+            _bump('algo_tier1_skip')
+            _algo_log_shadow(app, ticker, path, algo_decision,
+                              ai_ran=False, ai_prediction=None)
+            return None
 
     # Build the candidate prompt via the existing helper.
     try:
@@ -4010,8 +4044,142 @@ def _analyze_candidate(app, chosen: dict, ticker: str,
     # v4.14.5.62-concurrent-scan: scan_provider_filter pins this call to one
     # provider (a concurrent worker passes its own provider id); None keeps
     # the full router rotation (the sequential default — unchanged).
-    return _run_cloud_one(app, prompt, ticker, path, chosen,
+    pred = _run_cloud_one(app, prompt, ticker, path, chosen,
                           scan_provider_filter=scan_provider_filter)
+    # v4.14.6.31: shadow log — capture both decisions for A/B review.
+    # Skipped when the algo gate didn't run (feature + shadow both off).
+    if algo_decision is not None:
+        try:
+            _algo_log_shadow(app, ticker, path, algo_decision,
+                              ai_ran=True, ai_prediction=pred)
+        except Exception:
+            pass  # logging must never affect dispatch
+    return pred
+
+
+# ─── v4.14.6.31 — algorithmic tier-1 helpers ──────────────────────────
+
+def _algo_gate_decide(app, chosen: dict, ticker: str, path: str,
+                      cfg: dict) -> dict:
+    """Compute the algo score + would-promote decision for one
+    candidate. Pure read; no side effects on app state. Returns:
+
+        {
+          'score': float | None,
+          'reasons': list[str],
+          'algo_would_promote': bool,
+          'gate_reason': str,
+          'event_triggered': bool,
+          'threshold': float,
+        }
+    """
+    import tm_algo_score as _algo
+    threshold = float(cfg.get('algo_tier1_threshold', 65.0))
+    trigger_bypass = bool(cfg.get('algo_tier1_trigger_bypass', True))
+
+    # Pull features. `_holdings_window.cache` is the same cache the
+    # candidate-prompt builder reads from, so this is consistent with
+    # what the AI is being shown.
+    hw = getattr(app, '_holdings_window', None)
+    cache = getattr(hw, 'cache', None) if hw is not None else None
+    raw_tech = None
+    raw_news = None
+    if cache is not None:
+        try:
+            raw_tech = cache.technicals(ticker) or None
+        except Exception:
+            raw_tech = None
+        try:
+            raw_news = cache.news_features(ticker) or None
+        except Exception:
+            raw_news = None
+
+    feats = _algo.normalize_features(raw_tech, raw_news)
+    score, reasons = _algo.score_for_promotion(feats)
+
+    # Event-triggered: best-effort heuristic. The candidate dict
+    # carries the trigger 'kind' when it originated from the
+    # event-driven path; universe-sweep candidates do not. Defaults
+    # safely to False (algo gates on score in that case).
+    kind = (chosen or {}).get('kind') or (chosen or {}).get('fire_kind')
+    event_triggered = bool(kind) and str(kind).lower() not in (
+        'universe', 'sweep', '', 'staleness')
+
+    promote, gate_reason = _algo.should_promote(
+        score, threshold, event_triggered, trigger_bypass)
+    return {
+        'score': score,
+        'reasons': reasons,
+        'algo_would_promote': promote,
+        'gate_reason': gate_reason,
+        'event_triggered': event_triggered,
+        'threshold': threshold,
+    }
+
+
+def _algo_log_shadow(app, ticker: str, path: str, decision: dict,
+                      ai_ran: bool,
+                      ai_prediction: Optional[dict]) -> None:
+    """Append one line to data/algo_shadow.jsonl capturing both the
+    algorithmic decision and (when present) the AI's decision for the
+    same candidate. This is the A/B telemetry the user reviews to
+    decide whether to flip cfg['use_algorithmic_tier1'].
+
+    Schema (newline-delimited JSON, one record per call):
+      {
+        ts:                ISO timestamp,
+        ticker:            str,
+        path:              str (slow_safe / moderate / aggressive / ...),
+        algo_score:        float | null,
+        algo_would_promote: bool,
+        algo_gate_reason:  str,
+        algo_reasons:      [str, ...],  # rules that fired
+        event_triggered:   bool,
+        threshold:         float,
+        ai_ran:            bool,
+        ai_promoted:       bool | null,   # true if AI emitted a BUY
+        ai_direction:      str  | null,
+        algo_error:        str | null,
+      }
+
+    Best-effort; failures here are swallowed (logging must not block
+    dispatch).
+    """
+    import json
+    import os
+    from datetime import datetime as _dt
+    try:
+        ai_promoted: Optional[bool] = None
+        ai_direction: Optional[str] = None
+        if ai_ran and isinstance(ai_prediction, dict):
+            d = str(ai_prediction.get('direction') or '').upper()
+            ai_direction = d or None
+            # BUY-family verdicts mean "promoted to tier-2" downstream.
+            ai_promoted = d in ('BUY', 'STRONG_BUY')
+        record = {
+            'ts':                 _dt.utcnow().isoformat(timespec='seconds') + 'Z',
+            'ticker':             ticker,
+            'path':               path,
+            'algo_score':         decision.get('score'),
+            'algo_would_promote': bool(decision.get('algo_would_promote')),
+            'algo_gate_reason':   decision.get('gate_reason', ''),
+            'algo_reasons':       list(decision.get('reasons', [])),
+            'event_triggered':    bool(decision.get('event_triggered')),
+            'threshold':          decision.get('threshold'),
+            'ai_ran':             bool(ai_ran),
+            'ai_promoted':        ai_promoted,
+            'ai_direction':       ai_direction,
+            'algo_error':         decision.get('error'),
+        }
+        # Path: alongside other operational data files.
+        log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'data', 'algo_shadow.jsonl')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, default=str) + '\n')
+    except Exception:
+        pass  # never raise from a logging helper
 
 
 
@@ -4046,7 +4214,7 @@ def _run_cloud_one(app, prompt: str, ticker: str, path: str,
         # v4.14.3.6 (2026-05-14): wire log_fn through so the smart
         # router's existing diagnostic output (cooldown skips,
         # transient retries, [degradation] tags, all-exhausted
-        # breadcrumbs) reaches the user's activity log. Pre-v4.14.3.6
+        # breadcrumbs) reaches Mike's activity log. Pre-v4.14.3.6
         # this was None — all of the router's wonderful diagnostic
         # surface vanished into a no-op gate, leaving the queue
         # runner's amber summary as the only signal that anything
@@ -4412,7 +4580,7 @@ def _run_local_multi(app, prompt, ticker, eligible_paths):
         # Reuse _run_local_one's transport by asking it for the raw
         # parsed dict; but we need raw text → call the model directly
         # the same way _run_local_one does is over-engineering here.
-        # Local is rare for the user (cloud-only); fail OPEN to per-path.
+        # Local is rare for Mike (cloud-only); fail OPEN to per-path.
         return None
     except Exception:
         return None
@@ -5280,7 +5448,7 @@ _HEARTBEAT_INTERVAL = timedelta(minutes=15)
 
 def _heartbeat_if_quiet(app) -> None:
     """v4.14.5.25-activity-log-tiering: emit a periodic [heartbeat] liveness
-    pulse on a FIXED interval, independent of other logging — so the user always
+    pulse on a FIXED interval, independent of other logging — so Mike always
     has a visible sign of life. (The pre-v4.14.5.25 trigger was '30+ min since
     the runner last logged anything', but with routine breadcrumbs now collapsed
     that timer keeps getting refreshed — _safe_log stamps last-log even on

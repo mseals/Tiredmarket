@@ -1009,6 +1009,237 @@ def _resume_all_daemons(app) -> list:
     return log
 
 
+# ─── v4.14.6.30 — post-resume liveness verification ────────────────────
+#
+# The pre-v4.14.6.30 resume was fire-and-forget: the manifest recorded
+# "restarted" the moment the launch call returned, even if the daemon
+# crashed on init. A silently-dead daemon would sit dead until the user
+# restarted the app — invisible to them since the maintenance dialog
+# reported success.
+#
+# This block adds a deferred (~2.5s) liveness check after resume:
+#   - For each daemon `_resume_all_daemons` is supposed to start, look
+#     up its thread handle (same attrs `_wait_for_daemons_quiescent`
+#     uses) and `.is_alive()` it.
+#   - If DEAD, retry the restart ONCE, recheck.
+#   - Outcome per daemon ∈ {'alive', 'recovered_on_retry', 'DEAD',
+#     'unverified'}. 'unverified' covers the case where a module
+#     doesn't expose a thread handle — we'd rather stay silent than
+#     cry wolf.
+#   - Surviving DEAD daemons are surfaced to the user (via the UI
+#     completion dialog) AND to activity.log (via app._log if
+#     available) so they're never silently lost.
+#
+# The check is async (scheduled via app.root.after) and does NOT block
+# the engine or UI. The manifest log is rewritten with the verified
+# truth once the check completes.
+
+# Display name (for the UI) + thread attr on `app`. ORDER matches
+# `_resume_all_daemons`. Daemons whose modules don't currently expose a
+# thread handle can be added here later (they'll naturally report
+# 'unverified' until then).
+_RESUMED_DAEMONS = (
+    ('scheduler',    'Scheduler',    '_scheduler_thread'),
+    ('queue_runner', 'Queue runner', '_queue_runner_thread'),
+    ('layer2',       'Layer-2 validation', '_layer2_thread'),
+    ('layer3',       'Layer-3 replace',    '_layer3_thread'),
+    ('fundfile',     'Fundfile refresh',   '_fundfile_thread'),
+)
+
+# Delay before the post-resume check fires. Long enough for the
+# scheduler's `root.after(0, ...)` dispatch + the queue runner / layer
+# threads to come up; short enough that the user perceives the
+# completion dialog as snappy.
+_RESUME_VERIFY_DELAY_MS = 2500
+# Delay between retry and re-check, if the first verify finds DEAD.
+_RESUME_VERIFY_RETRY_DELAY_MS = 1500
+
+
+def _check_daemon_alive(app, thread_attr: str) -> str:
+    """Returns 'alive' / 'DEAD' / 'unverified'.
+
+    'unverified' = no thread handle exposed (attr missing / None / no
+    .is_alive). NOT a failure; the daemon module simply hasn't been
+    instrumented for thread-level checks. We log it so it's visible
+    but don't cry wolf.
+    """
+    if not thread_attr:
+        return 'unverified'
+    t = getattr(app, thread_attr, None)
+    if t is None:
+        return 'unverified'
+    try:
+        return 'alive' if t.is_alive() else 'DEAD'
+    except Exception:
+        return 'unverified'
+
+
+def _retry_resume_one(app, daemon_id: str) -> tuple[bool, str]:
+    """Retry the restart for ONE daemon. Returns (ok, message).
+    Mirrors the per-daemon logic in `_resume_all_daemons`, isolated so
+    the verifier can target a single daemon."""
+    try:
+        if daemon_id == 'scheduler':
+            if hasattr(app, '_start_scheduler'):
+                app.root.after(0, app._start_scheduler)
+                return True, 'scheduler: retry restart scheduled'
+            return False, 'scheduler: no _start_scheduler attr'
+        if daemon_id == 'queue_runner':
+            import tm_queue_runner
+            if hasattr(tm_queue_runner, 'start_queue_runner'):
+                tm_queue_runner.start_queue_runner(app)
+                return True, 'queue runner: retry restart issued'
+            return False, 'queue runner: no start_queue_runner'
+        if daemon_id == 'layer2':
+            import tm_layer2_validation as _tl2
+            if hasattr(_tl2, 'launch_layer2_validation'):
+                _tl2.launch_layer2_validation(app)
+                return True, 'layer2: retry restart issued'
+            return False, 'layer2: no launch fn'
+        if daemon_id == 'layer3':
+            import tm_layer3_replace as _tl3
+            if hasattr(_tl3, 'launch_layer3_replace'):
+                _tl3.launch_layer3_replace(app)
+                return True, 'layer3: retry restart issued'
+            return False, 'layer3: no launch fn'
+        if daemon_id == 'fundfile':
+            import tm_fundfile_fetcher as _tff
+            if hasattr(_tff, 'launch_fundfile_refresh'):
+                _tff.launch_fundfile_refresh(app)
+                return True, 'fundfile: retry restart issued'
+            return False, 'fundfile: no launch fn'
+        return False, f'{daemon_id}: unknown daemon id'
+    except Exception as e:
+        return False, f'{daemon_id}: retry raised {type(e).__name__}: {e}'
+
+
+def _verify_resume(app, run: dict,
+                   on_done: Optional[Callable[[dict], None]] = None,
+                   _retry_phase: bool = False) -> None:
+    """Walk every daemon `_resume_all_daemons` is supposed to start,
+    check `.is_alive()`, retry once for any found DEAD, recheck, and
+    record the verified outcome in `run['resume_verified']`. Then
+    rewrite the manifest log on disk and fire the on_done callback.
+
+    Two phases (driven by `_retry_phase`):
+      Phase 1 (initial): build initial verdict; if any DEAD, retry each
+                         and re-call this function with retry_phase=True.
+      Phase 2 (recheck): finalize state, write manifest, surface dead
+                         daemons via app._log + on_done callback.
+    """
+    verified: dict = run.setdefault('resume_verified', {})
+
+    if not _retry_phase:
+        # Phase 1: initial check across all resumed daemons.
+        dead_ids: list = []
+        for daemon_id, display, thread_attr in _RESUMED_DAEMONS:
+            state = _check_daemon_alive(app, thread_attr)
+            verified[daemon_id] = {
+                'display': display, 'state': state, 'retried': False,
+            }
+            if state == 'DEAD':
+                dead_ids.append(daemon_id)
+
+        if dead_ids:
+            # Retry each dead daemon once, then schedule the recheck.
+            retry_log: list = run.setdefault('resume_retry_log', [])
+            for daemon_id in dead_ids:
+                ok, msg = _retry_resume_one(app, daemon_id)
+                retry_log.append(msg)
+                verified[daemon_id]['retried'] = True
+                verified[daemon_id]['retry_ok'] = bool(ok)
+            try:
+                app.root.after(
+                    _RESUME_VERIFY_RETRY_DELAY_MS,
+                    lambda: _verify_resume(
+                        app, run, on_done=on_done, _retry_phase=True))
+                return
+            except Exception:
+                # Fall through to finalization inline (no event loop
+                # available — used by smoke tests).
+                time.sleep(_RESUME_VERIFY_RETRY_DELAY_MS / 1000.0)
+                _verify_resume(
+                    app, run, on_done=on_done, _retry_phase=True)
+                return
+        # No dead daemons — fall through to finalize.
+
+    else:
+        # Phase 2: recheck the daemons we retried.
+        for daemon_id, display, thread_attr in _RESUMED_DAEMONS:
+            entry = verified.get(daemon_id) or {
+                'display': display, 'state': 'unverified',
+                'retried': False,
+            }
+            if not entry.get('retried'):
+                continue
+            new_state = _check_daemon_alive(app, thread_attr)
+            if new_state == 'alive':
+                entry['state'] = 'recovered_on_retry'
+            else:
+                # Still not alive (or 'unverified' on a missing attr)
+                # — leave it as DEAD so the UI surfaces it. Unverified
+                # after retry is essentially indistinguishable from
+                # DEAD from the user's perspective (the daemon was
+                # supposed to be live and isn't reporting it).
+                entry['state'] = 'DEAD'
+            verified[daemon_id] = entry
+
+    # Finalize: compute the surviving DEAD list, log warnings, rewrite
+    # the manifest, fire the on_done callback.
+    survivors_dead = [
+        v['display'] for v in verified.values()
+        if v.get('state') == 'DEAD'
+    ]
+    unverified = [
+        v['display'] for v in verified.values()
+        if v.get('state') == 'unverified'
+    ]
+    recovered = [
+        v['display'] for v in verified.values()
+        if v.get('state') == 'recovered_on_retry'
+    ]
+
+    # Surface dead daemons to activity.log via the app's logger if
+    # available (so non-maintenance-UI users — and any post-hoc log
+    # review — see the warning).
+    if survivors_dead:
+        try:
+            warn = (f"[maintenance] WARNING: background task(s) failed "
+                    f"to resume after cleanup: "
+                    f"{', '.join(survivors_dead)}. Restart the app to "
+                    f"restore them.")
+            if hasattr(app, '_log'):
+                app._log(warn, 'amber')
+        except Exception:
+            pass
+    if recovered:
+        try:
+            if hasattr(app, '_log'):
+                app._log(
+                    f"[maintenance] background task(s) recovered on "
+                    f"retry after resume: {', '.join(recovered)}.",
+                    'green')
+        except Exception:
+            pass
+
+    # Rewrite the manifest log on disk with verified truth.
+    mp = run.get('manifest_path')
+    if mp:
+        try:
+            with open(mp, 'w', encoding='utf-8') as f:
+                json.dump(run, f, indent=2, default=str)
+        except Exception as e:
+            run.setdefault('log', []).append(
+                f'manifest rewrite failed: {e}')
+
+    # Fire the UI callback (best-effort; never block on its raise).
+    if on_done is not None:
+        try:
+            on_done(run)
+        except Exception:
+            pass
+
+
 # ─── VACUUM helpers ────────────────────────────────────────────────────
 
 def _vacuum_db(db_path: Path, log_fn: Callable[[str], None] = None) -> bool:
@@ -1074,11 +1305,33 @@ class MaintenanceEngine:
         return out
 
     def apply_selected(self, selected_ids: list,
-                       options_by_id: dict = None) -> dict:
+                       options_by_id: dict = None,
+                       on_resume_verified: Optional[
+                           Callable[[dict], None]] = None) -> dict:
         """Apply the selected tasks. Pauses daemons before any DB write,
         runs each task in its own transaction, VACUUMs affected DBs,
         resumes daemons, writes the manifest log.
-        Returns {results: [ApplyResult], log: [str], manifest_path: str}.
+        Returns {results: [ApplyResult], log: [str], manifest_path: str,
+                 resume_verified: dict}.
+
+        v4.14.6.30 — `on_resume_verified` callback:
+          When supplied, after the synchronous resume completes the
+          engine schedules a deferred (~2.5s) liveness check via
+          `app.root.after`. The check verifies each resumed daemon is
+          actually alive, retries any found DEAD once, surfaces
+          unrecovered DEAD daemons to the user via `app._log` AND via
+          the callback. The manifest log on disk is REWRITTEN with the
+          verified truth.
+
+          During the window between resume and verification,
+          `run['resume_verified']` carries the dict
+              {'state': 'pending', 'message': 'verification in progress'}
+          so any caller that reads the dict immediately knows it's not
+          yet final.
+
+          If `app.root.after` is unavailable (no Tk root — e.g. smoke
+          tests), the engine runs the check inline (after time.sleep),
+          so the return semantics stay the same.
         """
         options_by_id = options_by_id or {}
         selected_ids = set(selected_ids)
@@ -1088,6 +1341,16 @@ class MaintenanceEngine:
             'log':        [],
             'pause_log':  [],
             'resume_log': [],
+            # v4.14.6.30 — populated by _verify_resume after the
+            # deferred check. Initial 'pending' so consumers know the
+            # final state isn't yet decided.
+            'resume_verified': {
+                '_status': {
+                    'state': 'pending',
+                    'message': 'verification in progress',
+                }
+            },
+            'resume_retry_log': [],
             'manifest_path': '',
         }
 
@@ -1152,7 +1415,10 @@ class MaintenanceEngine:
         except Exception:
             pass
 
-        # 6. Write manifest log.
+        # 6. Write manifest log (initial — v4.14.6.30 rewrites it after
+        # the post-resume liveness check below completes, so the
+        # on-disk record reflects verified truth, not the optimistic
+        # resume_log).
         try:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_path = Path(__file__).parent / 'data' / f'cleanup_manifest_{ts}.log'
@@ -1161,6 +1427,37 @@ class MaintenanceEngine:
             run['manifest_path'] = str(log_path)
         except Exception as e:
             run['log'].append(f'manifest write failed: {e}')
+
+        # 7. Schedule the deferred liveness verification.
+        # v4.14.6.30 — only when we actually paused/resumed (i.e. there
+        # was a resume_log). If nothing ticked, skip the check.
+        if run.get('resume_log'):
+            try:
+                app_root = getattr(self.app, 'root', None)
+                if app_root is not None and hasattr(app_root, 'after'):
+                    # UI / event loop available — schedule async.
+                    app_root.after(
+                        _RESUME_VERIFY_DELAY_MS,
+                        lambda: _verify_resume(
+                            self.app, run,
+                            on_done=on_resume_verified))
+                else:
+                    # No Tk root (smoke tests, headless). Run inline
+                    # after a short sleep so semantics match.
+                    time.sleep(_RESUME_VERIFY_DELAY_MS / 1000.0)
+                    _verify_resume(
+                        self.app, run, on_done=on_resume_verified)
+            except Exception as e:
+                run['log'].append(
+                    f'resume verification scheduling failed: {e}')
+        else:
+            # No pause/resume cycle — mark verified state as N/A.
+            run['resume_verified'] = {
+                '_status': {
+                    'state': 'skipped',
+                    'message': 'no pause/resume cycle (no tasks ran)',
+                }
+            }
 
         return run
 

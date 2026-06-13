@@ -538,11 +538,75 @@ def _upsert_many(
     table: str,
     columns: list[str],
     rows: Iterable[dict],
+    *,
+    pk: list[str] | tuple[str, ...] | str,
+    coalesce: bool = False,
 ) -> int:
-    """Generic INSERT OR REPLACE for a table with named columns."""
+    """Column-explicit UPSERT for a table with named columns.
+
+    v4.14.6.29-no-clobber-everywhere: replaces the original
+    `INSERT OR REPLACE` implementation, which had two latent issues —
+    (1) on a PARTIAL-row write (caller supplies only a subset of cols
+    via `row.get(c)` defaulting absent keys to None), every omitted
+    column was silently nulled out, the same clobber bug v4.14.6.26
+    fixed for `tickers` via the scoped `upsert_tickers`; (2) `INSERT
+    OR REPLACE` issues a DELETE then an INSERT under the hood, which
+    rotates rowid and is rougher on triggers/FKs than `ON CONFLICT
+    DO UPDATE`.
+
+    The replacement is `INSERT ... ON CONFLICT(pk) DO UPDATE SET
+    <non-pk-cols>`. Two modes via `coalesce`:
+
+      coalesce=False (default — full overwrite):
+        Non-PK cols use `col = excluded.col`. Incoming value always
+        wins, INCLUDING when incoming is NULL/0. Use for tables where
+        a corrected/recomputed value (potentially clearing a field)
+        must apply: daily_bars (corrected OHLCV bars), macro_indicators
+        (single value per series-date), splits_dividends (single event
+        value), insider_flow (recomputed aggregate — a NULL recompute
+        must clear stale data).
+
+      coalesce=True:
+        Non-PK cols use `col = COALESCE(excluded.col, table.col)`.
+        Incoming non-NULL wins; incoming NULL preserves the stored
+        value. Use for append/accumulate tables with multi-source
+        partial writes: fundamentals (EDGAR fills some fields, Yahoo
+        fills others — neither should null the other's data),
+        filings (description column added in v4.14.5.62; pre-existing
+        rows have description=NULL, and a future refetch that
+        re-supplies metadata shouldn't undo the description that
+        landed in between).
+
+    `pk` is the primary-key column name(s) — string or list/tuple.
+    Required: there is no safe sensible default per-table without
+    knowing the schema; callers always know their PK.
+    """
     cols_csv = ", ".join(columns)
     placeholders = ", ".join("?" for _ in columns)
-    sql = f"INSERT OR REPLACE INTO {table} ({cols_csv}) VALUES ({placeholders})"
+    pk_cols = [pk] if isinstance(pk, str) else list(pk)
+    non_pk = [c for c in columns if c not in pk_cols]
+    if non_pk:
+        if coalesce:
+            update_clause = ", ".join(
+                f"{c} = COALESCE(excluded.{c}, {table}.{c})"
+                for c in non_pk
+            )
+        else:
+            update_clause = ", ".join(
+                f"{c} = excluded.{c}" for c in non_pk
+            )
+        pk_csv = ", ".join(pk_cols)
+        sql = (
+            f"INSERT INTO {table} ({cols_csv}) VALUES ({placeholders}) "
+            f"ON CONFLICT({pk_csv}) DO UPDATE SET {update_clause}"
+        )
+    else:
+        # PK-only table (no non-PK cols) — on conflict there is nothing
+        # to update, so just keep the existing row.
+        sql = (
+            f"INSERT INTO {table} ({cols_csv}) VALUES ({placeholders}) "
+            f"ON CONFLICT DO NOTHING"
+        )
     count = 0
     for row in rows:
         values = [row.get(c) for c in columns]
@@ -689,7 +753,7 @@ def upsert_tickers(rows: Iterable[dict]) -> int:
 
 
 def upsert_daily_bars(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into daily_bars.
+    """Upsert rows into daily_bars (full-overwrite via ON CONFLICT).
 
     v4.14.5.6: also writes cache_metadata.have_from_date/have_to_date
     per ticker. This is the SINGLE chokepoint for every daily_bars
@@ -702,7 +766,10 @@ def upsert_daily_bars(rows: Iterable[dict]) -> int:
     conn = get_connection()
     try:
         with conn:
-            n = _upsert_many(conn, "daily_bars", _DAILY_BARS_COLS, rows)
+            n = _upsert_many(
+                conn, "daily_bars", _DAILY_BARS_COLS, rows,
+                pk=["ticker", "date"], coalesce=False,
+            )
     finally:
         conn.close()
 
@@ -741,7 +808,13 @@ def upsert_daily_bars(rows: Iterable[dict]) -> int:
 
 
 def upsert_fundamentals(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into fundamentals.
+    """Upsert rows into fundamentals (COALESCE-preserving via ON CONFLICT).
+
+    v4.14.6.29-no-clobber-everywhere: uses COALESCE on every non-PK
+    column so a partial write from one source (e.g. EDGAR fills
+    revenue/eps/margins) does not null out fields filled by another
+    source (e.g. Yahoo's shares_outstanding). Closes the same clobber
+    class v4.14.6.26 fixed for tickers.
 
     v4.14.6.25-fundamentals-row-fetched-at: every row gets a
     `fetched_at` timestamp stamped here if the caller didn't supply
@@ -758,7 +831,10 @@ def upsert_fundamentals(rows: Iterable[dict]) -> int:
     conn = get_connection()
     try:
         with conn:
-            return _upsert_many(conn, "fundamentals", _FUNDAMENTALS_COLS, rows)
+            return _upsert_many(
+                conn, "fundamentals", _FUNDAMENTALS_COLS, rows,
+                pk=["ticker", "fiscal_period_end"], coalesce=True,
+            )
     finally:
         conn.close()
 
@@ -802,17 +878,31 @@ def upsert_earnings_cache(ticker: str, *, events_json: str, status: str,
                           next_retry_at: float | None = None,
                           attempts: int = 0,
                           source: str | None = None) -> None:
-    """INSERT OR REPLACE the earnings row for ticker. status ∈ ok|empty|failed."""
+    """Upsert the earnings row for ticker. status ∈ ok|empty|failed.
+    Full-overwrite via ON CONFLICT DO UPDATE (see v4.14.6.29)."""
     t = (ticker or "").upper()
     if not t:
         return
     conn = get_connection()
     try:
         with conn:
+            # v4.14.6.29-no-clobber-everywhere: switched from
+            # INSERT OR REPLACE to ON CONFLICT DO UPDATE. Same
+            # full-overwrite semantic — every status flip /
+            # next_retry_at update / attempts reset must apply
+            # (including clearing to NULL/0) — but column-explicit
+            # and rowid-stable.
             conn.execute(
-                "INSERT OR REPLACE INTO earnings "
+                "INSERT INTO earnings "
                 "(ticker, events_json, status, as_of, next_retry_at, attempts, source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(ticker) DO UPDATE SET "
+                "  events_json   = excluded.events_json, "
+                "  status        = excluded.status, "
+                "  as_of         = excluded.as_of, "
+                "  next_retry_at = excluded.next_retry_at, "
+                "  attempts      = excluded.attempts, "
+                "  source        = excluded.source",
                 (t, events_json, status, as_of, next_retry_at, int(attempts or 0), source),
             )
     finally:
@@ -855,7 +945,8 @@ def get_all_fundamentals_status(status: str | None = None) -> list[sqlite3.Row]:
 def upsert_fundamentals_status(ticker: str, *, status: str,
                                as_of: str | None = None,
                                source: str | None = None) -> None:
-    """INSERT OR REPLACE the fundamentals-status row. status ∈ 'ok'|'empty'.
+    """Upsert the fundamentals-status row. status ∈ 'ok'|'empty'.
+    Full-overwrite via ON CONFLICT DO UPDATE (see v4.14.6.29).
     Writing 'ok' (data found) clears a prior 'empty' so a ticker that later
     gains coverage is no longer skipped."""
     t = (ticker or "").upper()
@@ -864,9 +955,16 @@ def upsert_fundamentals_status(ticker: str, *, status: str,
     conn = get_connection()
     try:
         with conn:
+            # v4.14.6.29-no-clobber-everywhere: full-overwrite via
+            # ON CONFLICT DO UPDATE. Status flip ('empty' → 'ok')
+            # must apply.
             conn.execute(
-                "INSERT OR REPLACE INTO fundamentals_status "
-                "(ticker, status, as_of, source) VALUES (?, ?, ?, ?)",
+                "INSERT INTO fundamentals_status "
+                "(ticker, status, as_of, source) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(ticker) DO UPDATE SET "
+                "  status = excluded.status, "
+                "  as_of  = excluded.as_of, "
+                "  source = excluded.source",
                 (t, status, as_of, source),
             )
     finally:
@@ -912,7 +1010,8 @@ def get_all_filings_status(status: str | None = None) -> list[sqlite3.Row]:
 def upsert_filings_status(ticker: str, *, status: str,
                           as_of: str | None = None,
                           source: str | None = None) -> None:
-    """INSERT OR REPLACE the filings-status row. status ∈ 'ok'|'empty'.
+    """Upsert the filings-status row. status ∈ 'ok'|'empty'.
+    Full-overwrite via ON CONFLICT DO UPDATE (see v4.14.6.29).
     Writing 'ok' (data found) clears a prior 'empty' so a ticker that
     later starts filing is no longer skipped."""
     t = (ticker or "").upper()
@@ -921,9 +1020,15 @@ def upsert_filings_status(ticker: str, *, status: str,
     conn = get_connection()
     try:
         with conn:
+            # v4.14.6.29-no-clobber-everywhere: full-overwrite via
+            # ON CONFLICT DO UPDATE.
             conn.execute(
-                "INSERT OR REPLACE INTO filings_status "
-                "(ticker, status, as_of, source) VALUES (?, ?, ?, ?)",
+                "INSERT INTO filings_status "
+                "(ticker, status, as_of, source) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(ticker) DO UPDATE SET "
+                "  status = excluded.status, "
+                "  as_of  = excluded.as_of, "
+                "  source = excluded.source",
                 (t, status, as_of, source),
             )
     finally:
@@ -959,21 +1064,27 @@ def get_fresh_empty_filings_tickers(now_ts: float | None = None) -> set:
 
 
 def upsert_macro_indicators(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into macro_indicators."""
+    """Upsert rows into macro_indicators (full-overwrite via ON CONFLICT)."""
     conn = get_connection()
     try:
         with conn:
-            return _upsert_many(conn, "macro_indicators", _MACRO_COLS, rows)
+            return _upsert_many(
+                conn, "macro_indicators", _MACRO_COLS, rows,
+                pk=["series_id", "date"], coalesce=False,
+            )
     finally:
         conn.close()
 
 
 def upsert_splits_dividends(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into splits_dividends."""
+    """Upsert rows into splits_dividends (full-overwrite via ON CONFLICT)."""
     conn = get_connection()
     try:
         with conn:
-            return _upsert_many(conn, "splits_dividends", _SPLITS_DIV_COLS, rows)
+            return _upsert_many(
+                conn, "splits_dividends", _SPLITS_DIV_COLS, rows,
+                pk=["ticker", "ex_date", "action_type"], coalesce=False,
+            )
     finally:
         conn.close()
 
@@ -989,11 +1100,18 @@ def insert_news_signals(rows: Iterable[dict]) -> int:
 
 
 def upsert_filings(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into filings (PK is accession_number)."""
+    """Upsert rows into filings (COALESCE-preserving via ON CONFLICT;
+    PK is accession_number). v4.14.6.29: COALESCE protects the
+    description column (added in v4.14.5.62) so a future refetch
+    that re-supplies only date/url metadata does not null out a
+    description that landed in between."""
     conn = get_connection()
     try:
         with conn:
-            return _upsert_many(conn, "filings", _FILINGS_COLS, rows)
+            return _upsert_many(
+                conn, "filings", _FILINGS_COLS, rows,
+                pk="accession_number", coalesce=True,
+            )
     finally:
         conn.close()
 
@@ -1005,12 +1123,18 @@ _INSIDER_FLOW_COLS = [
 
 
 def upsert_insider_flow(row: dict) -> None:
-    """v4.14.5.62-insider-flow: INSERT OR REPLACE one per-ticker insider-flow
-    aggregate (PK is ticker). `row` keys match _INSIDER_FLOW_COLS."""
+    """v4.14.5.62-insider-flow: upsert one per-ticker insider-flow
+    aggregate (PK is ticker). Full-overwrite via ON CONFLICT — a
+    recompute that returns NULL/0 must CLEAR stale values, so
+    COALESCE-preserve is wrong here. `row` keys match
+    _INSIDER_FLOW_COLS."""
     conn = get_connection()
     try:
         with conn:
-            _upsert_many(conn, "insider_flow", _INSIDER_FLOW_COLS, [row])
+            _upsert_many(
+                conn, "insider_flow", _INSIDER_FLOW_COLS, [row],
+                pk="ticker", coalesce=False,
+            )
     finally:
         conn.close()
 
@@ -1176,7 +1300,29 @@ def upsert_cache_metadata(ticker: str, lane: str, **fields: Any) -> None:
     columns = list(data.keys())
     cols_csv = ", ".join(columns)
     placeholders = ", ".join("?" for _ in columns)
-    sql = f"INSERT OR REPLACE INTO cache_metadata ({cols_csv}) VALUES ({placeholders})"
+    # v4.14.6.29-no-clobber-everywhere: cache_metadata UPSERT
+    # converted from INSERT OR REPLACE to ON CONFLICT DO UPDATE.
+    # Same full-overwrite semantic — `last_refresh_at` is stamped
+    # every call and the per-field updates (have_to_date etc.) are
+    # always intentional — but column-explicit and rowid-stable.
+    # Only updates the columns the caller actually provided (plus
+    # last_refresh_at), so an unrelated field already in the row
+    # is not touched.
+    pk_cols = {"ticker", "lane"}
+    update_cols = [c for c in columns if c not in pk_cols]
+    if update_cols:
+        update_clause = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+        sql = (
+            f"INSERT INTO cache_metadata ({cols_csv}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT(ticker, lane) DO UPDATE SET {update_clause}"
+        )
+    else:
+        sql = (
+            f"INSERT INTO cache_metadata ({cols_csv}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT(ticker, lane) DO NOTHING"
+        )
     conn = get_connection()
     try:
         with conn:
@@ -1190,9 +1336,14 @@ def set_lane_config(lane: str, fill_mode: str) -> None:
     conn = get_connection()
     try:
         with conn:
+            # v4.14.6.29-no-clobber-everywhere: full-overwrite via
+            # ON CONFLICT DO UPDATE.
             conn.execute(
-                "INSERT OR REPLACE INTO lane_config (lane, fill_mode, last_updated) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO lane_config (lane, fill_mode, last_updated) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(lane) DO UPDATE SET "
+                "  fill_mode    = excluded.fill_mode, "
+                "  last_updated = excluded.last_updated",
                 (lane, fill_mode, iso_now()),
             )
     finally:
@@ -1266,7 +1417,7 @@ FILL_MODE_KEYLESS = 'keyless'
 #
 # This was a frozenset prior to v4.14.3.4 — iteration order depended on
 # PYTHONHASHSEED, which made bulk and slow fill randomly choose which
-# lane to fill first per launch. On the user's 2026-05-14 morning bulk run,
+# lane to fill first per launch. On Mike's 2026-05-14 morning bulk run,
 # the coin flip put fundamentals first, leaving the queue runner with
 # zero new candidates from ITOT for over 30 minutes while daily_bars
 # stayed at 575/2490. A tuple makes the intent explicit and the order
