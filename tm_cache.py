@@ -98,6 +98,7 @@ _CREATE_TABLES = [
         total_liabilities   REAL,
         shares_outstanding  INTEGER,
         source              TEXT,
+        fetched_at          TEXT,          -- v4.14.6.25 row-level fetch stamp
         PRIMARY KEY (ticker, fiscal_period_end)
     )
     """,
@@ -311,6 +312,35 @@ def init_cache_db(db_path: Path | str = CACHE_DB_PATH) -> sqlite3.Connection:
                 if 'description' not in _fcols:
                     conn.execute(
                         "ALTER TABLE filings ADD COLUMN description TEXT")
+            except Exception:
+                pass
+            # v4.14.6.25-fundamentals-row-fetched-at: per-row fetch
+            # timestamp on `fundamentals`. Pre-fix only fundamentals_status
+            # carried an `as_of` (one per ticker), so multi-period rows
+            # for one ticker couldn't be aged individually. Same
+            # idempotent ADD COLUMN pattern as the description column
+            # above. Backfill is NULL — acceptable; existing readers
+            # never expected this column.
+            try:
+                _fucols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(fundamentals)")}
+                if 'fetched_at' not in _fucols:
+                    conn.execute(
+                        "ALTER TABLE fundamentals "
+                        "ADD COLUMN fetched_at TEXT")
+            except Exception:
+                pass
+            # v4.14.6.25-sec-name-bootstrap: ensure the cik column
+            # exists on tickers so the SEC bulk bootstrap can fill it
+            # alongside the name. Already present in the original
+            # CREATE TABLE; this is just the migration safety net for
+            # any DB created before that column shipped.
+            try:
+                _tkcols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(tickers)")}
+                if 'cik' not in _tkcols:
+                    conn.execute(
+                        "ALTER TABLE tickers ADD COLUMN cik TEXT")
             except Exception:
                 pass
             for stmt in _CREATE_INDEXES:
@@ -552,6 +582,12 @@ _FUNDAMENTALS_COLS = [
     "ticker", "fiscal_period_end", "revenue", "net_income", "eps",
     "gross_margin", "operating_margin", "total_assets", "total_liabilities",
     "shares_outstanding", "source",
+    # v4.14.6.25-fundamentals-row-fetched-at: per-row ingestion stamp.
+    # `_upsert_many` reads each row dict via row.get(col); callers that
+    # don't pass `fetched_at` leave it NULL (legacy-safe). The
+    # `upsert_fundamentals` wrapper below stamps it automatically so
+    # every new write gets a fresh value without changing call sites.
+    "fetched_at",
 ]
 
 _MACRO_COLS = ["series_id", "date", "value"]
@@ -577,13 +613,79 @@ _SOCIAL_COLS = [
 
 
 def upsert_tickers(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into tickers. Each row keyed by column name."""
+    """Non-clobbering upsert into tickers.
+
+    v4.14.6.26-seed-no-clobber: the universe seed at
+    tm_fill_executor._seed_universe_if_needed (line ~876) builds rows
+    with only {'ticker', 'last_updated'}. Pre-fix this called the
+    shared `_upsert_many` which does
+    `INSERT OR REPLACE INTO tickers (...all 9 cols...) VALUES (...)`,
+    so every seed cycle wiped name / cik / exchange / currency /
+    first_trade_date / sector / market_cap_tier back to NULL on every
+    existing row — silently undoing the v4.14.6.25 SEC name bootstrap
+    on every restart.
+
+    Fix is scoped to THIS function (NOT `_upsert_many` — other tables
+    like daily_bars and fundamentals legitimately use full-row REPLACE
+    semantics; changing the shared helper would regress them).
+    Per-row SQLite UPSERT: INSERT new tickers normally, and on a
+    PRIMARY KEY(ticker) conflict UPDATE only last_updated unconditionally
+    plus `COALESCE(excluded.X, tickers.X)` for every other column —
+    meaning a caller that supplies a value still wins, a caller that
+    sends NULL keeps the stored value. This preserves SEC names + CIKs
+    across every routine seed AND keeps the door open for a future
+    seed source that does carry name/sector/etc. to fill them in.
+
+    Returns the number of rows processed (consistent with
+    `_upsert_many` behaviour). Best-effort per-row — a single malformed
+    row logs and continues; never raises into the seed caller.
+    """
+    sql = (
+        "INSERT INTO tickers ("
+        "  ticker, name, exchange, cik, currency, "
+        "  first_trade_date, sector, market_cap_tier, last_updated"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(ticker) DO UPDATE SET "
+        "  last_updated     = excluded.last_updated, "
+        "  name             = COALESCE(excluded.name, tickers.name), "
+        "  cik              = COALESCE(excluded.cik, tickers.cik), "
+        "  exchange         = COALESCE(excluded.exchange, tickers.exchange), "
+        "  currency         = COALESCE(excluded.currency, tickers.currency), "
+        "  first_trade_date = COALESCE(excluded.first_trade_date, "
+        "                              tickers.first_trade_date), "
+        "  sector           = COALESCE(excluded.sector, tickers.sector), "
+        "  market_cap_tier  = COALESCE(excluded.market_cap_tier, "
+        "                              tickers.market_cap_tier)"
+    )
     conn = get_connection()
+    count = 0
     try:
         with conn:
-            return _upsert_many(conn, "tickers", _TICKERS_COLS, rows)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                tk = row.get('ticker')
+                if not tk:
+                    continue
+                try:
+                    conn.execute(sql, (
+                        tk,
+                        row.get('name'),
+                        row.get('exchange'),
+                        row.get('cik'),
+                        row.get('currency'),
+                        row.get('first_trade_date'),
+                        row.get('sector'),
+                        row.get('market_cap_tier'),
+                        row.get('last_updated') or iso_now(),
+                    ))
+                    count += 1
+                except Exception:
+                    # Per-row failure stays scoped — never blocks the seed.
+                    pass
     finally:
         conn.close()
+    return count
 
 
 def upsert_daily_bars(rows: Iterable[dict]) -> int:
@@ -639,7 +741,20 @@ def upsert_daily_bars(rows: Iterable[dict]) -> int:
 
 
 def upsert_fundamentals(rows: Iterable[dict]) -> int:
-    """INSERT OR REPLACE rows into fundamentals."""
+    """INSERT OR REPLACE rows into fundamentals.
+
+    v4.14.6.25-fundamentals-row-fetched-at: every row gets a
+    `fetched_at` timestamp stamped here if the caller didn't supply
+    one. Callers that pre-stamp (e.g. for backfills with historical
+    dates) keep their value. None means the column stores NULL —
+    same as legacy rows pre-migration. Cheap helper closes the
+    "no per-row fetch ts" data-hygiene gap from the audit.
+    """
+    rows = list(rows)
+    _now = iso_now()
+    for r in rows:
+        if isinstance(r, dict) and not r.get('fetched_at'):
+            r['fetched_at'] = _now
     conn = get_connection()
     try:
         with conn:

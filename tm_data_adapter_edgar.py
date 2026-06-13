@@ -964,9 +964,16 @@ def fetch_fundamentals(ticker: str) -> Optional[list]:
                        and v is not None)
         if n_fields == 0:
             return None
+        # v4.14.6.25-fundfile-log-tag-parity: dual-tag so a tail-grep
+        # for `[fundfile]` (the daemon's start-line tag) catches its
+        # operational ticks. Pre-fix the start logged `[fundfile]` but
+        # every per-ticker fetch logged `[edgar]` only, so the audit's
+        # daemon-liveness grep mistakenly thought fundfile had stalled
+        # overnight when it was healthy (110 fetches in the first hour).
         _adapter_log(
-            f"[edgar] fundamentals fetched for {ticker.upper()}: "
-            f"{n_fields} fields, as_of={fiscal_period_end}", 'muted')
+            f"[fundfile] [edgar] fundamentals fetched for "
+            f"{ticker.upper()}: {n_fields} fields, "
+            f"as_of={fiscal_period_end}", 'muted')
         return [row]
     except Exception:
         return None

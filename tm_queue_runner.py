@@ -1652,12 +1652,27 @@ def _set_structurally_short(app, path: str, reason: str) -> None:
             app._fill_structurally_short = ss
         if path in ss:
             return
+        now_set = time.time()
         ss[path] = {
-            'set_at': time.time(),
+            'set_at': now_set,
             'val_signature': _displayed_validation_signature(app, path),
-            'last_candidate_check': time.time(),
+            'last_candidate_check': now_set,
             'reason': reason,
         }
+        # v4.14.6.25-lottery-thrash-log-rate-limit: pre-fix this logged
+        # an amber "pausing AI dispatch" line on every promotion, but
+        # the lottery path was promote→clear (event-driven dispatch)→
+        # promote-again ~52 times overnight, with median 75 s between
+        # cycles. Each "pausing AI dispatch" line was misleading because
+        # the clear happened within ~75 s. Rate-limit: suppress the log
+        # if this same path was cleared less than _SS_LOG_QUIET_SECONDS
+        # ago. The promotion logic itself is UNCHANGED — only the log
+        # noise. Tracked per-path on `app._fill_ss_last_clear_ts`.
+        _quiet_until_ts = getattr(app, '_fill_ss_last_clear_ts', None) or {}
+        _last_clear = float(_quiet_until_ts.get(path, 0) or 0)
+        _SS_LOG_QUIET_SECONDS = 5 * 60  # 5 min
+        if _last_clear and (now_set - _last_clear) < _SS_LOG_QUIET_SECONDS:
+            return  # silently set the flag; skip the misleading log line
         _log_amber(
             app,
             f"[fill-mode] {path}: structurally short ({reason}) — "
@@ -1676,6 +1691,18 @@ def _clear_structurally_short(app, path: str, reason: str = '') -> None:
         ss = getattr(app, '_fill_structurally_short', None) or {}
         if path in ss:
             ss.pop(path, None)
+            # v4.14.6.25-lottery-thrash-log-rate-limit: record the clear
+            # time so a fresh promote within the next ~5 min skips its
+            # misleading "pausing AI dispatch" log line. The clear log
+            # itself stays muted-cadence so its noise is bounded.
+            try:
+                _t = getattr(app, '_fill_ss_last_clear_ts', None)
+                if _t is None:
+                    _t = {}
+                    app._fill_ss_last_clear_ts = _t
+                _t[path] = time.time()
+            except Exception:
+                pass
             if reason:
                 _log_muted(
                     app,
