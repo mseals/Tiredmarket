@@ -3,7 +3,7 @@ Tired Market — Phase 2C: Discover, predictions, AI track record.
 
 This module owns four things:
 
-1. **Watchlist**: persistent list of tickers the user wants the AI to analyze.
+1. **Watchlist**: persistent list of tickers Mike wants the AI to analyze.
    File: data/watchlist.json. Manual input, manual edit, no auto-population.
 
 2. **Universe**: the broader pool to scan when looking for new ideas.
@@ -19,18 +19,18 @@ This module owns four things:
    reached (or position is sold), the prediction record gets closed
    with the actual outcome. Aggregated stats power the Track Record view.
 
-Design principles (settled in conversation with the user):
+Design principles (settled in conversation with Mike):
 
 - Manual trigger only. No scheduled discovery runs.
 - Honest framing in output language: "best of today's scan" not "top picks"
-- No buy buttons, no broker integration — just suggestions the user acts on
+- No buy buttons, no broker integration — just suggestions Mike acts on
   separately.
 - Track record diagnoses whether the AI is useful, NOT predicts the next
   trade. Roulette principle: past results inform whether you're playing
   a winnable version of the game.
 - The AI sees its own track record when making new calls (injected into
   prompts). Whether this actually improves accuracy is empirical — but
-  it costs nothing and the meta-data is useful for the user either way.
+  it costs nothing and the meta-data is useful for Mike either way.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from typing import Any, Callable, Optional
 # ─── Watchlist ────────────────────────────────────────────────────────
 
 class Watchlist:
-    """Persistent list of tickers the user has flagged for analysis.
+    """Persistent list of tickers Mike has flagged for analysis.
 
     Schema (data/watchlist.json):
     {
@@ -197,7 +197,7 @@ class Watchlist:
 
 # Curated fallback list — used if we can't fetch IWM holdings dynamically.
 # These are well-known small/mid-cap tickers across sectors. Not Russell
-# 2000 strict membership, just "stuff worth scanning." the user can extend.
+# 2000 strict membership, just "stuff worth scanning." Mike can extend.
 FALLBACK_UNIVERSE = [
     # EV / Energy
     "BLNK", "CHPT", "EVGO", "RIVN", "LCID", "NIO", "FSR", "WKHS", "RIDE",
@@ -888,7 +888,7 @@ class Universe:
 #
 # Problem this solves: the prefilter passes ~75 candidates per scan based
 # only on price/volume/news. The AI then evaluates each one. A consistent
-# pattern emerged in the user's data: certain stocks (ERAS, OWL, SOUN, PTON,
+# pattern emerged in Mike's data: certain stocks (ERAS, OWL, SOUN, PTON,
 # JBLU, LCID, WU, ...) keep getting AVOID'd by every model on every
 # scan, but the prefilter has no memory and keeps feeding them.
 # Meanwhile real winners (IONQ, ORKA, USAR, OKLO) get the same treatment
@@ -936,7 +936,7 @@ def compute_history_scores(predictions_log, path,
     try:
         all_preds = []
         if hasattr(predictions_log, 'get_all'):
-            all_preds = predictions_log.get_all() or []
+            all_preds = predictions_log.get_all_full(timeout=30.0) or []
         elif hasattr(predictions_log, 'read_all'):
             all_preds = predictions_log.read_all() or []
         else:
@@ -1104,7 +1104,7 @@ PATH_FILTER_PARAMS = {
     'penny_lottery': {
         'min_price': 0.10,           # v4.13.1: true sub-dollar long shots.
         'max_price': 2.00,           # overlap with lottery is intentional;
-                                     # gives the user a way to surface sub-$1
+                                     # gives Mike a way to surface sub-$1
                                      # plays explicitly when he wants them.
         'min_avg_volume': 25_000,    # lower than lottery — penny names are thin
         'max_drop_30d_pct': 90.0,    # accepts the ugliest charts
@@ -1289,7 +1289,7 @@ def recently_analyzed_tickers(predictions_log,
     cutoff = datetime.now() - timedelta(hours=hours)
     out = set()
     try:
-        for p in predictions_log.get_all():
+        for p in predictions_log.get_all_full(timeout=30.0):
             try:
                 ts = datetime.fromisoformat(p.get('timestamp', ''))
                 if ts >= cutoff:
@@ -1346,6 +1346,13 @@ def compute_per_model_stats(predictions_log,
     """
     if predictions_log is None:
         return []
+    # v4.14.6.35-fix-startup-stampede: working-set sufficient. This
+    # path is time-windowed to `hours` (default 168 = 7 days). The
+    # working set (recent 2000 records, easily covering weeks of
+    # ingest) is more than enough; the v4.14.6.34 audit
+    # miscategorised this as needing full history. Reverting from
+    # get_all_full so consensus-runner first-tick doesn't block on
+    # the predictions tail-load.
     try:
         all_preds = predictions_log.get_all()
     except Exception:
@@ -1467,7 +1474,7 @@ def list_consensus_scan_ids(predictions_log,
     if predictions_log is None:
         return []
     try:
-        all_preds = predictions_log.get_all()
+        all_preds = predictions_log.get_all_full(timeout=30.0)
     except Exception:
         return []
 
@@ -1562,6 +1569,10 @@ def compute_consensus(predictions_log,
     """
     if predictions_log is None:
         return []
+    # v4.14.6.35-fix-startup-stampede: working-set sufficient. This
+    # consensus path is time-windowed to `hours` (default 48 = 2 days)
+    # and only considers the most-recent prediction per (ticker,
+    # model) inside that window. The working set covers it.
     try:
         all_preds = predictions_log.get_all()
     except Exception:
@@ -3230,6 +3241,26 @@ class PredictionsLog:
     DELTA_COMPACT_THRESHOLD = 100  # in-session deltas before compacting
     DELTA_RATIO_TRIGGER = 0.5      # startup compact if deltas/full > this
 
+    # v4.14.6.34-lazy-predictions: hot-path working-set size. Loading
+    # the entire predictions.jsonl on every launch is the only
+    # remaining every-launch data-proportional cost after the
+    # v4.14.6.33 async-startup refactor — a heavy user with a 29 MB
+    # file (~10K records) pays ~500ms-2s + ~300 MB RAM at startup,
+    # blocking the daemons that wait on holdings state to come up.
+    # The hot path now loads:
+    #   * the N most-recent records (by insertion order in the file),
+    #     covering active analysis / recent-history reads, AND
+    #   * EVERY record with status == OUTCOME_OPEN, regardless of age,
+    #     because outcome resolution needs all unresolved predictions
+    # The remaining older closed records stream into self._archive on
+    # a background tail-load thread. Consumers needing full history
+    # (accuracy weight maps, track record all-time view, history
+    # scoring) call get_all_full(timeout=N) which blocks on the
+    # _predictions_history_complete event. The append-only invariant
+    # on self._cache is preserved so tm_queue_runner's len(_cache)-
+    # based new-row detection (line ~4210, 4458) keeps working.
+    HOT_PATH_RECENT_N = 2000
+
     def __init__(self, path: Path):
         self.path = path
         # v4.14.3.13: RLock instead of Lock. The pre-v4.14.3.13 code
@@ -3245,25 +3276,55 @@ class PredictionsLog:
         # file). Not persisted across launches - we re-count at startup
         # via _load's delta_count side-channel.
         self._delta_count_since_compact = 0
-        # Maintain an in-memory list for fast queries; loaded once at
-        # start. _load also returns the count of delta records seen
-        # so we can decide whether to compact immediately.
-        self._cache, _delta_count_at_load = self._load_with_counts()
+        # v4.14.6.34: split hot path vs. tail load. self._cache holds
+        # the working set (last N + all open) and is append-only after
+        # init. self._archive holds the older closed records once the
+        # tail-load thread completes. get_all() returns archive+cache;
+        # get_all_full() blocks on _predictions_history_complete.
+        self._archive: list[dict] = []
+        self._predictions_history_complete = threading.Event()
+        # _archive_pending_ids: the set of record ids that need to be
+        # loaded into archive. Populated by the hot-path scan; consumed
+        # by the tail-load thread. Empty if every record fit in the
+        # working set (new users / small files).
+        self._archive_pending_ids: set[str] = set()
+
+        # Hot-path load: working set only. Returns (working_cache,
+        # delta_count, archive_pending_ids).
+        (self._cache,
+         _delta_count_at_load,
+         self._archive_pending_ids) = self._load_working_set(
+            self.HOT_PATH_RECENT_N)
         # Startup compaction trigger. If the file is more than half
         # deltas, rewrite as all-full-records before anyone else
         # touches it. Cheap insurance against a long-running uninter-
         # rupted session that didn't hit the in-session trigger.
-        full_count = len(self._cache)
-        if (full_count > 0
-                and _delta_count_at_load / full_count
-                    > self.DELTA_RATIO_TRIGGER):
-            self.compact()
-        # If the file existed only as deltas with no resolvable full
-        # records (shouldn't happen on a well-formed file but defensive),
-        # also compact - that path produces an empty file which is the
-        # right cleanup.
-        elif _delta_count_at_load > 0 and full_count == 0:
-            self.compact()
+        # NOTE: compaction must NOT run until the archive is loaded,
+        # otherwise compact() would persist only the working set and
+        # silently truncate the older records on disk. Defer the
+        # decision until after tail-load completes (handled inside
+        # the tail-load worker).
+        self._startup_compaction_needed = (
+            (len(self._cache) > 0
+             and _delta_count_at_load / max(1, len(self._cache))
+                 > self.DELTA_RATIO_TRIGGER)
+            or (_delta_count_at_load > 0 and len(self._cache) == 0))
+
+        # Spawn the background tail-load. If the file fit entirely in
+        # the working set (new users), short-circuit to event-set and
+        # skip the thread.
+        if not self._archive_pending_ids:
+            self._predictions_history_complete.set()
+            # No deferred compaction needed in that case either —
+            # the working set IS everything.
+            if self._startup_compaction_needed:
+                self.compact()
+                self._startup_compaction_needed = False
+        else:
+            threading.Thread(
+                target=self._tail_load_worker,
+                daemon=True,
+                name='predictions-tail-load').start()
 
     def _load(self) -> list[dict]:
         """Public-shape load: returns the merged record list.
@@ -3274,6 +3335,167 @@ class PredictionsLog:
         still use this since the cache is built once at init."""
         records, _ = self._load_with_counts()
         return records
+
+    # ── v4.14.6.34-lazy-predictions: hot-path / tail-load split ──
+
+    def _read_merged_records(self) -> tuple[list[dict], list[str], int]:
+        """Internal: walk predictions.jsonl applying deltas, return
+        (insertion_ordered_records, insertion_order_ids, delta_count).
+
+        Same merge algorithm as _load_with_counts (shared substrate)
+        but separated so both the hot-path and tail-load paths can
+        share it without code drift. On a missing file returns empty
+        results.
+        """
+        if not self.path.exists():
+            return [], [], 0
+        records: dict[str, dict] = {}
+        insertion_order: list[str] = []
+        delta_count = 0
+        orphan_count = 0
+        try:
+            with open(self.path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get('_d') == 1:
+                        delta_count += 1
+                        pred_id = rec.get('id')
+                        if not pred_id or pred_id not in records:
+                            orphan_count += 1
+                            continue
+                        patch = rec.get('patch') or {}
+                        if isinstance(patch, dict):
+                            records[pred_id].update(patch)
+                        continue
+                    pred_id = rec.get('id')
+                    rec.setdefault('provider_id', None)
+                    rec.setdefault('canonical_model', None)
+                    rec.setdefault('lineup_version', 'v4.13')
+                    rec.setdefault('data_version', 'sparse')
+                    if pred_id:
+                        if pred_id not in records:
+                            insertion_order.append(pred_id)
+                        records[pred_id] = rec
+                    else:
+                        synthetic_key = (
+                            f"__no_id__/{len(insertion_order)}")
+                        insertion_order.append(synthetic_key)
+                        records[synthetic_key] = rec
+        except Exception:
+            return [], [], 0
+        if orphan_count > 0:
+            try:
+                print(
+                    f"[PredictionsLog] {orphan_count} orphan delta "
+                    f"record(s) skipped during load — file may have "
+                    f"been hand-edited or partially corrupted.")
+            except Exception:
+                pass
+        merged = [records[k] for k in insertion_order if k in records]
+        return merged, insertion_order, delta_count
+
+    def _load_working_set(
+            self, recent_n: int
+    ) -> tuple[list[dict], int, set[str]]:
+        """v4.14.6.34 hot-path load. Walks the entire file (single
+        pass) but builds the working set only:
+          * the recent_n MOST-RECENTLY-INSERTED records, plus
+          * every record with status == OUTCOME_OPEN regardless of
+            position (so outcome resolution sees every unresolved
+            prediction even if it's months old).
+
+        Returns (working_cache, delta_count, archive_pending_ids)
+        where archive_pending_ids is the set of record ids the
+        background tail-loader still has to bring in.
+
+        Insertion order within the returned working_cache mirrors the
+        file's order, preserving tm_queue_runner's reverse-iteration
+        recency assumptions.
+        """
+        merged, insertion_order, delta_count = self._read_merged_records()
+        if not merged:
+            return [], delta_count, set()
+
+        n = len(insertion_order)
+        # Recent-N cut: the LAST recent_n ids in insertion_order.
+        if recent_n >= n:
+            recent_ids = set(insertion_order)
+        else:
+            recent_ids = set(insertion_order[-recent_n:])
+
+        # Build a quick id → record lookup over the merged list.
+        # `merged` is in insertion order; the corresponding ids are in
+        # insertion_order. Zip and reuse.
+        id_to_rec = dict(zip(insertion_order, merged))
+
+        # Pull in every open record regardless of recency. OUTCOME_OPEN
+        # is the canonical "unresolved" marker; cover the legacy
+        # "open" string too defensively.
+        keep_ids: set[str] = set(recent_ids)
+        for rid, rec in id_to_rec.items():
+            st = (rec.get('status') or '')
+            if st == OUTCOME_OPEN or st == 'open':
+                keep_ids.add(rid)
+
+        working = [id_to_rec[i] for i in insertion_order if i in keep_ids]
+        pending = {
+            i for i in insertion_order
+            if i not in keep_ids and not i.startswith('__no_id__/')
+        }
+        return working, delta_count, pending
+
+    def _tail_load_worker(self) -> None:
+        """v4.14.6.34: background tail-load. Re-reads the file (full
+        merge), filters down to JUST the archive_pending_ids, then
+        atomically assigns self._archive. Honors the lock; never
+        touches self._cache (append-only invariant kept).
+
+        Sets self._predictions_history_complete on completion (always,
+        even on error / empty result — so consumers waiting on the
+        event are never wedged).
+        """
+        try:
+            merged, insertion_order, _ = self._read_merged_records()
+            pending = self._archive_pending_ids
+            archive: list[dict] = []
+            if merged and pending:
+                id_to_rec = dict(zip(insertion_order, merged))
+                archive = [
+                    id_to_rec[i] for i in insertion_order
+                    if i in pending and i in id_to_rec
+                ]
+            with self._lock:
+                self._archive = archive
+                # If startup wanted a compaction, do it now — after
+                # we have the full record set so compact() rewrites
+                # the whole file rather than just the working set.
+                if self._startup_compaction_needed:
+                    try:
+                        self.compact()
+                    except Exception:
+                        pass
+                    self._startup_compaction_needed = False
+        except Exception:
+            # Defensive: never let a tail-load fault prevent consumers
+            # from making progress. The event is released in finally.
+            pass
+        finally:
+            self._predictions_history_complete.set()
+
+    def wait_for_full_history(self, timeout: float | None = 30.0) -> bool:
+        """Block until the background tail-load completes. Returns
+        True if loaded within the timeout, False on timeout.
+        Consumers that walk all-time history (accuracy weight maps,
+        track record all-time, history scoring) should call this
+        before get_all() / direct _cache walks on the hot path.
+        """
+        return self._predictions_history_complete.wait(timeout)
 
     def _load_with_counts(self) -> tuple[list[dict], int]:
         """v4.14.3.13: read predictions.jsonl applying any delta
@@ -3450,7 +3672,7 @@ class PredictionsLog:
         Crash safety: the original file is NOT modified until
         os.replace succeeds. If the temp-write fails or the rename
         fails, the original is intact and the temp file is cleaned
-        up. the user's data is never at risk.
+        up. Mike's data is never at risk.
         """
         with self._lock:
             return self._compact_locked()
@@ -3557,8 +3779,35 @@ class PredictionsLog:
         return out
 
     def get_all(self) -> list[dict]:
+        """Return every record currently in memory: tail-loaded
+        archive (older closed) PLUS the live working set (recent +
+        all open + appended since startup). Initially the archive is
+        empty so this returns the working set only; once the
+        background tail-load completes, it returns the full history.
+
+        Callers that REQUIRE the full history (accuracy weight maps,
+        track record all-time, history scoring) should call
+        get_all_full() instead — it blocks on
+        _predictions_history_complete to guarantee completeness.
+        """
         with self._lock:
-            return list(self._cache)
+            return list(self._archive) + list(self._cache)
+
+    def get_all_full(self, timeout: float | None = 30.0) -> list[dict]:
+        """v4.14.6.34: blocking variant of get_all() that waits on
+        the background tail-load. Use this for any consumer walking
+        all-time history. Returns the merged record list once full
+        history is available; on timeout, returns whatever's in
+        memory (best-effort — log the timeout to surface stalls).
+        """
+        if not self.wait_for_full_history(timeout):
+            try:
+                print(
+                    "[PredictionsLog] get_all_full timed out waiting "
+                    "for tail-load; returning partial history.")
+            except Exception:
+                pass
+        return self.get_all()
 
     def get_most_recent_for_ticker_and_path(
             self, ticker: str, path: str) -> Optional[dict]:
@@ -5454,7 +5703,7 @@ def format_prediction_request_block_owned() -> str:
 
 def format_prediction_request_block_candidate() -> str:
     """v4.14.2 stage 4: candidate prompt (build_candidate_prompt,
-    fresh-buy consensus). HOLD is meaningless on tickers the user doesn't
+    fresh-buy consensus). HOLD is meaningless on tickers Mike doesn't
     own — replaced with WATCH (semantically: 'interesting, wait for
     better entry').
 
@@ -5496,7 +5745,7 @@ def format_prediction_request_block_candidate() -> str:
 # structure, parser, or the eventual writer fan-out.
 #
 # Delimiter choice = structured text `=== PATH: <key> ===`, NOT JSON.
-# Reasoning (NOT a live test — live model-reliability is the user's
+# Reasoning (NOT a live test — live model-reliability is Mike's
 # flag-on validation in Patch 2; this environment has no network /
 # live models): structured text degrades gracefully — a model that
 # drops or mangles one block still yields the others, and the parser
@@ -5625,16 +5874,16 @@ def format_track_record_context(prediction_log: PredictionsLog,
     v4.13.1 fix: distinguishes between (a) the AI's own paper-trade
     predictions (which are tracked automatically and can have
     misleading "stop_hit" rates from intra-day price moves) and
-    (b) the user's actual realized buy/sell trades.
+    (b) Mike's actual realized buy/sell trades.
 
     Pre-v4.13.1, this function reported AI paper-trade stop-hit
     counts as "your track record," which the models read as
-    "the user loses every trade" and biased toward AVOID. That was
-    wrong. the user's real track record is in portfolio.json closed[].
+    "Mike loses every trade" and biased toward AVOID. That was
+    wrong. Mike's real track record is in portfolio.json closed[].
 
     Now: only emit a track-record line when there are >= 5 closed
     AI predictions (signal vs noise floor), and FRAME it correctly
-    as paper-trade self-evaluation, not the user's real performance.
+    as paper-trade self-evaluation, not Mike's real performance.
     Suppress entirely when the data would mislead more than inform.
     """
     overall = prediction_log.aggregate_stats(days_back=180)
@@ -5644,7 +5893,7 @@ def format_track_record_context(prediction_log: PredictionsLog,
     if closed_n < 5:
         return ""
 
-    # NEVER claim this is "your" or "the user's" track record.
+    # NEVER claim this is "your" or "Mike's" track record.
     # These are auto-tracked paper predictions, not real trades.
     lines = ["AI PREDICTION TRACKING (paper-trade self-eval, not real trades):"]
     # v4.14.5.14-canonical-accuracy-definition: hit rate is target/(target+
@@ -5670,7 +5919,7 @@ def format_track_record_context(prediction_log: PredictionsLog,
                       f"count against the hit rate)")
     lines.append("- NOTE: stop_hit on a paper prediction means price "
                   "*touched* stop intraday; many of those would have "
-                  "recovered. Do NOT read this as the user losing trades.")
+                  "recovered. Do NOT read this as Mike losing trades.")
 
     if ticker:
         ticker_recent = prediction_log.get_recent_for_ticker(ticker, limit=3)

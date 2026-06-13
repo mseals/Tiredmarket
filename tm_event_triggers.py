@@ -299,7 +299,7 @@ def apply_path_merge_v414514mu(cfg: dict | None = None) -> bool:
     half of the penny_lottery→lottery merge. When
     cfg['use_path_merge'] is True (default):
       - lottery's suspicion-staleness window aligns with the
-        moderate path's window (the user's articulated weeks-of-sweating
+        moderate path's window (Mike's articulated weeks-of-sweating
         holding pattern is structurally moderate-pace; SINGLE
         SOURCE OF TRUTH = SUSPICION_STALENESS_WINDOWS_DAYS
         ['moderate'], so future bumps to moderate automatically
@@ -606,7 +606,7 @@ def _check_legacy_staleness_triggers(app, path: str,
         # tickers when stale"; bootstrap (never-analyzed) flows through
         # the existing cadence-mode universe-cursor path on the rare
         # paths where flag=True before the universe is populated. For
-        # the user's mature install this is fine.
+        # Mike's mature install this is fine.
         try:
             cur = conn.execute(
                 "SELECT ticker, last_analyzed_at FROM "
@@ -812,6 +812,13 @@ def _check_suspicion_staleness_triggers(app, path: str,
         plog = state.get('predictions_log')
         if plog is None:
             return []
+        # v4.14.6.35-fix-startup-stampede: working-set sufficient.
+        # Suspicion-staleness checks only OPEN predictions (the rule
+        # is "this BUY has gone quiet"); the working set always loads
+        # every record with status=OUTCOME_OPEN regardless of age.
+        # Calling get_all_full on the event-trigger first tick was
+        # one of the stampede contributors that blocked the post-paint
+        # window in v4.14.6.34.
         try:
             records = plog.get_all() if hasattr(plog, 'get_all') else list(
                 getattr(plog, '_cache', []) or [])
@@ -1175,7 +1182,7 @@ def check_news_triggers(app, path: str,
 
     Returns list of (ticker, signal_context) tuples where
     context['kind'] = 'news'. Sparsity reality on day-one ship:
-    only ~8 of the user's ~2,500 tickers have news_cache data, so
+    only ~8 of Mike's ~2,500 tickers have news_cache data, so
     fires will be sparse until background news refresh lands in
     a future patch.
     """
@@ -2355,7 +2362,7 @@ def evaluate_all_triggers(app) -> list:
 
         # v4.14.4.2: news sweep. Fires when >= path-threshold articles
         # arrived since the analysis baseline. Sparsity reality on
-        # day one: only ~8 of the user's ~2,500 tickers have news_cache
+        # day one: only ~8 of Mike's ~2,500 tickers have news_cache
         # data, so fires are sparse until background news refresh
         # lands in a future patch. Failure here doesn't suppress
         # staleness/price fires for the same path.

@@ -304,6 +304,16 @@ def _find_original_buy_prediction(predictions_log,
     """
     if predictions_log is None or not ticker:
         return None
+    # v4.14.6.35-fix-portfolio-paint: surfacing the MOST RECENT BUY
+    # for a held ticker is a working-set question, not an all-time
+    # one — the latest BUY is always near the tail of insertion
+    # order. The v4.14.6.34 audit miscategorised this as needing
+    # full history; the resulting get_all_full(timeout=30.0) call
+    # blocked the main thread for up to 30s during _build because
+    # the portfolio panel paints synchronously while the predictions
+    # tail-load is still in progress. Reverting to get_all() reads
+    # the working set (last 2000 + all open) which always contains
+    # the most recent BUY for any held position the user can see.
     try:
         all_preds = predictions_log.get_all()
     except Exception:
@@ -355,6 +365,10 @@ def _find_buy_prediction_for_triggers(predictions_log,
     """
     if predictions_log is None or not ticker:
         return None
+    # v4.14.6.35-fix-portfolio-paint: same revert as
+    # _find_buy_prediction_for_levels above. Sell triggers for a held
+    # ticker come from the most-recent trigger-bearing prediction;
+    # the working set always carries that record.
     try:
         all_preds = predictions_log.get_all()
     except Exception:
@@ -1433,7 +1447,7 @@ class PortfolioPanel:
         # display. Stage 6d's sweep covered View Reasoning + Consensus
         # Running inline display in this module but missed THIS render
         # site (the per-holding consensus card in the main window —
-        # the one the user sees on FISV with raw "My Groq" / "qwen2.5:14b"
+        # the one Mike sees on FISV with raw "My Groq" / "qwen2.5:14b"
         # labels). Applied via the same lazy-import pattern as the
         # other render sites; signals.jsonl on disk stays untouched.
         try:
@@ -2760,7 +2774,7 @@ class PortfolioPanel:
 
         v4.15.0 (May 2026): switched from prompt_kind='fresh_buy'
         (asks "should someone enter a fresh BUY?") to the runner's
-        default owned_position prompt (asks "given the user owns this at
+        default owned_position prompt (asks "given Mike owns this at
         cost X, should he HOLD / TRIM / SELL / BUY MORE?"). The
         owned-position parser still extracts target + stop_loss
         fields, so the SELL TRIGGERS block continues to render —
@@ -2858,7 +2872,7 @@ class PortfolioPanel:
             return
 
         # v4.15.0: pass the REAL holding (with shares + cost basis) so
-        # the owned_position prompt can render the user's actual position
+        # the owned_position prompt can render Mike's actual position
         # into the prompt and ask the right question — HOLD / TRIM /
         # SELL / BUY MORE — instead of the fresh-entry question that
         # was producing AVOID verdicts on held stocks (May 2026 bug).

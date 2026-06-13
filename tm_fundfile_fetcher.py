@@ -761,6 +761,14 @@ def launch_fundfile_refresh(app) -> None:
         while not _ok():
             if stop.wait(15):
                 return
+        # v4.14.6.35-fix-startup-stampede: 20s startup grace before
+        # the first fundamentals/filings/earnings/universe cycle.
+        # EDGAR + finnhub calls were stacking with layer2's consensus
+        # burst at t=0; staggering by 20s lets the heaviest work
+        # (layer2 60s) start last and lets news (15s) fire just
+        # before. Stop-event interruptible.
+        if stop.wait(20.0):
+            return
         _cycle(startup=True)
         while not stop.is_set():
             if stop.wait(FUNDAMENTALS_REFRESH_INTERVAL_SECONDS):

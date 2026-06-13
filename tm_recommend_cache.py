@@ -100,6 +100,14 @@ def _current_buy_tickers_for_path(plog, path: str,
     cfg['use_watch_no_rescind'] flag and passes it through. A
     pure-WATCH ticker (no prior BUY) is NOT surfaced — the Watching
     list (separate surface) handles those."""
+    # v4.14.6.35-fix-startup-stampede: working-set sufficient. This
+    # filters to status=open BUYs, and the working set already loads
+    # every open record regardless of age. A later AVOID that would
+    # disqualify a BUY is itself recent (it has to follow the open
+    # BUY in time and is in the recent-N window). Reverting from
+    # get_all_full so the recommend-cache daemon's first tick doesn't
+    # block on the predictions tail-load — it's one of the v4.14.6.34
+    # stampede contributors.
     try:
         allrecs = plog.get_all()
     except Exception:
@@ -157,6 +165,9 @@ def _is_current_buy(plog, ticker: str, path: str,
         return rec
     # No-rescind path: walk per-ticker history for the latest BUY and
     # check no AVOID has been written after it.
+    # v4.14.6.35-fix-startup-stampede: working-set sufficient — same
+    # reasoning as _current_buy_tickers_for_path above (the latest
+    # open BUY + any disqualifying later AVOID are both recent).
     try:
         allrecs = plog.get_all()
     except Exception:

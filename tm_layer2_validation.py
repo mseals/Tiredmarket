@@ -819,7 +819,7 @@ def _loop(app, stop_event, interval: int) -> None:
     # (2026-05-20): idle-log heartbeat. The `pick is None` branch
     # below used to silently wait + loop, which the 2026-05-20
     # investigation found indistinguishable from a daemon crash
-    # (cost the user 2.5h of "is this thing alive?" uncertainty after
+    # (cost Mike 2.5h of "is this thing alive?" uncertainty after
     # the thesis-validation restart). `_idle_logged_at` mirrors
     # the existing one-shot patterns (`_no_model_logged`,
     # `_pause_logged`): log once on transition into idle, then
@@ -835,6 +835,18 @@ def _loop(app, stop_event, interval: int) -> None:
     _bm_models_sum = 0
     _bm_window_start = time.time()
     _BURN_METRICS_SECONDS = 3600.0
+    # v4.14.6.35-fix-startup-stampede: per-daemon startup grace.
+    # Layer-2 is the HEAVIEST single burst on the post-paint window —
+    # a single first tick dispatches a 3-AI cloud consensus. Pre-
+    # v4.14.6.35 it fired at t=0 alongside news / fundfile / queue-
+    # runner / recommend-cache, contending main thread + GIL + AI
+    # providers (Gemini hit its per-minute cap 34s into startup as
+    # direct evidence). 60s grace lets the UI settle + lets the
+    # other daemons' lighter first ticks land first. The wait is
+    # interruptible by stop_event so shutdown during grace returns
+    # immediately (matters for the v4.14.6.34 async-close path).
+    if stop_event.wait(60.0):
+        return
     while not stop_event.is_set():
         sleep_for = interval
         _now_bm = time.time()

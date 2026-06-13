@@ -258,6 +258,15 @@ def _runner_loop(app) -> None:
     if stop_event is None:
         return
 
+    # v4.14.6.35-fix-startup-stampede: 30s startup grace before the
+    # first event-driven sweep. The sweep is moderate-cost (it walks
+    # candidate shortlist + may dispatch an AI call). Spreading the
+    # grace across daemons (layer2 60s, queue-runner 30s, fundfile
+    # 20s, news 15s, recommend-cache 10s) prevents the v4.14.6.34
+    # stampede where all 5 hit at t=0. Stop-event interruptible.
+    if stop_event.wait(30.0):
+        return
+
     # v4.14.4.0: dedicated wake event for user-initiated refresh.
     # stop_event semantically means "exit"; don't overload it. The
     # wake event interrupts the loop's sleep early so the next

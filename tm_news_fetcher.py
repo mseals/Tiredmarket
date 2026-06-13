@@ -69,7 +69,7 @@ def _norm(seq) -> list:
 def _is_active_holding(h: dict) -> bool:
     """v4.14.5.14-cadence-dampening-and-f5a-hygiene Part B (2026-05-20):
     holding is "active" for data-daemon purposes if its status is not
-    `written_off`. Written-off positions are the user's explicit "give up"
+    `written_off`. Written-off positions are Mike's explicit "give up"
     marker — the money is gone, news / EDGAR / fundamentals cycles on
     those tickers are pure waste (UBQU and BRZV today). EventDetector
     already gates on `tradable=False` independently; this filter
@@ -77,7 +77,7 @@ def _is_active_holding(h: dict) -> bool:
     iterate the raw holdings list. Treat missing/unknown `status` as
     active (fail-OPEN — don't accidentally hide a real holding because
     of a typo). Locked positions ARE active (locked != written_off);
-    the user still wants news/fundamentals on locked holdings because the
+    Mike still wants news/fundamentals on locked holdings because the
     lock may eventually clear."""
     if not isinstance(h, dict):
         return False
@@ -347,6 +347,13 @@ def launch_news_refresh(app) -> None:
         while not _ok():
             if stop.wait(15):
                 return
+        # v4.14.6.35-fix-startup-stampede: 15s startup grace before
+        # the first tier-1 refresh. News tier-1 was hitting 132
+        # articles in a single burst at t=0 alongside layer2+queue
+        # runner+fundfile; spreading the grace prevents the GIL +
+        # AI-provider stampede. Stop-event interruptible.
+        if stop.wait(15.0):
+            return
         if not _paused():
             try:
                 _summ('startup', refresh_news_universe(

@@ -836,6 +836,276 @@ class BackupPileTask(Task):
         return r
 
 
+# ─── Task 7 — On-demand predictions.jsonl cleanup (v4.14.6.36) ─────────
+
+class PredictionsCleanupTask(Task):
+    """Tiered retention cleanup of `data/predictions.jsonl`.
+
+    Wraps the existing `PredictionsLog.cleanup_tiered` logic so the
+    user explicitly opens the Maintenance dialog and confirms each
+    run, instead of the pre-v4.14.6.36 silent-nightly auto-tick.
+
+    Retention (unchanged from the existing well-tested logic):
+      * BUY                — kept FOREVER (the user's track record)
+      * NO_CALL            — kept 1 day (pure noise)
+      * WATCH/AVOID/HOLD   — kept 30 days
+      * unknown direction / missing timestamp — KEPT (failsafe)
+
+    The underlying cleanup writes a rotating backup BEFORE deleting
+    and uses an atomic rewrite; either failure ABORTs without
+    touching the file.
+
+    Dry-run: counts only — no write, no backup, no delete. Apply:
+    real cleanup.
+    """
+    id = 'predictions_cleanup'
+    label = 'Predictions log cleanup (tiered retention)'
+    description = (
+        'Trims data/predictions.jsonl by tiered retention: BUYs kept '
+        'forever (your track record); NO_CALL records older than 1 '
+        'day removed; WATCH/AVOID/HOLD older than 30 days removed; '
+        'anything with an unknown direction or missing timestamp is '
+        'kept as a failsafe. Writes a rotating backup before the '
+        'delete and uses an atomic rewrite — aborts if either step '
+        'fails. v4.14.6.36 moved this here from a silent auto-tick.'
+    )
+    # No DB touched → no VACUUM list.
+
+    def _predictions_log(self, app):
+        """Return the PredictionsLog instance or None if unavailable."""
+        try:
+            state = getattr(app, '_holdings_state', None) or {}
+            pl = state.get('predictions_log')
+            if pl is None or not hasattr(pl, 'cleanup_tiered'):
+                return None
+            return pl
+        except Exception:
+            return None
+
+    def _run_logic(self, app, dry_run: bool) -> Optional[dict]:
+        """Run cleanup_tiered with the given dry-run flag. Returns
+        the counts dict or None if the predictions log is missing
+        (e.g. discover disabled / fresh install / startup race)."""
+        pl = self._predictions_log(app)
+        if pl is None:
+            return None
+        try:
+            return pl.cleanup_tiered(dry_run=dry_run)
+        except Exception:
+            return None
+
+    def dry_run(self, app) -> dict:
+        m = _new_manifest(self.id, self.label)
+        counts = self._run_logic(app, dry_run=True)
+        if counts is None:
+            m['notes'].append(
+                "Predictions log not available — discover module not "
+                "loaded yet, fresh install, or startup race. Nothing "
+                "to preview.")
+            return m
+        kept_buy = int(counts.get('kept_buy', 0) or 0)
+        kept_no_call_fresh = int(counts.get('kept_no_call_fresh', 0) or 0)
+        kept_other_fresh = int(counts.get('kept_other_fresh', 0) or 0)
+        kept_unknown = int(counts.get('kept_unknown', 0) or 0)
+        kept_no_ts = int(counts.get('kept_no_timestamp', 0) or 0)
+        drop_no_call_old = int(counts.get('dropped_no_call_old', 0) or 0)
+        drop_other_old = int(counts.get('dropped_other_old', 0) or 0)
+        total_before = int(counts.get('total_before', 0) or 0)
+        total_after = int(counts.get('total_after', 0) or 0)
+        dropped = drop_no_call_old + drop_other_old
+
+        m['would_remove'] = dropped
+        # Rough size estimate — predictions records average ~300 B.
+        m['bytes_freed'] = dropped * 300
+
+        m['per_subject']['BUY (kept forever)']           = kept_buy
+        m['per_subject']['NO_CALL kept (< 1 day)']       = kept_no_call_fresh
+        m['per_subject']['WATCH/AVOID/HOLD kept (< 30d)'] = kept_other_fresh
+        m['per_subject']['unknown-direction (failsafe kept)']    = kept_unknown
+        m['per_subject']['no-timestamp (failsafe kept)']         = kept_no_ts
+        m['per_subject']['NO_CALL would drop (> 1 day)']         = drop_no_call_old
+        m['per_subject']['WATCH/AVOID/HOLD would drop (> 30d)']  = drop_other_old
+
+        if total_before:
+            pct = 100.0 * dropped / max(1, total_before)
+            m['notes'].append(
+                f"Before: {total_before:,} records  |  After: "
+                f"{total_after:,}  |  Drop: {dropped:,} ({pct:.1f}%).")
+        m['notes'].append(
+            "BUY records (your track record) are kept forever — never "
+            "dropped on age. A rotating backup is written before any "
+            "delete; either backup or atomic-rewrite failure aborts "
+            "without modifying the file.")
+        if dropped == 0:
+            m['notes'].append("Nothing past the retention windows yet.")
+        return m
+
+    def apply(self, app, options: dict) -> dict:
+        r = _new_apply_result(self.id)
+        counts = self._run_logic(app, dry_run=False)
+        if counts is None:
+            r['errors'].append(
+                'predictions log unavailable — task skipped')
+            return r
+        if counts.get('aborted'):
+            r['errors'].append(
+                'cleanup_tiered aborted (backup or atomic-rewrite '
+                'failed; file left intact, no records deleted)')
+            return r
+        drop_no_call_old = int(counts.get('dropped_no_call_old', 0) or 0)
+        drop_other_old = int(counts.get('dropped_other_old', 0) or 0)
+        r['removed'] = drop_no_call_old + drop_other_old
+        r['bytes_freed'] = r['removed'] * 300
+        return r
+
+
+# ─── Task 6 — On-demand backup snapshot (v4.14.6.34) ───────────────────
+
+class BackupSnapshotTask(Task):
+    """Create a full snapshot of `data/` as `data_backups/data_<ts>/`.
+
+    The same shutil.copytree behavior the close-time auto-backup
+    used to run on every clean exit — but now USER-TRIGGERED via
+    the Maintenance dialog instead of blocking shutdown.
+
+    Dry-run reports what would be copied (data/ size, current
+    backup count, how many old snapshots the prune step would drop).
+    Apply runs the copy, then prunes data_backups/data_* to keep
+    the newest N (cfg['cleanup_keep_backups'], default 2).
+
+    Notes:
+      * Touches NO DB — pure filesystem copy. No VACUUM needed.
+      * Uses the same ignore patterns the close-time path used
+        (.lock / .write_test / __pycache__).
+      * Errors during prune don't fail the task (the copy is the
+        load-bearing part; rotation is housekeeping).
+    """
+    id = 'backup_snapshot'
+    label = 'Create backup snapshot of data/'
+    description = (
+        'Snapshots the data/ folder into data_backups/data_<ts>/ '
+        'and rotates old snapshots (newest 2 by default). The '
+        'pre-v4.14.6.34 auto-backup-on-exit ran this every clean '
+        'close; it now lives here on-demand so close stays fast. '
+        'Touches no DB — pure filesystem copy.'
+    )
+    # No DB touched → no VACUUM list.
+
+    _KEEP_NEWEST_DEFAULT = 2
+
+    def _root(self) -> Path:
+        return Path(__file__).parent
+
+    def _data_dir(self) -> Path:
+        return self._root() / 'data'
+
+    def _backup_root(self) -> Path:
+        return self._root() / 'data_backups'
+
+    def _data_size_bytes(self) -> int:
+        d = self._data_dir()
+        if not d.exists():
+            return 0
+        try:
+            return sum(f.stat().st_size for f in d.rglob('*')
+                       if f.is_file())
+        except Exception:
+            return 0
+
+    def _existing_data_snapshots(self) -> list[Path]:
+        br = self._backup_root()
+        if not br.exists():
+            return []
+        try:
+            return sorted(
+                [p for p in br.iterdir()
+                 if p.is_dir() and p.name.startswith('data_')],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return []
+
+    def dry_run(self, app) -> dict:
+        m = _new_manifest(self.id, self.label)
+        size = self._data_size_bytes()
+        snaps = self._existing_data_snapshots()
+        try:
+            keep = int((getattr(app, 'cfg', None) or {}).get(
+                'cleanup_keep_backups',
+                self._KEEP_NEWEST_DEFAULT))
+        except Exception:
+            keep = self._KEEP_NEWEST_DEFAULT
+        # After this run there will be (existing + 1) snapshots;
+        # prune will drop the (existing + 1 - keep) oldest.
+        n_will_drop = max(0, len(snaps) + 1 - keep)
+        m['would_archive'] = 1
+        m['would_remove'] = n_will_drop
+        m['bytes_freed'] = 0  # backup ADDS bytes; doesn't free any
+        m['per_subject']['data/ size to copy'] = _human_bytes(size)
+        m['per_subject']['existing data_* snapshots'] = len(snaps)
+        m['per_subject']['after-run keep newest'] = keep
+        m['per_subject']['snapshots prune would drop'] = n_will_drop
+        m['sample'].append(
+            f"COPY {self._data_dir().name}/ "
+            f"({_human_bytes(size)}) -> "
+            f"{self._backup_root().name}/data_<ts>/")
+        for p in snaps[keep - 1:]:  # the ones that will rotate out
+            m['sample'].append(f"ROTATE OUT {p.name}")
+        m['notes'].append(
+            f"Adds {_human_bytes(size)} to data_backups/. "
+            f"After the copy, prune rotates to keep newest {keep} "
+            f"snapshots.")
+        if size == 0:
+            m['notes'].append("data/ is empty — nothing to copy.")
+        return m
+
+    def apply(self, app, options: dict) -> dict:
+        r = _new_apply_result(self.id)
+        data_dir = self._data_dir()
+        if not data_dir.exists():
+            r['errors'].append('data/ missing — nothing to snapshot')
+            return r
+        try:
+            self._backup_root().mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            dest = self._backup_root() / f'data_{ts}'
+            shutil.copytree(
+                str(data_dir), str(dest),
+                ignore=shutil.ignore_patterns(
+                    '.lock', '.write_test', '__pycache__'))
+            r['archived'] = 1
+            # bytes_freed reported as the copied size for the manifest
+            # (technically bytes WRITTEN, not freed, but the field
+            # name is the manifest's accumulator) — the UI shows it
+            # with a "+disk_used" note via the task description.
+            try:
+                r['bytes_freed'] = sum(
+                    f.stat().st_size for f in dest.rglob('*')
+                    if f.is_file())
+            except Exception:
+                pass
+        except Exception as e:
+            r['errors'].append(f'copytree: {e}')
+            return r
+        # Prune old snapshots, best-effort.
+        try:
+            keep = int((getattr(app, 'cfg', None) or {}).get(
+                'cleanup_keep_backups',
+                self._KEEP_NEWEST_DEFAULT))
+            snaps = self._existing_data_snapshots()
+            for old in snaps[keep:]:
+                try:
+                    shutil.rmtree(str(old), ignore_errors=True)
+                    if not old.exists():
+                        r['removed'] += 1
+                except Exception as _e:
+                    r['errors'].append(f'rmtree {old.name}: {_e}')
+        except Exception as _ep:
+            r['errors'].append(f'prune: {_ep}')
+        return r
+
+
 # ─── Registry — the place future Tasks plug in ─────────────────────────
 
 CFG_ENABLE_GOSSIP_REMOVAL = 'maintenance_enable_gossip_removal'
@@ -870,6 +1140,19 @@ def get_task_registry(cfg: dict = None) -> list:
         OperationalLogTask(),
         AILogArchiveTask(),
         BackupPileTask(),
+        # v4.14.6.34-async-shutdown: on-demand backup snapshot. The
+        # close-time auto-backup used to be the dominant shutdown
+        # cost (~2.3 GB shutil.copytree blocking close for 30-120s on
+        # HDD). It now runs detached after exit when the cfg flag is
+        # on; the cfg flag default is now False for new installs so
+        # backups happen here when the user clicks Apply.
+        BackupSnapshotTask(),
+        # v4.14.6.36-cleanup-era: relocated predictions retention.
+        # The pre-v4.14.6.36 nightly auto-tick deleted non-BUY
+        # records older than 30d silently with no UI surface. Now
+        # user-triggered here — same cleanup_tiered logic (BUYs
+        # forever, backup + atomic rewrite), but visible.
+        PredictionsCleanupTask(),
     ])
     return out
 

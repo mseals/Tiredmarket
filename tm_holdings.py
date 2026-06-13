@@ -192,7 +192,7 @@ _LEGACY_PATH_REMAP = {
 # return 8 entries — and every consumer that iterates PATHS.keys()
 # (path rotation, cadence loop, recommend-cache _paths_for_refresh)
 # dispatched against the legacy names too. That was the double-dispatch
-# observed as old-key lines in the activity log. The aliases are now
+# Mike saw as old-key lines in the activity log. The aliases are now
 # REMOVED so PATHS.keys() returns ONLY the four band keys.
 # `_LEGACY_PATH_REMAP` itself + remap_legacy_path() STAY for
 # resolution-on-access — a persisted analysis_path or a legacy-keyed
@@ -244,7 +244,7 @@ def get_path_track(path: str) -> str:
     return PATH_TRACK.get(remap_legacy_path(p), "speculative")
 
 
-# v4.14.5.14-merge-and-unify — the user's articulated architectural
+# v4.14.5.14-merge-and-unify — Mike's articulated architectural
 # simplification (see IDEAS.md 2026-05-19 "penny_lottery merges into
 # lottery"). Lottery now MEANS "cheap speculation under $5" and the
 # prompt reframes to honest weeks-of-sweating behaviour rather than
@@ -1290,7 +1290,7 @@ class DataCacheLayer:
         messages — enough for the prompt block to render meaningful
         social context without dumping raw post text.
 
-        StockTwits-only is the common case until the user provisions
+        StockTwits-only is the common case until Mike provisions
         embedded Reddit credentials. The merge layer handles either
         source being absent gracefully.
         """
@@ -1506,7 +1506,7 @@ class PromptBuilder:
         path_info = PATHS.get(path_key, PATHS[DEFAULT_PATH])
 
         lines = []
-        lines.append(f"You are analyzing a position for the user. Be direct, commit "
+        lines.append(f"You are analyzing a position for Mike. Be direct, commit "
                      f"to a recommendation, explain your reasoning. If the data "
                      f"is insufficient to give a real opinion, say what data "
                      f"you'd need — don't make up numbers.")
@@ -1597,7 +1597,7 @@ class PromptBuilder:
             lines.append("")
 
         # v4.15.0 Step 16: inject user preferences just before QUESTION so the
-        # AI reads context first, then the user's stated preferences, then what
+        # AI reads context first, then Mike's stated preferences, then what
         # it's being asked to do. No-op when choices are at defaults.
         _user_pref = self._get_user_preferences_line()
         if _user_pref:
@@ -1618,7 +1618,7 @@ class PromptBuilder:
             _horizon_days = 90
 
         lines.append("QUESTION:")
-        lines.append(f"  Given the user's chosen path ({path_info['name']}) and "
+        lines.append(f"  Given Mike's chosen path ({path_info['name']}) and "
                      f"the data above, what's your recommendation on this "
                      f"position? Hold or sell? Give a probability (number, "
                      f"not 'low/medium/high') for whether the position will "
@@ -1702,7 +1702,7 @@ class PromptBuilder:
         current_price = (quote or {}).get('price') if quote else None
 
         lines = []
-        lines.append("You are watching a LOCKED position for the user. He cannot "
+        lines.append("You are watching a LOCKED position for Mike. He cannot "
                      "sell this — it's frozen, illiquid, or otherwise non-"
                      "tradable. Don't recommend hold or sell. Instead, look "
                      "for anything notable: did the price move significantly? "
@@ -1763,7 +1763,7 @@ class PromptBuilder:
                      "unusual, just say so briefly (1-2 sentences). If "
                      "something IS notable — price spike, news, regulatory "
                      "filing, possible unlock event — describe it and what "
-                     "the user should know.")
+                     "Mike should know.")
 
         # Phase 2C: even for locked positions, ask for the structured
         # summary so we can track AI's accuracy on "is anything happening?"
@@ -2736,7 +2736,7 @@ class HoldingsWindow:
         buy recommendations — that's a different decision and bundling
         them encourages overtrading after a win.
 
-        For the user specifically: he asked about post-sell buy suggestions,
+        For Mike specifically: he asked about post-sell buy suggestions,
         and we agreed to defer that to Phase 2C when we have real data
         for picks. This dialog is the acknowledgment-only version.
         """
@@ -3210,7 +3210,7 @@ class HoldingsWindow:
             whether a per-path scan actually did any work."""
             try:
                 if self.predictions_log is not None:
-                    return sum(1 for p in self.predictions_log.get_all()
+                    return sum(1 for p in self.predictions_log.get_all_full(timeout=30.0)
                                 if p.get('path') == path_key)
             except Exception:
                 pass
@@ -3694,7 +3694,7 @@ class HoldingsWindow:
                 try:
                     if self.predictions_log is not None:
                         _initial_pred_count = len(
-                            self.predictions_log.get_all())
+                            self.predictions_log.get_all_full(timeout=30.0))
                 except Exception:
                     pass
 
@@ -3721,7 +3721,7 @@ class HoldingsWindow:
                         _new_buys = 0
                         try:
                             if self.predictions_log is not None:
-                                _all_preds = self.predictions_log.get_all()
+                                _all_preds = self.predictions_log.get_all_full(timeout=30.0)
                                 for p in _all_preds[_initial_pred_count:]:
                                     if p.get('direction') == 'BUY':
                                         _new_buys += 1
@@ -3822,7 +3822,7 @@ class HoldingsWindow:
     # Sort priority for AI directions on Discover results.
     # Lower number = appears higher in the list = more actionable.
     # The "owned" flag flips priorities so SELL/TRIM/HOLD/AVOID on owned
-    # positions are far more relevant than on stocks the user doesn't own.
+    # positions are far more relevant than on stocks Mike doesn't own.
     _DISCOVER_SORT_BUCKETS = {
         ('BUY',     False): 1,   # new opportunity
         ('SELL',    True ): 2,   # exit signal — own
@@ -3840,7 +3840,7 @@ class HoldingsWindow:
     _DISCOVER_CONF_RANK = {'HIGH': 0, 'MODERATE': 1, 'LOW': 2, '': 3, None: 3}
 
     def _discover_held_tickers(self) -> set[str]:
-        """Tickers the user currently owns (any status). Used to flag 'OWNED'
+        """Tickers Mike currently owns (any status). Used to flag 'OWNED'
         rows in Discover and to drive the sort priority."""
         try:
             return {h.get('ticker', '').upper() for h in self.mgr.holdings}
@@ -3985,7 +3985,7 @@ class HoldingsWindow:
         if _unified:
             lines = [
                 f"You are evaluating {ticker} as a potential new "
-                f"position for the user (he does not own it). Evaluate it "
+                f"position for Mike (he does not own it). Evaluate it "
                 f"SEPARATELY for EACH strategy path below — the same "
                 f"fundamentals/technicals/news, only the entry bar "
                 f"differs per path:",
@@ -4001,7 +4001,7 @@ class HoldingsWindow:
             lines = [
                 f"You are evaluating {ticker} as a potential new "
                 f"position for "
-                f"the user. He doesn't currently own this — should he "
+                f"Mike. He doesn't currently own this — should he "
                 f"consider entering?",
                 "",
                 f"PATH/GOAL: {path_info['name']} — "
@@ -4009,7 +4009,7 @@ class HoldingsWindow:
                 "",
             ]
         if notes:
-            lines.append(f"USER'S NOTE ON THIS TICKER: {notes}")
+            lines.append(f"MIKE'S NOTE ON THIS TICKER: {notes}")
             lines.append("")
 
         price = quote.get('price')
@@ -4026,7 +4026,7 @@ class HoldingsWindow:
         # v4.14.1 stage 5: route TECHNICALS + RECENT NEWS sections
         # (plus the new FACTS / EARNINGS / FILINGS blocks) through
         # tm_context_builder. Candidate variant uses the full block
-        # set — the user is evaluating an entry decision so technicals,
+        # set — Mike is evaluating an entry decision so technicals,
         # fundamentals, news, earnings, and filings are all relevant.
         try:
             import tm_context_builder
@@ -4082,10 +4082,10 @@ class HoldingsWindow:
 
         lines.append("QUESTION:")
         # v4.14.2 stage 4: vocabulary fix. Pre-stage-4 this asked for
-        # BUY / HOLD / AVOID; HOLD is meaningless on tickers the user
+        # BUY / HOLD / AVOID; HOLD is meaningless on tickers Mike
         # doesn't own. WATCH replaces HOLD with the right semantics:
         # "interesting, wait for a better entry / clearer signal."
-        lines.append(f"  Should the user enter a position in {ticker}? "
+        lines.append(f"  Should Mike enter a position in {ticker}? "
                      "Consider his path, current technicals, and news. "
                      "If you'd say BUY, give a specific entry zone and "
                      "exit levels. If WATCH, say what would change "
@@ -4122,7 +4122,7 @@ class HoldingsWindow:
                 except Exception:
                     pass
             lines.append("")
-            # v4.14.2 stage 4: candidate prompt (the user doesn't own
+            # v4.14.2 stage 4: candidate prompt (Mike doesn't own
             # this ticker yet) — uses BUY / WATCH / AVOID. HOLD
             # was the v4.14.1 framing and produced meaningless
             # "hold what?" verdicts on non-owned tickers.
@@ -4471,7 +4471,7 @@ class HoldingsWindow:
                 _cached = getattr(self.app, '_track_record_cache', None)
                 if _cached:
                     try:
-                        cur_count = len(self.predictions_log.get_all())
+                        cur_count = len(self.predictions_log.get_all_full(timeout=30.0))
                     except Exception:
                         cur_count = -1
                     if (_cached.get('pred_count') == cur_count
@@ -5248,7 +5248,7 @@ class HoldingsWindow:
             # are filter-outs.
             #
             # The new sort respects:
-            #   - Owned tickers first (the user needs to know about positions)
+            #   - Owned tickers first (Mike needs to know about positions)
             #   - Within owned: exit signals (SELL/TRIM/AVOID) > confirmations
             #   - Unowned: BUY signals > splits > AVOID signals
             #   - Stronger consensus before weaker within each group
@@ -5516,7 +5516,18 @@ class HoldingsWindow:
                  font=('Segoe UI', 9, 'bold')
                  ).pack(side='left')
 
-        # Clear buttons on the right side
+        # Clear buttons on the right side.
+        # v4.14.6.35-fix-portfolio-paint: this footer renders during
+        # _build (main thread) and is supposed to surface RECENT
+        # predictions only — the working set covers everything the
+        # user sees here (most-recent-first sort, capped at the
+        # "recent" view further down). The v4.14.6.34 audit
+        # miscategorised this as needing full history; the resulting
+        # get_all_full(timeout=30.0) call blocked the main thread for
+        # up to 30s during _build while the predictions tail-load was
+        # still in progress (the headline cause of the ~12s blank
+        # pre-paint). Reverted to get_all() so the footer paints
+        # instantly from the working set.
         all_preds = self.predictions_log.get_all()
         all_preds.sort(key=lambda p: p.get('timestamp', ''), reverse=True)
 
@@ -5772,7 +5783,7 @@ class HoldingsWindow:
         the file before deleting."""
         if not self.predictions_log:
             return
-        all_preds = self.predictions_log.get_all()
+        all_preds = self.predictions_log.get_all_full(timeout=30.0)
         n = len(all_preds)
         if n == 0:
             return
@@ -5842,7 +5853,7 @@ class HoldingsWindow:
         """Confirm + clear predictions older than `days` days."""
         if not self.predictions_log:
             return
-        all_preds = self.predictions_log.get_all()
+        all_preds = self.predictions_log.get_all_full(timeout=30.0)
         if not all_preds:
             return
 
