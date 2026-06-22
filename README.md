@@ -14,46 +14,24 @@ AVOID verdicts, and groups them into deployment baskets (ALL IN / A FEW /
 DIVERSIFY) for a budget you set. Educational / research tool — not
 financial advice.
 
-## Download — three ways to get it
+## Download
 
-1. **Installer (recommended for most people).** Download
-   `TiredMarket-Setup-v4.14.6.108.exe` from the
-   [Releases](../../releases) page and run it. It installs the app,
-   creates Start-Menu/desktop shortcuts, and stores your data beside the
-   install. Uninstall from "Add or Remove Programs" (it asks whether to
-   also delete your data).
-2. **Portable standalone (no install).** Download
-   `TiredMarket-portable-v4.14.6.108.zip` from Releases, unzip it
-   anywhere, and run `TiredMarket.exe`. On first launch it asks where to
-   keep its data. To fully remove it, delete the folder **and** the data
-   folder it created (there's no uninstaller for the portable build).
-3. **From source.** Clone the repo, `pip install -r requirements.txt`,
-   then `python tired_market.py`. See **Running from source** below.
+Most people: grab a ready-to-run build from the [Releases page](https://github.com/mseals/Tiredmarket/releases/latest).
 
-### Unsigned-software notice (read this first)
+- **All-in-One** (`TiredMarket-AllInOne-v4.14.6.108.exe`) — one file. Download, double-click, it runs. No install, no unzip. Simplest option.
+- **Installer** (`TiredMarket-Setup-v4.14.6.108.exe`) — installs like a normal program (Start Menu shortcut, clean uninstall that can remove your data). Recommended if you want it installed properly.
+- **Portable** (`TiredMarket-portable-v4.14.6.108.zip`) — unzip the folder anywhere and run `TiredMarket.exe` inside. No install. Good for a USB stick.
+- **Source** (for developers) — see "Running from source" below.
 
-The installer and `.exe` are **not code-signed** (a signing certificate
-costs hundreds of dollars a year — not worth it for a free tool). So the
-**first** time you run them, Windows will show scary-looking but harmless
-warnings:
+> ⚠️ **Unsigned software.** These builds are unsigned, so Windows SmartScreen may say "Windows protected your PC" → click **More info → Run anyway**. Some antivirus may flag it (a false positive — normal for independent free apps built with PyInstaller). The All-in-One single file trips this a bit more than the others.
 
-- **SmartScreen — "Windows protected your PC."** Click **More info →
-  Run anyway**.
-- **Antivirus may flag it.** This is a common *false positive* for apps
-  packaged with PyInstaller. Allow / whitelist `TiredMarket.exe` if needed.
-
-If that's not acceptable to you, run from source instead (option 3).
-
-## System requirements
-
-- **Windows 10 or 11, 64-bit.**
-- **No GPU required** — the AI runs in the cloud (you bring your own free
-  API keys); the rest is a local algorithm.
-- **Minimum:** ~4 GB RAM, dual-core CPU, ~3 GB free disk.
-- **Recommended:** 8 GB RAM + SSD. **Optimal:** 16 GB + SSD.
-- The **first hour** of cache-fill is heavy (it pulls daily price bars +
-  news for the whole universe); after that it's light. The data folder
-  **grows over time toward ~2 GB**.
+### System requirements
+- **Windows 10 or 11, 64-bit.** (Not macOS, Linux, older Windows, or 32-bit.)
+- **No GPU needed** — the AI runs in the cloud (bring your own free keys), and the app itself is CPU-only.
+- **Minimum:** ~4 GB RAM, dual-core, ~3 GB free disk.
+- **Recommended:** 8 GB RAM + SSD.
+- The first hour of data-loading is the heavy part (price + news cache fill from scratch); it's light after that. Data grows over time toward ~2 GB.
+- **AI is optional:** bring your own free API keys for smarter, validated picks — or run on the built-in algorithm with no keys at all.
 
 ## Where your data lives
 
@@ -81,7 +59,7 @@ portfolio** are stored in a `data` folder:
   Zhipu (Z.AI), GitHub Models, Cloudflare Workers AI.
 - Internet (for model calls + Yahoo Finance / Stooq price data).
 
-## Install
+### Install (from source)
 
 1. Clone or download the repo anywhere (folder name and drive don't
    matter — the app resolves its own paths at runtime).
