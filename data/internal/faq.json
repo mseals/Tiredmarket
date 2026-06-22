@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "what_is_consensus",
+      "keywords": ["consensus", "vote", "voting", "multiple ai", "what do all the ai say"],
+      "question": "How does consensus voting work?",
+      "answer": "When you click Look Up or Scan, Tired Market sends the same prompt to several AI models at once. Each one votes BUY, WATCH, or AVOID independently. The 'consensus' is the breakdown of how they voted — it's not a single answer, it's a count of how many AIs agreed."
+    },
+    {
+      "id": "what_are_paths",
+      "keywords": ["path", "paths", "trading style", "conservative", "aggressive", "moderate", "day trade"],
+      "question": "What are the trading paths / styles?",
+      "answer": "Trading paths tell the AI what kind of investor you are. Conservative looks for stable companies and low risk. Moderate balances growth and stability. Aggressive looks for higher-reward, higher-risk plays. Each path filters candidates and tunes the AI's reasoning differently."
+    },
+    {
+      "id": "how_to_add_provider",
+      "keywords": ["add provider", "api key", "connect ai", "groq", "gemini", "mistral", "set up ai"],
+      "question": "How do I add an AI provider?",
+      "answer": "Click the API button in the toolbar, or open Settings → AI Providers. Pick a provider (Groq is the easiest free one), paste in your API key, and save. The fastest way to get a Groq key is at groq.com — sign up, go to API keys, create one, paste it in."
+    },
+    {
+      "id": "why_no_recommendations",
+      "keywords": ["no recommendations", "recommend empty", "no buys", "nothing in recommend"],
+      "question": "Why doesn't Recommend show anything?",
+      "answer": "Recommend reads from your recent scan results. If you haven't run a Scan in a while, or your last scan didn't produce any BUY votes, Recommend will be empty. Try running a fresh Scan — that populates new recommendations."
+    },
+    {
+      "id": "what_is_track_record",
+      "keywords": ["track record", "accuracy", "how good is the ai", "ai performance", "stats"],
+      "question": "What does Track Record show?",
+      "answer": "Track Record has two cards. AI Accuracy shows how often your AI models' predictions hit their targets vs missed — a paper-trade evaluation. Real Trades shows your actual buy/sell history from your portfolio. They're separate — Track Record can show good AI accuracy even if you haven't acted on the predictions."
+    },
+    {
+      "id": "free_vs_paid_ai",
+      "keywords": ["free", "paid", "cost", "pricing", "how much", "expensive"],
+      "question": "Do I have to pay for AI providers?",
+      "answer": "No. Most of the AI providers Tired Market supports have free tiers that are plenty for personal use — Groq, Gemini, Mistral, Cerebras, GitHub Models, and SambaNova all offer free API keys. You'll only hit limits if you run lots of scans every day."
+    },
+    {
+      "id": "what_data_sources",
+      "keywords": ["data", "data source", "where data come from", "yahoo", "finnhub"],
+      "question": "Where does the stock data come from?",
+      "answer": "Tired Market pulls data from several sources: Yahoo Finance and Stooq for prices, Finnhub for news and fundamentals (with a free API key), SEC EDGAR for filings, FRED for macro data, Reddit and StockTwits for social sentiment. The keyless sources (Yahoo, Stooq, EDGAR) work without setup."
+    },
+    {
+      "id": "what_is_consensus_filter",
+      "keywords": ["consensus filter", "why is this not recommended", "why was this dropped"],
+      "question": "Why was a ticker dropped from Recommend?",
+      "answer": "Recommend filters out tickers where the most recent multi-AI consensus voted HOLD or AVOID within the last 5 days — even if a single AI later said BUY. The idea is that fresh group disagreement should outweigh one optimistic AI."
+    },
+    {
+      "id": "how_outcomes_resolve",
+      "keywords": ["target hit", "stop hit", "outcome", "did i win", "expired prediction"],
+      "question": "How do predictions get marked target_hit or stop_hit?",
+      "answer": "Tired Market checks every prediction against daily price history. If the closing price hit the target before the stop, target_hit. If it hit the stop first, stop_hit. If neither happened within the timeframe, expired. Intraday wicks don't count — only daily closes matter."
+    },
+    {
+      "id": "what_is_choices",
+      "keywords": ["choices", "price range", "style", "trading style", "what kind of stocks"],
+      "question": "What are the Choices controls?",
+      "answer": "Choices tells me what kind of stocks you care about. Price range is which dollar buckets you trade — penny stocks under $1, low $1-10, mid $10-50, high $50+. You can pick multiple. Style is conservative, moderate, aggressive, or day_trade — that tells me how risky you want to be."
+    },
+    {
+      "id": "what_does_written_off_mean",
+      "keywords": ["written off", "writeoff", "delisted"],
+      "question": "What does 'WRITTEN OFF' mean on a holding?",
+      "answer": "Written off means the position is held for record but isn't expected to recover — typically delisted stocks, OTC Expert Market stocks (where brokers won't process retail sells), or stocks that have lost essentially all value. They stay in your portfolio for tracking but don't get analyzed or recommended on."
+    },
+    {
+      "id": "scan_taking_long_time",
+      "keywords": ["slow scan", "scan slow", "taking forever", "how long"],
+      "question": "Why is my scan taking so long?",
+      "answer": "A full scan iterates through your selected universe (could be 2000+ tickers) and calls AI for each one that passes the filter. Free-tier AI providers have rate limits, so the scan paces itself. A scan with one provider can take 30-60 minutes for a few hundred candidates."
+    },
+    {
+      "id": "what_is_cache",
+      "keywords": ["cache", "cached data", "what is the cache", "data cache"],
+      "question": "What is the cache?",
+      "answer": "Tired Market stores stock data locally (in data/cache.db) so it doesn't have to refetch the same information every time. Prices, news, filings, fundamentals — anything fetched once gets cached. The app reads from cache first, only fetching live data when the cache is stale or missing."
+    },
+    {
+      "id": "how_to_change_style",
+      "keywords": ["change style", "switch path", "change trading style"],
+      "question": "How do I change my trading style?",
+      "answer": "Click the Choices summary strip at the top of the main window (the line that says 'Looking for: ...'). That opens the Choices popup where you can adjust your price range and style. Changes apply to your next Look Up, Scan, or Recommend."
+    },
+    {
+      "id": "is_this_real_money",
+      "keywords": ["real money", "paper trade", "actually buy", "does this trade"],
+      "question": "Does Tired Market actually buy stocks for me?",
+      "answer": "No. Tired Market is an analysis tool — it tells you what the AI thinks about stocks. You decide what to buy or sell, and you do the trading yourself in your brokerage. The Real Trades card in Track Record is a manual log of your actual trades, not automated trading."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "_schema_version": 1,
+  "_generated_by": "v4.14.2-stage4 — first cheat-sheet artifact per IDEAS Tired Market AI as system steward (Phase 1 — Authored layer foundation).",
+  "_consumer": "v4.14.2-stage4 reads tier_unlocks / signup_url / estimated_signup_time_seconds for the Settings UI render. The guided_steps array is reserved for the embedded assistant in v4.15.0+ — no consumer in v4.14.2.",
+  "_internal_files_convention": "This directory has the Windows hidden+system attribute set during install. Files here are not user-edited; the system steward (when active) auto-recovers from data_backups or the install snapshot.",
+  "_note": "v4.14.5.14-macro-keyless (2026-05-26): ZERO data-provider entries by design. Every data type now has a working keyless path (FRED macro went keyless via its CSV endpoint + Treasury/BLS fallbacks), so the teacher AI recommends NO data keys — only cloud AI-inference keys, which are genuinely required post-Ollama. Add an entry here ONLY if a future capability is genuinely keyed-only (no keyless source exists). See DECISIONS.md 2026-05-26 'Macro keyless'."
+}

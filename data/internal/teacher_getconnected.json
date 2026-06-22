@@ -1,0 +1,195 @@
+{
+  "_schema_version": 1,
+  "_purpose": "Teacher AI 'get connected' on-ramp (v4.15.0-teacher-getconnected). Read ONLY by tm_teacher_retrieval (the local/offline program lane) so the AI can walk a user through adding a free cloud AI key WITHOUT needing the cloud (the bootstrap trap). Separate from provider_signup_specs.json, which is deliberately empty-by-design (macro-keyless) and drives the Data Providers UI \u2014 this file does NOT touch that path.",
+  "_authoring_note": "Draft authored by Windows-Claude from the verified free-tier facts in DECISIONS.md (slice-6 STEP 0); pending chat-Claude wording review (same status as the identity-sheet draft). Hot-editable.",
+  "_reverify_note": "Free-tier limits + signup friction CHANGE \u2014 re-verify each provider at build/release. Lead with email-only providers; present the phone-verify one (Mistral) with an explicit caveat.",
+  "entries": [
+    {
+      "id": "which_ai_to_add",
+      "title": "Which AI should I add (and the order to add them)",
+      "keywords": [
+        "which ai",
+        "which ai should i add",
+        "what ai should i add",
+        "which provider",
+        "what provider",
+        "recommend an ai",
+        "best ai to add",
+        "which one should i add",
+        "what should i connect",
+        "which is best"
+      ],
+      "body": "Tired Market needs at least one cloud AI to do its analysis. Good free first choices, easiest first: (1) Groq \u2014 free, very fast, sign up with just an email or Google account, no card. Great for quick answers. (2) Google Gemini \u2014 free, also just email/Google, no card; it has a large daily allowance so it's good for the heavier scanning work. (3) Mistral \u2014 also free with a large allowance, BUT its signup asks for a phone number to verify, so add this one only if you don't mind that. Start with Groq or Gemini (no phone needed). Adding two or three DIFFERENT providers is better than one: if one is busy, the app falls back to another. (Adding several keys from the SAME provider does not help \u2014 limits are per account, not per key.)"
+    },
+    {
+      "id": "how_to_add_ai",
+      "title": "How to add an AI provider (general steps)",
+      "keywords": [
+        "how do i add an ai",
+        "add an ai",
+        "add a provider",
+        "add ai",
+        "add a key",
+        "add an api key",
+        "connect an ai",
+        "get connected",
+        "set up ai",
+        "how do i connect",
+        "add my key",
+        "where do i put the key",
+        "enter api key",
+        "how do i add",
+        "steps to add",
+        "walk me through"
+      ],
+      "body": "To add a cloud AI: 1) Open Settings, then the AI Providers manager. 2) Pick a provider (Groq is a good first one \u2014 email signup, no card). 3) Click its 'Get free key' link to open the provider's site, create a free account, and copy your API key. 4) Back in Tired Market, paste the key into that provider's slot and save. The app checks the key right away and tells you if it worked. You only need one to start, but two or three different providers give you a fallback if one is busy."
+    },
+    {
+      "id": "add_groq",
+      "title": "Add Groq (free, fast, email signup)",
+      "keywords": [
+        "groq",
+        "add groq",
+        "groq key",
+        "groq signup",
+        "how do i get a groq key",
+        "groq api"
+      ],
+      "body": "Groq is free and very fast, and signing up only needs an email or Google account \u2014 no credit card, no phone number. Steps: open the provider's site from the Groq 'Get free key' link, sign in with email/Google, create an API key, copy it, then paste it into Groq's slot in Settings -> AI Providers and save. Groq is best for quick interactive answers; its per-minute token budget is smaller, so it's not the main heavy-scanning workhorse."
+    },
+    {
+      "id": "add_gemini",
+      "title": "Add Google Gemini (free, large allowance, email signup)",
+      "keywords": [
+        "gemini",
+        "google gemini",
+        "add gemini",
+        "gemini key",
+        "google ai",
+        "gemini signup",
+        "how do i get a gemini key"
+      ],
+      "body": "Google Gemini is free and signs up with just a Google/email account \u2014 no card, no phone. It has a large daily token allowance, which makes it a strong choice for the heavier scanning the app does. Steps: open the Gemini 'Get free key' link, sign in with your Google account, create an API key, copy it, paste it into Gemini's slot in Settings -> AI Providers, and save."
+    },
+    {
+      "id": "add_mistral",
+      "title": "Add Mistral (free, large allowance \u2014 needs a phone number)",
+      "keywords": [
+        "mistral",
+        "add mistral",
+        "mistral key",
+        "mistral signup",
+        "how do i get a mistral key",
+        "phone",
+        "phone number",
+        "does mistral",
+        "mistral phone",
+        "needs a phone",
+        "need a phone"
+      ],
+      "body": "Mistral's free tier has a large token allowance, BUT its signup asks for a phone number to verify your account \u2014 so add it only if you're okay giving a phone number (you can skip it and use Groq or Gemini instead, which only need an email). Steps: open the Mistral 'Get free key' link, create an account (it will ask to verify a phone number), create an API key, copy it, paste it into Mistral's slot in Settings -> AI Providers, and save. Note Mistral describes its free tier as for evaluation/prototyping."
+    },
+    {
+      "id": "trouble_invalid_key",
+      "title": "It says my key is invalid / was rejected",
+      "keywords": [
+        "invalid key",
+        "key invalid",
+        "it says invalid",
+        "key rejected",
+        "key not accepted",
+        "key didn't work",
+        "key doesnt work",
+        "bad key",
+        "authentication failed",
+        "unauthorized",
+        "401",
+        "invalid",
+        "rejected",
+        "won't validate",
+        "wont validate",
+        "key failed",
+        "said invalid",
+        "not valid",
+        "key is invalid"
+      ],
+      "body": "An 'invalid' or 'rejected' key means the provider didn't accept it. Common causes: the key was copied incompletely or with extra spaces (re-copy the whole key and make sure there are no spaces before or after it); the key was pasted into the wrong provider's slot (a Groq key only works in the Groq slot); or the account isn't fully activated yet (some providers need you to confirm an email or finish setup before the key works). Re-copy the key carefully, confirm it's in the right provider's slot, and save again. If it still fails, create a fresh key on the provider's site."
+    },
+    {
+      "id": "trouble_key_format",
+      "title": "I pasted the key but it won't take / extra spaces",
+      "keywords": [
+        "pasted wrong",
+        "extra spaces",
+        "key has spaces",
+        "key won't paste",
+        "wont paste",
+        "key looks wrong",
+        "copied wrong",
+        "paste the key",
+        "spaces",
+        "whitespace",
+        "trailing space"
+      ],
+      "body": "Keys are long strings and are easy to copy with an extra space or a missing character. Select the whole key on the provider's site (use its copy button if it has one), make sure nothing is selected before or after it, and paste it fresh into the slot. Remove any space at the start or end. Then save \u2014 the app re-checks it immediately."
+    },
+    {
+      "id": "trouble_wrong_slot",
+      "title": "Wrong provider's key in the wrong slot",
+      "keywords": [
+        "wrong slot",
+        "wrong provider",
+        "key in wrong place",
+        "groq key in gemini",
+        "mixed up keys",
+        "which slot",
+        "wrong box",
+        "which provider",
+        "mixed up"
+      ],
+      "body": "Each provider's key only works in that provider's slot \u2014 a Groq key won't validate as Gemini, and vice-versa. In Settings -> AI Providers, check that the key you pasted matches the provider whose slot it's in. If you're not sure which is which, the provider's own dashboard (where you made the key) tells you who issued it."
+    },
+    {
+      "id": "trouble_offline_validate",
+      "title": "It can't check my key / I might be offline",
+      "keywords": [
+        "can't check key",
+        "cant validate",
+        "couldn't validate",
+        "couldnt validate",
+        "offline",
+        "no internet",
+        "no connection",
+        "validation failed network",
+        "can't reach",
+        "cant reach",
+        "couldn't reach",
+        "couldnt reach",
+        "unreachable"
+      ],
+      "body": "If the app says it couldn't reach the provider to check your key (rather than that the key was rejected), that's usually a connection problem, not a bad key. Check your internet connection and try saving again \u2014 the app re-checks the key when you save. If you're offline, the rest of Tired Market still works on cached data; the key will validate once you're back online."
+    },
+    {
+      "id": "trouble_cant_find_setting",
+      "title": "I can't find where to add the key",
+      "keywords": [
+        "can't find the setting",
+        "cant find setting",
+        "where is the setting",
+        "where do i add ai",
+        "where is ai providers",
+        "can't find ai providers",
+        "where are providers",
+        "where to add",
+        "can't find",
+        "cant find",
+        "where do i",
+        "find the setting",
+        "where is the",
+        "can't find where",
+        "add the key"
+      ],
+      "body": "The place to add cloud AI keys is Settings -> AI Providers (the AI Providers manager). Open Settings, look for the AI Providers section, and you'll see a slot for each provider with a 'Get free key' link and a box to paste the key into. Paste your key in the right provider's box and save."
+    }
+  ]
+}

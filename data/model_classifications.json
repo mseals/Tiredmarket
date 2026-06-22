@@ -1,0 +1,95 @@
+{
+  "metadata": {
+    "0xroyce/plutus": {
+      "architecture": "llama",
+      "parameter_count_b": 8.0,
+      "has_custom_prompt": false,
+      "name": "0xroyce/plutus"
+    },
+    "jaahas/qwen3.5-uncensored:9b": {
+      "architecture": "qwen35",
+      "parameter_count_b": 9.0,
+      "has_custom_prompt": false,
+      "name": "jaahas/qwen3.5-uncensored:9b"
+    },
+    "dolphin-mixtral:8x7b": {
+      "architecture": "llama",
+      "parameter_count_b": 46.7,
+      "has_custom_prompt": true,
+      "name": "dolphin-mixtral:8x7b"
+    },
+    "deepseek-r1:14b": {
+      "architecture": "qwen2",
+      "parameter_count_b": 14.8,
+      "has_custom_prompt": false,
+      "name": "deepseek-r1:14b"
+    },
+    "phi4:14b": {
+      "architecture": "phi3",
+      "parameter_count_b": 14.7,
+      "has_custom_prompt": false,
+      "name": "phi4:14b"
+    },
+    "dolphin3:8b": {
+      "architecture": "llama",
+      "parameter_count_b": 8.0,
+      "has_custom_prompt": true,
+      "name": "dolphin3:8b"
+    },
+    "qwen2.5:14b": {
+      "architecture": "qwen2",
+      "parameter_count_b": 14.8,
+      "has_custom_prompt": true,
+      "name": "qwen2.5:14b"
+    },
+    "hermes3:8b": {
+      "architecture": "llama",
+      "parameter_count_b": 8.0,
+      "has_custom_prompt": false,
+      "name": "hermes3:8b"
+    },
+    "gemma4:e4b": {
+      "architecture": "gemma4",
+      "parameter_count_b": 8.0,
+      "has_custom_prompt": false,
+      "name": "gemma4:e4b"
+    },
+    "qwen3.5:9b": {
+      "architecture": "qwen35",
+      "parameter_count_b": 9.7,
+      "has_custom_prompt": false,
+      "name": "qwen3.5:9b"
+    },
+    "huihui_ai/deepseek-r1-abliterated:14b": {
+      "architecture": "qwen2",
+      "parameter_count_b": 14.8,
+      "has_custom_prompt": false,
+      "name": "huihui_ai/deepseek-r1-abliterated:14b"
+    },
+    "huihui_ai/qwen2.5-coder-abliterate:14b": {
+      "architecture": "qwen2",
+      "parameter_count_b": 14.8,
+      "has_custom_prompt": true,
+      "name": "huihui_ai/qwen2.5-coder-abliterate:14b"
+    },
+    "llama3.1:8b": {
+      "architecture": "llama",
+      "parameter_count_b": 8.0,
+      "has_custom_prompt": false,
+      "name": "llama3.1:8b"
+    },
+    "qwen2.5:3b": {
+      "architecture": "qwen2",
+      "parameter_count_b": 3.1,
+      "has_custom_prompt": true,
+      "name": "qwen2.5:3b"
+    },
+    "phi3:3.8b": {
+      "architecture": "phi3",
+      "parameter_count_b": 3.8,
+      "has_custom_prompt": false,
+      "name": "phi3:3.8b"
+    }
+  },
+  "saved_at": "2026-05-04T11:36:49.867254"
+}

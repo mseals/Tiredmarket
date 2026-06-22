@@ -1,0 +1,18 @@
+{
+  "_comment": "Tired Market path enable/disable config. Edit and restart the app to change. Setting enabled=false on a path means: (1) Recommend will skip predictions from that path, (2) the dropdown will return empty if you pick that path. Predictions are still made and stored \u2014 the recommendation engine just stops surfacing them. Default state below as of v4.13.39 reflects accuracy matrix data: lottery and penny_lottery have ~3% and 0% hit rates over 76+29 closed predictions, so we pause them while you decide whether to fix or remove. The other paths stay on.",
+  "paths": {
+    "lottery": {
+      "enabled": true,
+      "reason": "v4.14.5.55: Speculative is filled again (fill_enabled re-enabled in tm_queue_runner._FILL_DEFAULT_TARGETS \u2014 it had drifted off in the AI-timeout era while staying display-enabled here, a contradiction now reconciled). Historically low accuracy (~3% hit rate on early predictions) is disclosed up front by the speculative warning banner, incl. the news-scarcity line; it fills BEHIND the high-yield paths (aggressive/moderate) \u2014 by the BUY-rate ordering it edges out slow_safe, so it trails but isn't strictly last; it never starves the high-yield paths. Set enabled=false to hide it from Recommend."
+    },
+    "band_10_50": {
+      "enabled": true
+    },
+    "band_50_up": {
+      "enabled": true
+    },
+    "band_5_10": {
+      "enabled": true
+    }
+  }
+}

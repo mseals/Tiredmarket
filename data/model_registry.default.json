@@ -1,0 +1,137 @@
+{
+  "_comment": "Bundled default model registry shipped with Tired Market v4.14.0+. Maps each provider's model string to a canonical, provider-neutral id so the router can dedupe votes (one canonical model = one vote, regardless of how many providers serve it) and fail over between providers serving the same model. NEVER edit this file by hand on a real install — your edits will be overwritten on the next app update. To add or override a mapping, edit data/model_registry.json instead (the user override file). The loader merges override on top of default at load time.",
+  "version": 1,
+  "models": [
+    {
+      "canonical_id": "meta/llama-3.1-8b-instruct",
+      "display_name": "Llama 3.1 8B Instruct",
+      "class": "B",
+      "provider_strings": {
+        "groq": "llama-3.1-8b-instant",
+        "cerebras": "llama3.1-8b"
+      }
+    },
+    {
+      "canonical_id": "meta/llama-3.3-70b-instruct",
+      "display_name": "Llama 3.3 70B Instruct",
+      "class": "A",
+      "provider_strings": {
+        "groq": "llama-3.3-70b-versatile",
+        "cerebras": "llama3.3-70b",
+        "sambanova": "Meta-Llama-3.3-70B-Instruct"
+      }
+    },
+    {
+      "canonical_id": "google/gemini-1.5-pro",
+      "display_name": "Gemini 1.5 Pro",
+      "class": "A",
+      "provider_strings": {
+        "google": "gemini-1.5-pro-latest"
+      }
+    },
+    {
+      "canonical_id": "google/gemini-2.5-flash-lite",
+      "display_name": "Gemini 2.5 Flash Lite",
+      "class": "B",
+      "provider_strings": {
+        "google": "gemini-2.5-flash-lite"
+      }
+    },
+    {
+      "canonical_id": "mistral/mistral-large",
+      "display_name": "Mistral Large",
+      "class": "A",
+      "provider_strings": {
+        "mistral": "mistral-large-latest"
+      }
+    },
+    {
+      "canonical_id": "mistral/mistral-small",
+      "display_name": "Mistral Small",
+      "class": "B",
+      "provider_strings": {
+        "mistral": "mistral-small-latest"
+      }
+    },
+    {
+      "canonical_id": "openai/gpt-4o",
+      "display_name": "GPT-4o",
+      "class": "A",
+      "provider_strings": {
+        "github": "gpt-4o"
+      }
+    },
+    {
+      "canonical_id": "openai/gpt-4o-mini",
+      "display_name": "GPT-4o Mini",
+      "class": "B",
+      "provider_strings": {
+        "github": "gpt-4o-mini"
+      }
+    },
+    {
+      "canonical_id": "deepseek/deepseek-v3",
+      "display_name": "DeepSeek V3",
+      "class": "A",
+      "provider_strings": {
+        "sambanova": "DeepSeek-V3.1"
+      }
+    },
+    {
+      "canonical_id": "mistral/mixtral-8x7b",
+      "display_name": "Mixtral 8x7B",
+      "class": "B",
+      "provider_strings": {
+        "groq": "mixtral-8x7b-32768"
+      }
+    },
+    {
+      "canonical_id": "google/gemini-2.5-flash",
+      "display_name": "Gemini 2.5 Flash",
+      "class": "A",
+      "provider_strings": {
+        "google": "gemini-2.5-flash"
+      }
+    },
+    {
+      "canonical_id": "google/gemini-2.5-pro",
+      "display_name": "Gemini 2.5 Pro",
+      "class": "A",
+      "provider_strings": {
+        "google": "gemini-2.5-pro"
+      }
+    },
+    {
+      "canonical_id": "mistral/mistral-medium",
+      "display_name": "Mistral Medium",
+      "class": "A",
+      "provider_strings": {
+        "mistral": "mistral-medium-latest"
+      }
+    },
+    {
+      "canonical_id": "openai/gpt-oss-120b",
+      "display_name": "GPT-OSS 120B",
+      "class": "A",
+      "provider_strings": {
+        "cerebras": "gpt-oss-120b"
+      }
+    },
+    {
+      "canonical_id": "zhipu/glm-4.5-flash",
+      "display_name": "GLM-4.5 Flash",
+      "class": "B",
+      "provider_strings": {
+        "zhipu": "glm-4.5-flash"
+      }
+    },
+    {
+      "canonical_id": "zhipu/glm-4.7-flash",
+      "display_name": "GLM-4.7 Flash",
+      "class": "B",
+      "provider_strings": {
+        "zhipu": "glm-4.7-flash"
+      }
+    }
+  ]
+}

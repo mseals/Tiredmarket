@@ -1,0 +1,81 @@
+# Live local state — never commit
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.log
+data/*.log.*
+data/*.jsonl
+data/app.lock
+data/api_provider_usage.json
+data/event_detector_state.json
+data/lane_pacing.json
+data/model_registry.json
+data/portfolio.json
+
+# Live config (use the .example pattern — committed examples, gitignored live files)
+data/api_providers.json
+data/config.json
+
+# App-generated runtime markers & state (never commit)
+.disclaimer_accepted
+data/provider_health.json
+data/universe_*.json
+data/earnings_calendar.json
+data/nasdaq_earnings_calendar.json
+data/snapshots/
+data_backups/
+data/backups/
+data/data_backups/
+
+# Robust catch-all: ignore ALL data/*.json at the top level, then
+# re-allow only the must-ship reference / seed / example files.
+# Subfolders (data/internal/*.json) are unaffected — the pattern only
+# matches files directly inside data/, not deeper.
+data/*.json
+!data/api_providers.example.json
+!data/config.example.json
+!data/model_classifications.json
+!data/model_registry.default.json
+!data/path_config.json
+# Bundled universe snapshot MUST ship (the earlier data/universe_*.json rule
+# would otherwise exclude it, leaving frozen/source users with the 113 fallback).
+!data/universe_iwv.json
+
+# Backups
+*.bak
+*.bak.*
+*.pre_*.bak
+*.HOLD
+*.BACKUP
+
+# Build / cache
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+
+# Audit / dev scaffolding
+_audit_*.py
+_run_audit*.py
+_suite*.txt
+source_backup_*.py
+_apply_*.py
+_verify_*.py
+_trace_*.py
+_probe_*.py
+_build_*.py
+_archive/
+_backups/
+_backup_*/
+_cleanbuild_staging/
+_release/
+outputs/
+updates/
+extracts/
+design/
+data/logs/
+
+# OS junk
+Thumbs.db
+.DS_Store

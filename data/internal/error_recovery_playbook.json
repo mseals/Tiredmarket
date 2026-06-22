@@ -1,0 +1,1469 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-13",
+  "_categories_doc": {
+    "description": "Valid values for entry.category. Authors must pick from this list.",
+    "categories": [
+      {
+        "category": "action_blocked",
+        "description": "Pre-flight blocking: user clicked something, prereq is unmet, action does not run. Surfaces immediately on click via the intercept layer."
+      },
+      {
+        "category": "action_degraded",
+        "description": "The action runs but with caveats (e.g., partial completion, missing inputs). Phase 3 surface — fires from worker threads via the post-flight upgrade mechanism. v4.15.0 retains the category but most v4.14.x action_degraded entries collapsed into coaching."
+      },
+      {
+        "category": "system_event",
+        "description": "Background failure that surfaces unprompted — auth errors, rate limits, disk write failures, background-queue runner errors. Not tied to a specific user click."
+      },
+      {
+        "category": "data_missing",
+        "description": "An action ran (or could run) but the data it needs isn't there yet. Sometimes blocking, sometimes informational."
+      },
+      {
+        "category": "coaching",
+        "description": "Post-action soft guidance. The action completed, but Teacher AI surfaces a tip or suggestion (e.g., 'this Verify ran with one voice — adding a second gives you real consensus'). Coaching is never blocking and never error-flavored."
+      }
+    ]
+  },
+  "_trigger_kinds_doc": {
+    "description": "Valid values for trigger.kind. Each kind has its own field shape.",
+    "kinds": [
+      {
+        "kind": "action_prereq",
+        "shape": "{ kind, actions: [list of action_ids], prereq: prereq_id }",
+        "fires_when": "User clicks a button registered with one of the actions; the named prereq predicate returns False. Pre-flight, blocks the action."
+      },
+      {
+        "kind": "system_event",
+        "shape": "{ kind, event: event_id }",
+        "fires_when": "Code path emits the event via emit_system_event (Phase 2). Surfaces unprompted, optionally carries a {provider} context for token substitution."
+      },
+      {
+        "kind": "post_action_observation",
+        "shape": "{ kind, actions: [list of action_ids], observation: observation_id }",
+        "fires_when": "An action in the list completes; the named observation predicate (in the OBSERVATION_CHECKS registry, Pass B) returns True against the action result + system state. Post-flight, never blocking."
+      }
+    ]
+  },
+  "_intents_doc": {
+    "description": "Valid values for offered_action.intent. Authors must pick from this list. The intercept layer maintains the dispatch table that maps each intent string to a callable. Adding a new intent here without wiring it in code is a content bug.",
+    "intents": [
+      {
+        "intent": "open_api_providers_dialog",
+        "description": "Opens the standalone API Providers manager dialog (cloud key add/edit/health view)."
+      },
+      {
+        "intent": "open_settings_ai_sources",
+        "description": "Opens Settings dialog scrolled to the AI Sources / Models to Run section."
+      },
+      {
+        "intent": "open_recommend_settings",
+        "description": "Opens the Advanced Settings section for Recommend's top-AI configuration (cold-start default, override pin, budget thresholds)."
+      },
+      {
+        "intent": "open_recommendations",
+        "description": "Opens the Recommendations view itself (not its settings) via _show_recommendations. Used by the recs-ready proactive moment's 'Show me' button (v4.14.5.37)."
+      },
+      {
+        "intent": "unpause_ai",
+        "description": "Calls set_ai_paused(False); resumes AI work globally."
+      },
+      {
+        "intent": "start_verify",
+        "description": "Runs Verify (full consensus) on the pick in current context. The pick identity is implicit from where the surface fired."
+      },
+      {
+        "intent": "trigger_data_refresh",
+        "description": "Forces a manual data refresh of the data cache."
+      },
+      {
+        "intent": "open_data_folder",
+        "description": "Opens the app's data folder in Explorer. Useful when the user needs to inspect file permissions or see why a write failed."
+      },
+      {
+        "intent": "open_backups_folder",
+        "description": "Opens the auto-backups folder in Explorer."
+      },
+      {
+        "intent": "open_data_providers_dialog",
+        "description": "Opens the Data Providers manager dialog (data-side keys, lane health, alternate-source configuration)."
+      }
+    ]
+  },
+  "_suggest_role_doc": {
+    "description": "Optional entry-level field on coaching entries. When present, the runtime queries features.json for AI providers with that recommendation_role and picks one the user does not yet have configured. When absent, the runtime infers from context (count of configured providers maps to the slot being filled).",
+    "valid_values": [
+      "good_first_provider",
+      "good_second_voice",
+      "good_for_deep_analysis",
+      "good_for_speed",
+      "specialty"
+    ]
+  },
+  "entries": [
+    {
+      "entry_id": "feature_intro_groq_howto",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "feature_intro_groq_howto"
+      },
+      "short_hint": "Add a second AI to work through your styles faster.",
+      "diagnostic": "Right now I'm running on a single AI provider, so I analyze picks one at a time to stay within its limits. If you add a second provider, I can work through your styles faster. Want to know how?",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.39",
+      "keywords": [
+        "how do i add groq",
+        "groq key",
+        "get a free key",
+        "how do i connect an ai",
+        "set up my first ai"
+      ]
+    },
+    {
+      "entry_id": "feature_intro_connected",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "feature_intro_connected"
+      },
+      "short_hint": "I'm connected and working - give me a few minutes.",
+      "diagnostic": "I'm connected and working. Give me a few minutes to pull current prices and scan for picks across your styles - I'll let you know the moment there's something worth showing you.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.39",
+      "keywords": [
+        "am i connected",
+        "is my ai connected",
+        "connected",
+        "now what",
+        "what happens now"
+      ]
+    },
+    {
+      "entry_id": "feature_intro_recs_ready",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "feature_intro_recs_ready"
+      },
+      "short_hint": "Your first recommendations are ready to look at.",
+      "diagnostic": "I've found your first recommendations - I pulled together what looks worth your attention right now. There's more coming as I keep analyzing, but there's enough here to start. Want to take a look?",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.37",
+      "keywords": [
+        "recommendations ready",
+        "recs ready",
+        "are my recommendations ready",
+        "anything to recommend yet"
+      ]
+    },
+    {
+      "entry_id": "feature_intro_ask_ai",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "feature_intro_ask_ai"
+      },
+      "short_hint": "Ask me anything - a ticker, a pick, a term.",
+      "diagnostic": "Anything you're curious about - a ticker, why I picked something, what a term means - just ask me. I'm here to explain my thinking, not just hand you a list.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.36",
+      "keywords": [
+        "ask ai",
+        "ask tired market ai",
+        "how do i ask",
+        "where do i ask questions"
+      ]
+    },
+    {
+      "entry_id": "feature_intro_model_rotation",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "feature_intro_model_rotation"
+      },
+      "short_hint": "I turned on model rotation so your scans use more of each provider's models.",
+      "diagnostic": "You've got an AI provider with more than one model available, so I switched on model rotation. It spreads your scans across each provider's models, so no single model hits its per-model rate limit as fast — that means more analysis per day, and you didn't have to change a setting.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.62",
+      "keywords": [
+        "model rotation",
+        "rotate models",
+        "per-model limit",
+        "why did rotation turn on",
+        "more analysis per day"
+      ]
+    },
+    {
+      "entry_id": "feature_intro_layer3_drop",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "feature_intro_layer3_drop"
+      },
+      "short_hint": "I sometimes remove a pick when a closer look flags it.",
+      "diagnostic": "Heads up: I just removed one of your picks. A closer look by several AIs flagged it as likely to underperform, so I cleared the slot and the next scan will refill it with a stronger candidate. This is normal housekeeping — you don't need to do anything. (The specific ticker is in the activity log.)",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.62",
+      "keywords": [
+        "why did a pick disappear",
+        "removed a pick",
+        "pick vanished",
+        "layer 3",
+        "dropped recommendation"
+      ]
+    },
+    {
+      "entry_id": "recs_gate_not_ready",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "recs_gate_not_ready"
+      },
+      "short_hint": "Recommendations aren't ready just yet.",
+      "diagnostic": "I don't have recommendations ready just yet - still pulling data and analyzing. I'll let you know the moment there's something worth showing.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.51",
+      "keywords": [
+        "recommendations not ready",
+        "nothing to recommend yet",
+        "why can't i open recommendations"
+      ]
+    },
+    {
+      "entry_id": "recs_gate_filter_hides_all",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "recs_gate_filter_hides_all"
+      },
+      "short_hint": "Your current filter is hiding this style's picks.",
+      "diagnostic": "This style does have picks - your current filter is just hiding all of them right now. Loosen the filter, or tap 'Show all' to see them.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.53",
+      "keywords": [
+        "filter hiding picks",
+        "where did my picks go",
+        "style looks empty but has picks"
+      ]
+    },
+    {
+      "entry_id": "recs_gate_empty_path",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "recs_gate_empty_path"
+      },
+      "short_hint": "No picks on this style yet - try one of your other styles.",
+      "diagnostic": "No picks on this style yet - I'm still analyzing for it. There are recommendations ready on your other styles if you'd like to see those.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.51",
+      "keywords": [
+        "no picks on this style",
+        "empty trading style",
+        "nothing here for this style"
+      ]
+    },
+    {
+      "entry_id": "recs_gate_budget_no_fit",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "recs_gate_budget_no_fit"
+      },
+      "short_hint": "Nothing fits that amount yet - try a different budget.",
+      "diagnostic": "Nothing fits that amount yet - the picks I have right now need a different budget. Try adjusting the amount, or give me a bit to find more.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.51",
+      "keywords": [
+        "nothing fits my budget",
+        "no positions fit",
+        "cash amount too small"
+      ]
+    },
+    {
+      "entry_id": "recs_gate_budget_blocks_all",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "recs_gate_budget_blocks_all"
+      },
+      "short_hint": "Your budget is below every pick's price right now.",
+      "diagnostic": "I do have picks for you - they're just priced above your ${budget} budget right now, so there's nothing I can size into it. The cheapest BUY I've got is {cheapest_ticker} at ${cheapest_price}. Raise your budget to about that, or set it to 'Any' to see everything I found.",
+      "recommendation": "",
+      "manual_fallback": "",
+      "related_feature_ids": [
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.54",
+      "keywords": [
+        "budget too low for any pick",
+        "everything costs more than my budget",
+        "cheapest pick above budget",
+        "show me anything any budget"
+      ]
+    },
+    {
+      "entry_id": "no_ai_voices_configured",
+      "category": "coaching",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "verify",
+          "look_up",
+          "recommend"
+        ],
+        "prereq": "at_least_one_voice"
+      },
+      "short_hint": "No AI sources configured. The algorithm runs on its own; add a cloud provider to add AI validation.",
+      "diagnostic": "No AI is connected, so I'll run the built-in algorithm on its own. Add an AI to layer on a second-opinion validation step.",
+      "recommendation": "It's quick and free: Groq just needs an email and takes about a minute. Adding one enables AI validation automatically (no restart, no setting to change). Click below and I'll walk you through it — or dismiss this and keep using the algorithm alone.",
+      "offered_action": {
+        "label": "Set up my first AI",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources, click into the API Providers manager, and add a key for any provider. Groq at console.groq.com/keys is the fastest start.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources",
+        "provider_groq",
+        "consensus_voting"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "no providers",
+        "no ai",
+        "no ai sources",
+        "no voices",
+        "add a provider",
+        "nothing configured",
+        "no ai configured",
+        "it says no providers",
+        "need an ai"
+      ]
+    },
+    {
+      "entry_id": "ai_globally_paused",
+      "category": "action_blocked",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "verify",
+          "look_up"
+        ],
+        "prereq": "ai_not_paused"
+      },
+      "short_hint": "Can't run — AI is paused. Click the badge to resume.",
+      "diagnostic": "AI work is currently paused, so {action} can't run. The pause was triggered by you (the Stop button) or by UPS battery monitoring.",
+      "recommendation": "The pause flag stops every AI call across the app — Verify, Look Up, and the background queue runner that keeps Recommend fresh. Two things turn it on: the Stop button in the toolbar (manual pause), or the UPS module detecting you're on battery power (auto-pause for power safety). Click Stop again (it becomes Resume) to resume manually, or wait for the battery auto-pause to clear.",
+      "offered_action": {
+        "label": "Resume AI now",
+        "intent": "unpause_ai"
+      },
+      "manual_fallback": "Click the Stop/Resume button in the toolbar. It toggles between paused and active.",
+      "related_feature_ids": [
+        "ai_badge",
+        "setting_ups_power"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "paused",
+        "ai paused",
+        "why is ai paused",
+        "everything stopped",
+        "nothing is running",
+        "resume ai",
+        "ai is off"
+      ]
+    },
+    {
+      "entry_id": "provider_rate_limit_active",
+      "category": "action_blocked",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "verify",
+          "look_up"
+        ],
+        "prereq": "no_active_cooldown"
+      },
+      "short_hint": "Rate-limit cooldown active. Wait for it to expire and try again.",
+      "diagnostic": "A cloud provider returned a rate-limit error recently and the app is in a cooling-off period. {action} can't fire while the cooldown is active.",
+      "recommendation": "Cooldowns happen when a provider tells us we've sent too many requests in too short a window. The app respects the cooldown so it doesn't make things worse — hammering during a 429 typically extends the cool-off rather than ending it. The activity log shows when the cooldown expires (usually a few minutes). When it does, your next click will go through normally. If you're hitting cooldowns often, consider adding more providers so the load spreads, or upgrading the tier on whichever provider is the bottleneck.",
+      "manual_fallback": "Wait for the cooldown to expire — the activity log shows the time. Then re-try.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "activity_log",
+        "consensus_voting"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "rate limit",
+        "rate limited",
+        "cooldown",
+        "too many requests",
+        "slow down",
+        "wait to try again",
+        "429"
+      ]
+    },
+    {
+      "entry_id": "ai_module_not_loaded",
+      "category": "action_blocked",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "verify",
+          "look_up"
+        ],
+        "prereq": "ai_module_loaded"
+      },
+      "short_hint": "AI module didn't load. Make sure tm_holdings.py is present in the app folder.",
+      "diagnostic": "{action} needs the AI module to run, but it didn't load when the app started.",
+      "recommendation": "The tm_holdings.py module is the analysis surface that drives AI-powered features (it works with the cloud router and consensus engine). Without it, nothing AI-powered works. The file should be in the app folder alongside tired_market.py. If it's missing, your install is incomplete. If it's present but failed to import, the activity log at startup will show the specific error (usually a missing Python dependency). Reinstalling Tired Market is the most reliable fix; for advanced users, running the install command for the missing dependency works too.",
+      "manual_fallback": "Verify tm_holdings.py is in the app folder. Check the startup log for the import error if it's present but not loading. Reinstall if needed.",
+      "related_feature_ids": [
+        "verify",
+        "look_up",
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "recommend_engine_module_missing",
+      "category": "action_blocked",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "recommend"
+        ],
+        "prereq": "recommend_module_loaded"
+      },
+      "short_hint": "Recommendation engine not available (tm_recommend.py missing).",
+      "diagnostic": "Recommend can't render its queue because its code module (tm_recommend.py) didn't load — the file is missing or failed to import.",
+      "recommendation": "Recommend in v4.15.0 is the surface that shows the top AI's continuously-maintained ranked queue of buy candidates. Without tm_recommend.py the queue can't render. The file should sit alongside tired_market.py in the app folder. If it's missing, your install is incomplete and reinstalling Tired Market is the cleanest fix. If the file is present but failed to import, check the activity log on app startup for the specific import error — usually a missing dependency.",
+      "manual_fallback": "Verify tm_recommend.py is present in the app folder. If it is, check the startup log for the import error and reinstall if needed.",
+      "related_feature_ids": [
+        "recommend"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "not_enough_voices_for_consensus",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "verify"
+        ],
+        "observation": "one_voice_only"
+      },
+      "suggest_role": "good_second_voice",
+      "short_hint": "Verify ran with one voice — that isn't really consensus.",
+      "diagnostic": "Verify just completed, but you only have one AI voice configured. A consensus of one is just one opinion in formal clothes.",
+      "recommendation": "Tired Market's whole approach to Verify is asking several AIs the same question independently and weighing their answers together. With one voice you get a quick read, but you don't get the diversity of perspective that catches when a single model is overconfident or wrong. Adding a second voice from a different provider — different training, different blind spots — is the single biggest jump in answer quality. Want help adding one?",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, add a second provider. The runtime will pick a complementary one based on what you already have.",
+      "related_feature_ids": [
+        "consensus_voting",
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "not enough ai",
+        "need more providers",
+        "only one ai",
+        "one voice",
+        "add more models",
+        "not enough voices"
+      ]
+    },
+    {
+      "entry_id": "verify_some_voices_skipped",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "verify"
+        ],
+        "observation": "voices_skipped_during_verify"
+      },
+      "short_hint": "Verify finished but skipped one or more configured AIs.",
+      "diagnostic": "Verify completed, but one or more of your configured AIs were skipped — usually because they're in a cooldown after a recent rate-limit, or they've hit their daily quota.",
+      "recommendation": "The verdict you're seeing is built from the AIs that did respond, which is fewer voices than you've configured. The activity log lists which providers were skipped. This isn't a failure — Verify did its job — but the fewer voices in a consensus, the less weight you should put on a unanimous result. If skipping is happening often, either spread load by adding more providers, upgrade the tier on whichever one is bottlenecking, or accept that your tight-quota providers (SambaNova at 20/day, for example) only contribute when you haven't used them yet today.",
+      "manual_fallback": "Check the activity log for which providers were skipped. Add more providers in API Providers, or move tight-quota providers off your active list and use them only sparingly.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "consensus_voting",
+        "activity_log",
+        "provider_sambanova"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "verify_consensus_says_avoid",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "verify"
+        ],
+        "observation": "consensus_avoid_on_queue_pick"
+      },
+      "short_hint": "Verify came back AVOID. The pick was popped; next candidate is now on top.",
+      "diagnostic": "You verified a pick from the Recommend queue and the full consensus came back AVOID. The top AI that maintains the queue is faster and cheaper, but Verify is the quality gate — when the bigger consensus disagrees, the pick is removed.",
+      "recommendation": "The pick has been popped from the queue and the next candidate is now showing in its place. This is the system working as designed: the continuous-queue AI is good but not infallible, and Verify catches the calls it gets wrong. You can verify the next pick if you want a deeper check on it too, or move on to whatever else you're doing.",
+      "offered_action": {
+        "label": "Verify the next pick",
+        "intent": "start_verify"
+      },
+      "manual_fallback": "The next pick is already on the Recommend view. Click Verify next to it if you want.",
+      "related_feature_ids": [
+        "recommend",
+        "consensus_voting",
+        "verdict_avoid"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "verify_consensus_no_clear_winner",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "verify"
+        ],
+        "observation": "consensus_split_no_majority"
+      },
+      "short_hint": "The voices disagreed. Read each one's reasoning before acting.",
+      "diagnostic": "Verify completed but the AIs split — no direction (BUY / WATCH / AVOID) got a clear majority. This is the consensus telling you the call is genuinely uncertain.",
+      "recommendation": "Split votes mean the underlying signal is mixed. Some voices see something to buy, others see reasons to avoid, and the data isn't strong enough either way to push the consensus to a clean answer. The right move when this happens is usually to read each voice's reasoning — they often disagree on different specifics (one might worry about valuation while another focuses on momentum) and seeing the breakdown helps you weigh the risk yourself. Not every stock has a clean answer, and the system is being honest about that here rather than picking a side artificially.",
+      "manual_fallback": "Open the Verify result detail and read each AI's reasoning. The breakdown is more useful here than the aggregate.",
+      "related_feature_ids": [
+        "consensus_voting",
+        "confidence_levels",
+        "verdict_owned_concept",
+        "verdict_fresh_concept"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "recommend_top_ai_out_of_budget_fallback",
+      "category": "coaching",
+      "severity": "info",
+      "trigger": {
+        "kind": "system_event",
+        "event": "top_ai_budget_exhausted_fallback"
+      },
+      "suggest_role": "good_for_speed",
+      "short_hint": "Top AI hit its daily limit — using fallback today.",
+      "diagnostic": "{provider}, the AI normally running your Recommend queue, has hit its free-tier daily quota. The system fell back to your next-best AI for the rest of today.",
+      "recommendation": "This isn't broken — fallback is exactly what the system is designed to do. But it's also a sign that one provider isn't enough capacity for how you use Recommend day-to-day. Adding another provider with a generous free tier (Groq's quota is the most generous among the supported set) means the fallback chain has more room before quality starts dropping. {provider}'s quota resets at the provider's daily reset time (usually midnight UTC); your top AI will be back tomorrow.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers and add another provider. Groq is the recommended addition for capacity.",
+      "related_feature_ids": [
+        "recommend",
+        "api_providers_manager",
+        "provider_groq",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "cache_warming_up_initial_fill",
+      "category": "coaching",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "verify",
+          "look_up"
+        ],
+        "observation": "cache_thin_initial_fill"
+      },
+      "short_hint": "The data cache is still being populated. Results may improve once it's full.",
+      "diagnostic": "{action} just ran, but the background data cache is still in its initial population phase. The AI made its call from whatever data was available, which is thinner than you'll have once the cache is fully warmed.",
+      "recommendation": "Initial cache fill on a fresh install can take a while depending on which data providers you've configured and how aggressively they're rate-limited. The current result is real, not garbage — but the AI was reasoning over fewer data points than it normally would. If you're early in your day with the app, expect to see more solid recommendations once the cache catches up. The activity log shows what I'm working through as the cache fills in.",
+      "manual_fallback": "Give the cache a bit to catch up — the activity log shows what I'm pulling — then re-running this should produce a stronger answer.",
+      "related_feature_ids": [
+        "cache_fill_modes"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "still loading",
+        "warming up",
+        "data not ready",
+        "no data yet",
+        "loading data",
+        "why is it loading"
+      ]
+    },
+    {
+      "entry_id": "lookup_ticker_not_recognized",
+      "category": "data_missing",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "look_up"
+        ],
+        "prereq": "ticker_recognized"
+      },
+      "short_hint": "'{ticker}' isn't a recognized ticker - check the spelling, or it may just not be in the database yet.",
+      "diagnostic": "{action} couldn't find any quote data for the ticker you entered. It's most likely a typo or a delisted symbol.",
+      "recommendation": "Three common reasons a ticker comes back unrecognized: the symbol is misspelled (TSL vs TSLA is the classic), the company was delisted or acquired and the ticker no longer trades, or the symbol exists on a non-US exchange that the configured data sources don't cover. Double-check the spelling on a public source like finance.yahoo.com. If the ticker is valid and the data sources should cover it, the activity log will show the specific fetch failure.",
+      "manual_fallback": "Verify the ticker spelling on finance.yahoo.com or another quote source. Re-enter and try again.",
+      "related_feature_ids": [
+        "look_up",
+        "data_providers_manager",
+        "activity_log"
+      ],
+      "wiring_note": "tm_holdings.py:4019 (_headless_analyze_candidate) currently does a silent return on a falsy ticker. Add detection: when the ticker is non-empty but quote data comes back empty after a fetch attempt, fire this entry's intercept instead of silently producing no analysis.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "ticker not recognized",
+        "unknown ticker",
+        "invalid ticker",
+        "can't find ticker",
+        "symbol not found",
+        "no such ticker",
+        "ticker not found"
+      ]
+    },
+    {
+      "entry_id": "lookup_network_offline",
+      "category": "data_missing",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "look_up",
+          "verify"
+        ],
+        "prereq": "network_online"
+      },
+      "short_hint": "Network is offline — working from cache.",
+      "diagnostic": "{action} can't reach the data sources because the network is offline. Whatever runs now will use cached data, which may be stale.",
+      "recommendation": "When the network is offline, the app falls back to whatever data it last cached. That's better than nothing for already-analyzed tickers, but quotes won't be current and AI calls to cloud providers won't work at all. If you're on a flaky connection, wait a moment and try again — most network drops are temporary. If you're deliberately offline, expect quote data to be as old as the last cache update and cloud AI calls to fail until you're back online.",
+      "offered_action": {
+        "label": "Refresh data now",
+        "intent": "trigger_data_refresh"
+      },
+      "manual_fallback": "Wait for your connection to come back, then re-run Look Up.",
+      "related_feature_ids": [
+        "ai_mode_pill",
+        "cache_fill_modes"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "offline",
+        "no internet",
+        "no connection",
+        "can't connect",
+        "cant connect",
+        "internet down",
+        "network error"
+      ]
+    },
+    {
+      "entry_id": "cache_disk_write_failed",
+      "category": "data_missing",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "cache_disk_write_failed"
+      },
+      "short_hint": "Cache write failed. Data fetched this session won't survive restart.",
+      "diagnostic": "The data cache tried to persist to disk and failed. Cached quotes, news, and fundamentals are still in memory for this session, but they won't be there after restart.",
+      "recommendation": "The cache is what makes the app fast — it remembers data between sessions so it doesn't have to refetch everything from scratch. When the disk write fails, the cache still works in memory for the rest of this session, but at next launch the app starts cold and will refetch everything (slower, more API quota burned). The cause is almost always a permissions or disk-full problem on the data folder. Open the data folder to inspect.",
+      "offered_action": {
+        "label": "Open data folder",
+        "intent": "open_data_folder"
+      },
+      "manual_fallback": "Open the data folder, check write permissions and free disk space. Move the app to a writable location if needed.",
+      "related_feature_ids": [
+        "cache_fill_modes",
+        "setting_data_backups"
+      ],
+      "wiring_note": "tm_holdings.py:759-770 (DataCache.persist_to_disk) currently uses best-effort silent exception catch. Add a callback that fires this entry's playbook (system_event 'cache_disk_write_failed') as a non-blocking notification, so users know their session won't carry forward.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "recommend_queue_empty_warming_up",
+      "category": "data_missing",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "recommend"
+        ],
+        "observation": "queue_empty_initial_fill"
+      },
+      "short_hint": "I'm still working - recommendations will show up here as soon as they're ready.",
+      "diagnostic": "I'm still working - pulling current prices and analyzing for picks. Nothing's cleared my bar just yet, but I'll surface recommendations here as soon as they do.",
+      "recommendation": "On a fresh start I first pull current prices, then analyze across your trading styles to find candidates worth showing you. The activity log shows what I'm working on as I go. Nothing is broken - this is the normal first-run wait, and I'll surface picks here the moment they clear my bar.",
+      "manual_fallback": "Give it a little time - the activity log shows what I'm doing, and recommendations appear here as soon as they're ready.",
+      "related_feature_ids": [
+        "recommend",
+        "cache_fill_modes",
+        "activity_log"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "recommend empty",
+        "nothing in recommend",
+        "no recommendations",
+        "recommend shows nothing",
+        "empty recommend",
+        "why is recommend empty"
+      ]
+    },
+    {
+      "entry_id": "recommend_queue_empty_no_buys_found",
+      "category": "data_missing",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "recommend"
+        ],
+        "observation": "queue_empty_no_candidates"
+      },
+      "short_hint": "Top AI scanned and found no candidates matching your current trading style and price range.",
+      "diagnostic": "The data cache is current and the top AI finished a scan, but nothing in the universe met the criteria for your current trading style and price range.",
+      "recommendation": "This isn't a failure — the AI is being honest that it doesn't see anything compelling under your current constraints. Two things to consider: (1) widen the price range in Portfolio Recommendations — if you're looking only at penny stocks under $1, the universe of plausible BUYs is small, and not every day has one; (2) try a different trading style — Conservative and Speculative look for fundamentally different kinds of stocks, so switching sometimes turns up candidates the others skip. The next queue refresh runs automatically; you don't need to do anything if you're happy waiting.",
+      "manual_fallback": "Widen the price range or change the trading style in Portfolio Recommendations. The next queue refresh picks up the change automatically.",
+      "related_feature_ids": [
+        "recommend",
+        "path_concept",
+        "setting_analysis_path"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "no buys",
+        "no recommendations",
+        "recommend empty",
+        "nothing to buy",
+        "no candidates"
+      ]
+    },
+    {
+      "entry_id": "lookup_data_not_in_cache_yet",
+      "category": "data_missing",
+      "severity": "info",
+      "trigger": {
+        "kind": "post_action_observation",
+        "actions": [
+          "look_up"
+        ],
+        "observation": "ticker_not_in_cache"
+      },
+      "short_hint": "That ticker isn't in the cache yet — fetching now.",
+      "diagnostic": "You looked up a ticker that the background fill hasn't gotten to yet. The app is fetching it on demand.",
+      "recommendation": "Look Up automatically triggers an on-demand fetch when you ask about a ticker that isn't in the cache. The fetch usually completes in a few seconds for major tickers, longer for thinly-traded ones. Once the data is in, the AI runs immediately. The first Look Up on a brand-new ticker is the only one that takes the extra wait — subsequent ones use the cached data and are instant.",
+      "manual_fallback": "Wait a few seconds. If the AI doesn't return something within ~30 seconds, the fetch may have failed; check the activity log for the specific error.",
+      "related_feature_ids": [
+        "look_up",
+        "cache_fill_modes"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "provider_auth_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "provider_auth_failed"
+      },
+      "short_hint": "401 unauthorized — check API key.",
+      "diagnostic": "{provider} rejected our request as unauthorized. The API key is most likely invalid, revoked, or has been rotated.",
+      "recommendation": "Auth failures usually mean one of three things: the key was typed in wrong, the provider revoked it (some do this for inactivity or terms-of-service reasons), or you rotated it on the provider's site and never updated Tired Market. Open the API Providers manager, find {provider} in the list, and paste in a fresh key from the provider's dashboard. The new key takes effect on the next AI call — no restart needed.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, click {provider}, and paste a fresh key.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "provider_auth_failed_on_save",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "provider_auth_failed_on_save"
+      },
+      "short_hint": "That key wasn't accepted — it's probably a typo or a stale key.",
+      "diagnostic": "{provider} didn't accept the API key you just pasted. The most common causes are a typo (an extra space, a missing character) or pasting a key that's already been revoked or rotated on the provider's site.",
+      "recommendation": "Re-open {provider} in API Providers and paste the key again, carefully — pasting from the provider's dashboard usually works better than typing. If the same key keeps getting rejected, the key has probably been revoked on the provider's site; generate a fresh one and paste that. Nothing was saved this time, so you can just retry.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, re-open {provider}, and paste a fresh copy of the key.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.66"
+    },
+    {
+      "entry_id": "provider_endpoint_not_found",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "provider_endpoint_not_found"
+      },
+      "short_hint": "The model or endpoint wasn't found.",
+      "diagnostic": "{provider} answered, but said it doesn't have the endpoint or model we asked for. Usually that's a typo in the model name, a model id that the provider has retired, or a custom endpoint URL that's not quite right.",
+      "recommendation": "Re-open {provider} in API Providers and check two things: the model name matches one the provider currently offers (their dashboard usually lists current models), and — if this is a custom endpoint — the URL is the one the provider gave you. Save again once you've corrected either one.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, re-open {provider}, and verify the model name (and endpoint URL for a custom provider).",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.66"
+    },
+    {
+      "entry_id": "provider_endpoint_method_not_allowed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "provider_endpoint_method_not_allowed"
+      },
+      "short_hint": "The endpoint answered but didn't accept the request shape.",
+      "diagnostic": "{provider} replied, but rejected the way we asked. Usually that means the endpoint URL points at a different part of the provider's service (for example, an admin URL instead of the chat-completions URL).",
+      "recommendation": "If you picked {provider} from the preset list, the program already knows the right URL — re-open it in API Providers and re-select the preset so the endpoint resets. If this is a custom provider, double-check the endpoint URL against the provider's docs. The piece that usually matters is the very end of the URL (the path).",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, re-open {provider}, and re-select its preset to reset the endpoint URL.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.66"
+    },
+    {
+      "entry_id": "provider_save_validation_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "provider_save_validation_failed"
+      },
+      "short_hint": "Couldn't confirm the new provider — it didn't go through.",
+      "diagnostic": "Something went wrong when the program tried to confirm {provider}. It might be that {provider} is temporarily unreachable, the key wasn't accepted in a way the program recognizes, or the network briefly dropped while checking. Whatever it was, the provider was NOT saved — you haven't broken anything.",
+      "recommendation": "Re-open {provider} in API Providers and try Save again. If the same thing happens twice in a row, check that you can reach {provider}'s site in a browser; if you can't, the network is the problem. If their site loads fine, the key is the most likely cause — generate a fresh one from the provider's dashboard and paste that.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, re-open {provider}, and try Save again.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.14.5.66"
+    },
+    {
+      "entry_id": "provider_rate_limit_hit",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "provider_rate_limit_hit"
+      },
+      "short_hint": "429 rate-limited — slow down or upgrade tier.",
+      "diagnostic": "{provider} returned a rate-limit error. The app set a cooldown for that provider so it stops being called for a few minutes.",
+      "recommendation": "Rate limits are normal — every provider has them, especially on the free tier. The app handles this automatically: a cooldown is set, other providers (if configured) pick up the slack on the current task, and {provider} resumes after the cool-off expires. This event fires whether the limit was hit by a Verify click, a Look Up, or the background queue runner — same architectural cause regardless of who triggered it. You don't need to do anything for one occurrence. If you're seeing it often, it means your usage is outgrowing this provider's free quota — either add more providers to spread load, upgrade the tier on the bottleneck provider, or accept slower response times until the cooldown clears.",
+      "manual_fallback": "No action needed for one event. If frequent: add more providers in API Providers, or upgrade the bottleneck provider's tier.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "activity_log"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "rate limit",
+        "rate limited",
+        "429",
+        "too many requests",
+        "throttled"
+      ]
+    },
+    {
+      "entry_id": "yahoo_rate_limit_during_data_fill",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "yahoo_rate_limit_during_data_fill"
+      },
+      "short_hint": "Yahoo Finance rate-limited the background data fill. Try again in a few minutes.",
+      "diagnostic": "The background data fill hit a rate limit at Yahoo Finance — the free quote source most users rely on by default.",
+      "recommendation": "Yahoo Finance imposes informal rate limits that tighten under load. The fill ran but was throttled, so the cache may be patchy until the limit resets (usually a few minutes). No AI work was wasted by this — the limit hit at the data layer, before any AI call. Nothing to configure: prices already have a keyless backup (Stooq), so the router keeps working, and the fill resumes automatically when the cool-off expires.",
+      "manual_fallback": "Wait a few minutes — the fill resumes on its own when Yahoo's cool-off expires. No key needed: Stooq already backs up Yahoo for prices.",
+      "related_feature_ids": [
+        "data_providers_manager",
+        "cache_fill_modes"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "backup_on_exit_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "backup_on_exit_failed"
+      },
+      "short_hint": "Backup failed — could not create backup. Check that the script folder is writable.",
+      "diagnostic": "The auto-backup-on-exit ran and couldn't create the backup file.",
+      "recommendation": "Backups go to data_backups/ inside the app folder. If the write fails, the most common causes are: the folder is read-only, you don't have write permission on the install location (common when the app is in Program Files), or the disk is full. Open the backups folder to see what's there now and check permissions. The cleanest fix is to move the app to a folder you fully own (like Documents or your user folder) so it has write permission to its own data and backup folders.",
+      "offered_action": {
+        "label": "Open backups folder",
+        "intent": "open_backups_folder"
+      },
+      "manual_fallback": "Right-click the app folder → Properties → Security to check write permission. If installed in Program Files, move the app to your user folder.",
+      "related_feature_ids": [
+        "setting_data_backups"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "disclaimer_marker_write_failed",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "disclaimer_marker_write_failed"
+      },
+      "short_hint": "Couldn't save your disclaimer acknowledgement. The splash will reappear on next launch.",
+      "diagnostic": "You acknowledged the first-launch disclaimer, but the marker file that records that couldn't be written.",
+      "recommendation": "The disclaimer marker is a small file in the data folder that the app checks on startup to know whether you've already seen the disclaimer. If it can't be written, you'll see the splash again on every launch — annoying, but not harmful. The cause is almost always a permissions issue on the data folder. Open the data folder to check that it's writable. Moving the app to a folder you fully own (Documents or your user folder) usually fixes it permanently.",
+      "offered_action": {
+        "label": "Open data folder",
+        "intent": "open_data_folder"
+      },
+      "manual_fallback": "Right-click the data folder → Properties → Security and check write permission. Move the app to a writable location if needed.",
+      "related_feature_ids": [
+        "disclaimer_first_launch",
+        "setting_data_backups"
+      ],
+      "wiring_note": "tired_market.py:318-326 (_record_disclaimer_acceptance) currently catches all exceptions silently at line 325 with `except Exception: pass`. Add a callback to the intercept layer that fires this entry's playbook (system_event 'disclaimer_marker_write_failed') when the write raises — pass the exception message into the activity log, but show the playbook entry as a non-blocking notification so the user knows their acknowledgement didn't persist.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "settings_save_failed",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "settings_save_failed"
+      },
+      "short_hint": "Couldn't save your settings. Changes won't persist across restart.",
+      "diagnostic": "You changed a setting, but the config file save failed. The change is live in the current session but won't survive a restart.",
+      "recommendation": "Settings are saved to a config file in the data folder. If the save fails, your in-session changes still work — but they'll be gone the next time you launch the app. The cause is almost always a file-permission issue on the config file or its folder. Open the data folder to inspect. The fix is to make sure the data folder is writable, which usually means moving the app out of any protected location like Program Files.",
+      "offered_action": {
+        "label": "Open data folder",
+        "intent": "open_data_folder"
+      },
+      "manual_fallback": "Open the data folder, check write permissions on the config file. Move the app to a writable location if needed.",
+      "related_feature_ids": [
+        "setting_data_backups"
+      ],
+      "wiring_note": "tired_market.py:3882-3887 (save_config) currently prints '[config] WARN: failed to save config: <error>' to stdout only. Add a hook in the except block to fire this entry's playbook (system_event 'settings_save_failed') as a non-blocking notification surfaced to the user, not just stdout.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "settings won't save",
+        "cant save settings",
+        "settings not saving",
+        "settings won't stick"
+      ]
+    },
+    {
+      "entry_id": "holding_refresh_no_ai_available",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "holding_refresh_no_ai_available"
+      },
+      "short_hint": "No AI is available to run this refresh. Configure a provider first.",
+      "diagnostic": "I can't run this refresh because no AI provider is currently available. Either you don't have any configured, they're all toggled off, or all of them are out of quota for the day.",
+      "recommendation": "Open API Providers to check your provider list. If you don't have any configured yet, Groq is a good starter (free, fast, takes about a minute to sign up). If you have providers but they're toggled off, enable at least one. If all are configured and enabled but exhausted, you'll need to wait until quotas reset (usually midnight UTC, but each provider has its own clock).",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, confirm at least one provider is configured and enabled with quota remaining.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources",
+        "consensus_voting"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "recommend_all_providers_disabled",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "all_providers_disabled"
+      },
+      "short_hint": "All your AI providers are toggled off. Enable one in API Providers.",
+      "diagnostic": "You have AI providers configured, but every one of them is currently disabled. Until at least one is re-enabled, the Recommend queue can't run.",
+      "recommendation": "This is different from running out of quota — there's no waiting required. Open API Providers, find a provider you trust, and toggle its enabled flag back on. Changes take effect on the next queue runner pass within minutes. If you're not sure which one to enable, Groq is a strong default (free, generous daily quota, fast).",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → AI Sources → API Providers, find a provider, click its enable toggle. The Recommend queue will pick up the change on its next pass.",
+      "related_feature_ids": [
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "recommend_no_ai_has_budget_today",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "all_ais_budget_exhausted"
+      },
+      "short_hint": "All configured AIs are out of quota for today. Recommend's queue is paused.",
+      "diagnostic": "Every cloud AI you have configured has hit its daily free-tier quota. The continuous queue can't run until at least one provider's quota resets.",
+      "recommendation": "Free-tier daily quotas reset on a per-provider clock — usually midnight UTC, but each provider has its own schedule. Until one resets, the top AI has no fuel and the Recommend queue stays where it was. The way out is to add another cloud provider with quota remaining, ideally one with a generous daily limit (Groq's is the most generous among the supported set). Until a quota resets or you add capacity, the queue holds where it was.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Add another cloud provider with daily quota remaining, or wait for a provider's quota to reset.",
+      "related_feature_ids": [
+        "recommend",
+        "api_providers_manager",
+        "provider_groq",
+        "setting_ai_sources"
+      ],
+      "wiring_note": "Wire when the top-AI selection runtime can detect 'no candidate has budget today' and emit this event. The check should run once per top-AI re-selection cycle, not on every queue refresh.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "recommend_all_providers_cooldown",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "all_ais_in_cooldown"
+      },
+      "short_hint": "All AIs are briefly rate-limited. Picks will resume on their own.",
+      "diagnostic": "Every cloud AI you have configured is currently in a short rate-limit cooldown (typically 5 minutes after a 429 response). This is different from running out of daily quota — the providers are not exhausted, they just hit a per-minute throttle and need a few minutes to clear.",
+      "recommendation": "No action needed. The Recommend queue runner will automatically retry on its next pass once at least one provider's cooldown expires (about {cooldown_remaining_sec} seconds for the soonest). If this happens repeatedly throughout the day on the same provider, that provider is bursting against its per-minute limit too aggressively — adding a second provider spreads the load so no single one trips the throttle. the user's overnight 'all AIs exhausted' popup on 2026-05-14 was actually this state, surfaced under a different (per-provider) playbook entry — v4.14.3.5 gave the all-providers-cooled state its own clear copy.",
+      "offered_action": null,
+      "manual_fallback": "Wait. If the same provider keeps tripping cooldowns hourly, add a second provider in API Providers to spread the load.",
+      "related_feature_ids": [
+        "recommend",
+        "api_providers_manager",
+        "activity_log"
+      ],
+      "wiring_note": "Fired by tm_queue_runner.run_one_pass when tm_top_ai_picker.pick_top_ai returns success=False, reason='all_cooldown'. The context dict carries cooldown_remaining_sec for the {cooldown_remaining_sec} token substitution. Distinct from provider_rate_limit_hit (per-provider, fires on any 429) — this entry fires only when EVERY configured provider is simultaneously cooled.",
+      "entry_source": "authored",
+      "since_version": "v4.14.3.5"
+    },
+    {
+      "entry_id": "recommend_override_ai_out_of_budget",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "override_ai_budget_exhausted"
+      },
+      "short_hint": "Your pinned AI for Recommend hit its daily limit.",
+      "diagnostic": "{provider} — the AI you pinned in Recommend's Advanced Settings as the override — has hit its free-tier daily quota. The system can either fall back to automatic top-AI selection or wait for the override's quota to reset.",
+      "recommendation": "Pinning an override AI is useful when you want consistent answers from a specific model, but the trade-off is that you lose the system's automatic fallback when that AI runs out. Two options: (1) revert to automatic selection so the system picks whichever AI has both budget and good accuracy, treating your override as an unconfigured preference until {provider} resets; (2) leave the pin in place and accept that Recommend's queue won't update again until the daily reset. If you usually want stability, leave it; if you usually want continuity, revert.",
+      "offered_action": {
+        "label": "Open Recommend settings",
+        "intent": "open_recommend_settings"
+      },
+      "manual_fallback": "Open Settings → Advanced → Recommend, and either remove the override or change it to a provider with quota remaining.",
+      "related_feature_ids": [
+        "recommend",
+        "api_providers_manager",
+        "setting_ai_sources"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "cache_fill_stalled",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "background_fill_stalled"
+      },
+      "short_hint": "Background data fill hasn't progressed in a while. Check provider keys and network.",
+      "diagnostic": "The background data fill started but hasn't made progress for a stretch. Something is blocking it from completing.",
+      "recommendation": "Stalled fills usually mean one of three things: a data provider's API key is invalid (causing every request to fail silently), the network is up but reaching that specific provider's servers is failing, or the fill executor itself hit an error and stopped retrying. The activity log will show the last fetch attempt and any error message. Most stalls clear themselves within a minute or two as the executor retries; persistent ones need attention. Open the Data Providers manager to verify each key, then watch the activity log for whether the next retry succeeds.",
+      "offered_action": {
+        "label": "Open Data Providers",
+        "intent": "open_data_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → Data → Data Providers and verify each provider's key. Watch the activity log for the specific error from the failing fetch.",
+      "related_feature_ids": [
+        "data_providers_manager",
+        "cache_fill_modes",
+        "activity_log"
+      ],
+      "wiring_note": "Wire when the fill executor (tm_fill_executor.py) can emit a 'stalled' signal — e.g., when no progress has been made in N minutes despite the executor still being scheduled. Threshold likely 5–10 minutes for an active fill, with the metric coming from get_progress_snapshot.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0",
+      "keywords": [
+        "scan stuck",
+        "stuck",
+        "won't load",
+        "wont load",
+        "nothing is loading",
+        "frozen",
+        "not loading",
+        "stalled"
+      ]
+    },
+    {
+      "entry_id": "top_ai_continuous_run_failed",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "top_ai_runner_failed"
+      },
+      "short_hint": "The continuous queue runner hit an error. Recommend may be stale.",
+      "diagnostic": "The background runner that keeps Recommend's queue fresh encountered an error and aborted its current pass. The queue is whatever it was before the error.",
+      "recommendation": "The runner retries automatically on its next scheduled pass (usually within a few minutes), so most one-off errors clear themselves. The activity log shows the specific error message. Common causes: a transient network blip, a provider returning unexpected response shape, or an exception in the queue-update logic itself. If the same error fires repeatedly, the runner is hitting a real problem that needs investigation — at that point the activity log entries are the diagnostic starting point. While the runner is failing, Look Up and Verify still work; only the continuous queue is affected.",
+      "manual_fallback": "Check the activity log for the specific error. Most failures self-recover; persistent failures need code-level investigation.",
+      "related_feature_ids": [
+        "recommend",
+        "activity_log"
+      ],
+      "wiring_note": "Wire when the v4.15.0 top-AI continuous runner has an error path. The runner should catch its own exceptions, log them, and emit this event so users know the queue is stale rather than thinking the system is intentionally idle.",
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "background_fill_provider_exhausted",
+      "category": "system_event",
+      "severity": "soft_warn",
+      "trigger": {
+        "kind": "system_event",
+        "event": "fill_provider_exhausted"
+      },
+      "short_hint": "{provider} hit its daily quota during background fill.",
+      "diagnostic": "{provider} returned a hard quota error during the background data fill — not a soft rate-limit, but the daily ceiling. The fill switched to the next available provider for that data lane.",
+      "recommendation": "Data providers (different from AI providers) have their own daily quotas — a keyed provider's free tier might cap at a few dozen calls per day on some endpoints, for example. When a provider is exhausted, the data router falls back to a less-preferred but available source. The fill keeps running, just from a different provider. {provider} resets at its daily reset time. The keyless sources (Yahoo, EDGAR) carry the load on their own; extra keyed providers are only a bonus if you happen to have them.",
+      "offered_action": {
+        "label": "Open Data Providers",
+        "intent": "open_data_providers_dialog"
+      },
+      "manual_fallback": "Open Settings → Data → Data Providers and add a backup provider for the affected data lane, or upgrade the tier on {provider}.",
+      "related_feature_ids": [
+        "data_providers_manager",
+        "cache_fill_modes"
+      ],
+      "entry_source": "authored",
+      "since_version": "v4.15.0"
+    },
+    {
+      "entry_id": "lookup_all_voices_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "lookup_all_voices_failed"
+      },
+      "short_hint": "Couldn't get any AI responses for {ticker} - all providers were busy or unavailable. Try again in a few minutes.",
+      "diagnostic": "Look Up ran a full consensus on {ticker}, but every configured AI provider failed to return a usable vote - they were rate-limited, errored out, or the network dropped partway through. No opinion came back.",
+      "recommendation": "This is different from the AIs disagreeing or declining to call - here, nothing answered at all. The usual cause is that all your providers are simultaneously rate-limited (common on free tiers when you run several lookups in a row), the network dropped mid-dispatch, or every key is invalid. Waiting a few minutes for the cooldowns to clear and trying again resolves most cases. If it keeps happening, open API Providers to confirm at least one provider has a valid key and isn't out of quota for the day. The activity log shows a [degradation] line per provider that was skipped, which tells you whether this was rate-limiting or a key problem.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Wait a few minutes and re-run Look Up. If it still returns nothing, open Settings - AI Sources - API Providers and confirm at least one provider has a valid key with quota remaining. Check the activity log for [degradation] lines.",
+      "related_feature_ids": [
+        "look_up",
+        "api_providers_manager",
+        "consensus_voting",
+        "activity_log"
+      ],
+      "wiring_note": "Read DIRECTLY by the Look Up dialog via tired_market.App._get_playbook_message('lookup_all_voices_failed', ticker=...) at consensus-complete time when valid_vote_count == 0 (Fix A). It is NOT yet fired through emit_system_event / the intercept layer - the trigger.event id is reserved for a future Phase 2 wiring that would surface this unprompted. Until then this entry is a content source the dialog reads on its own.",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-lookup-honesty-and-cancel"
+    },
+    {
+      "entry_id": "verify_all_voices_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "verify_all_voices_failed"
+      },
+      "short_hint": "Couldn't get any AI responses for {ticker} - all providers were busy or unavailable. Try again in a few minutes.",
+      "diagnostic": "You ran Verify on {ticker} from the Recommend list, but every configured AI provider failed to return a usable vote - they were rate-limited, errored out, or the network dropped partway through. No verdict came back.",
+      "recommendation": "This is different from the AIs disagreeing or declining to call {ticker} - here, nothing answered at all. The usual cause is that all your providers are simultaneously rate-limited (common on free tiers when you verify several picks in a row), the network dropped mid-check, or every key is invalid. Waiting a few minutes for the cooldowns to clear and clicking the pick's verify tag again resolves most cases. If it keeps happening, open API Providers to confirm at least one provider has a valid key and isn't out of quota for the day. The activity log shows a [degradation] line per provider that was skipped, which tells you whether this was rate-limiting or a key problem.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Wait a few minutes and click the pick's verify tag again. If it still returns nothing, open Settings - AI Sources - API Providers and confirm at least one provider has a valid key with quota remaining. Check the activity log for [degradation] lines.",
+      "related_feature_ids": [
+        "recommend",
+        "consensus_voting",
+        "api_providers_manager",
+        "activity_log"
+      ],
+      "wiring_note": "Fired via emit_system_event('verify_all_voices_failed', context={'ticker': ...}) from tired_market._on_run_recommend_consensus.on_all_done when a Recommend Verify completes with zero REAL votes (every provider skipped/errored). Sibling of lookup_all_voices_failed (which the Look Up dialog reads directly). Distinct from holding_refresh_no_ai_available, which fires PRE-flight when no AI is available at all; this fires POST-dispatch when AI was available but every provider then failed.",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-recommend-responsiveness"
+    },
+    {
+      "entry_id": "recommend_verify_already_running",
+      "category": "action_blocked",
+      "severity": "info",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "verify"
+        ],
+        "prereq": "no_verify_in_progress"
+      },
+      "short_hint": "A Verify is already running on {other_ticker} - wait for it to finish, then click this one.",
+      "diagnostic": "Only one Verify runs at a time so the app doesn't burn cloud quota in a burst across several picks at once.",
+      "recommendation": "The Verify in progress will finish in a few seconds; this pick's verify tag re-enables automatically when it does. If you'd rather verify this pick now, Cancel the running one from the Verify status panel at the bottom of the Recommend window, then click this pick's verify tag.",
+      "offered_action": null,
+      "manual_fallback": "Wait for the current Verify to finish - this pick's verify tag re-enables on its own.",
+      "related_feature_ids": [
+        "recommend",
+        "consensus_voting"
+      ],
+      "wiring_note": "Read DIRECTLY by tired_market._make_consensus_pill via _get_playbook_message('recommend_verify_already_running', other_ticker=...) to label the disabled 'waiting' pill shown on every other pick while one Verify runs. The prereq 'no_verify_in_progress' is NOT wired into the intercept layer - the pill enforces it visually (refuse-with-explanation, not a queue).",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-recommend-narration-and-freshness"
+    },
+    {
+      "entry_id": "portfolio_save_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "portfolio_save_failed"
+      },
+      "short_hint": "Couldn't save your {action} — your portfolio on disk is unchanged. Free up disk space / close anything using the file, then try again.",
+      "diagnostic": "The write to portfolio.json failed, so your {action} was NOT saved. Tired Market rolled the on-screen state back to match the file on disk, so nothing is in a half-saved state. Common causes: the disk is full, the file is open in another program, or the app folder isn't writable.",
+      "recommendation": "Check that you have free disk space and that no other program (a backup tool, a text editor, cloud sync) has the portfolio file open, then redo the action. The new atomic save means your existing portfolio is never overwritten unless the new copy was written cleanly first — so a failed save can lose the one change you just made, but it can never corrupt or wipe the file.",
+      "offered_action": {
+        "label": "Open data folder",
+        "intent": "open_data_folder"
+      },
+      "manual_fallback": "If it keeps failing, close the app and check the data folder ({data_path}) for free space and write access; make sure no .tmp file is left behind there.",
+      "related_feature_ids": [
+        "portfolio",
+        "setting_data_backups"
+      ],
+      "wiring_note": "Surfaced DIRECTLY by tm_portfolio_panel._handle_save_failure via _get_playbook_message('portfolio_save_failed', action=..., data_path=...) when HoldingsManager.save() returns False (atomic write failed). The trigger.event id is reserved for a future emit_system_event wiring; today the panel reads short_hint directly and shows a modal. {action} is the user action (sell / add / remove / cash update); {data_path} appears in the manual_fallback only.",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-portfolio-atomic-save",
+      "keywords": [
+        "portfolio won't save",
+        "holdings not saving",
+        "my holdings disappeared",
+        "lost my holdings",
+        "portfolio not saving"
+      ]
+    },
+    {
+      "entry_id": "portfolio_refresh_all_voices_failed",
+      "category": "system_event",
+      "severity": "blocking",
+      "trigger": {
+        "kind": "system_event",
+        "event": "portfolio_refresh_all_voices_failed"
+      },
+      "short_hint": "Couldn't reach any AI for {ticker} — all providers were busy or unavailable. Try again in a few minutes.",
+      "diagnostic": "You refreshed the triggers on {ticker} from your Portfolio, but every configured AI provider failed to return a usable vote — they were rate-limited, errored out, or the network dropped partway through. The hold/trim/sell triggers were NOT updated.",
+      "recommendation": "This is different from the AIs disagreeing — here, nothing answered at all. The usual cause is that all your providers are simultaneously rate-limited (common on free tiers after several refreshes in a row), the network dropped, or every key is invalid. Wait a few minutes for the cooldowns to clear and refresh again. If it keeps happening, open API Providers to confirm at least one provider has a valid key with quota remaining. The activity log shows a [degradation] line per provider that was skipped.",
+      "offered_action": {
+        "label": "Open API Providers",
+        "intent": "open_api_providers_dialog"
+      },
+      "manual_fallback": "Wait a few minutes and click Refresh triggers again. If it still returns nothing, open Settings - AI Sources - API Providers and confirm at least one provider has quota remaining.",
+      "related_feature_ids": [
+        "portfolio",
+        "consensus_voting",
+        "api_providers_manager",
+        "activity_log"
+      ],
+      "wiring_note": "Read DIRECTLY by tm_portfolio_panel (the two Refresh handlers' on_all_done) via _get_playbook_message('portfolio_refresh_all_voices_failed', ticker=...) when a holding Refresh completes with zero REAL votes. Sibling of lookup_all_voices_failed / verify_all_voices_failed. Shown as a red line on the holding card (Fix A); the trigger.event id is reserved for a future emit_system_event wiring.",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-portfolio-narration-and-honesty"
+    },
+    {
+      "entry_id": "portfolio_refresh_already_running",
+      "category": "action_blocked",
+      "severity": "info",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "verify"
+        ],
+        "prereq": "no_holding_refresh_in_progress"
+      },
+      "short_hint": "A refresh is already running on {other_ticker} — wait for it to finish, then refresh this holding.",
+      "diagnostic": "Only one holding Refresh runs at a time so the app doesn't burn cloud quota in a burst across several holdings at once.",
+      "recommendation": "The refresh in progress will finish in a few seconds; this holding's Refresh / Run-consensus buttons re-enable automatically when it does. Pre-patch, clicking here would have SILENTLY cancelled the other holding's refresh — now it's left to finish and this one waits.",
+      "offered_action": null,
+      "manual_fallback": "Wait for the current refresh to finish — this holding's buttons re-enable on their own.",
+      "related_feature_ids": [
+        "portfolio",
+        "consensus_voting"
+      ],
+      "wiring_note": "Read DIRECTLY by tm_portfolio_panel's Refresh handlers (the refuse-with-explanation backstop) via _get_playbook_message('portfolio_refresh_already_running', other_ticker=...). The card also disables this holding's consensus buttons + shows a terse '⏳ refresh running on X' note while another runs. The prereq 'no_holding_refresh_in_progress' is NOT wired into the intercept — the panel enforces it visually (refuse-with-explanation, not a queue).",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-portfolio-narration-and-honesty"
+    },
+    {
+      "entry_id": "portfolio_add_holding_invalid_ticker",
+      "category": "data_missing",
+      "severity": "info",
+      "trigger": {
+        "kind": "action_prereq",
+        "actions": [
+          "add_holding"
+        ],
+        "prereq": "ticker_recognized"
+      },
+      "short_hint": "'{ticker}' isn't a recognized ticker — check the spelling, or it may just not be in the database yet.",
+      "diagnostic": "Add holding couldn't recognize '{ticker}'. It's most likely a typo, a delisted symbol, or one your configured data sources don't cover.",
+      "recommendation": "Double-check the spelling on a public source like finance.yahoo.com. The check is fail-open — if the ticker universe isn't loaded yet, or the symbol is real but obscure, the add still goes through; this message only appears when the ticker is confidently not recognizable. If you're sure the symbol is right, you can re-enter it and it will be added.",
+      "offered_action": null,
+      "manual_fallback": "Verify the ticker spelling on finance.yahoo.com, then re-enter it in the Add holding form.",
+      "related_feature_ids": [
+        "portfolio",
+        "look_up"
+      ],
+      "wiring_note": "Read DIRECTLY by tm_portfolio_panel._on_add via _get_playbook_message('portfolio_add_holding_invalid_ticker', ticker=...) when the new fail-open App._is_valid_ticker (reused from Look Up Phase 2) rejects the input. Surfaced as an amber activity-log line (the Add form's existing error channel), not a modal. The prereq 'ticker_recognized' is not wired into the intercept.",
+      "entry_source": "authored",
+      "since_version": "v4.14.5.14-portfolio-narration-and-honesty"
+    }
+  ]
+}
