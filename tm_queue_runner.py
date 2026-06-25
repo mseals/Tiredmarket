@@ -3461,6 +3461,33 @@ def _run_fill_mode(app) -> None:
                             f"[fill-mode] {path}: actionable +{_delta} "
                             f"this cycle → back-off cleared")
                     _reset_zero_progress_streak(app, path)
+                elif (int(nd) >= int(dt) and int(nb) >= int(bf)):
+                    # v4.14.6.108-standalone-prep: satisfied, NOT starved.
+                    # Δactionable==0 here doesn't mean the path failed to
+                    # fill — it means the path is genuinely FULL (raw
+                    # displayed already meets target AND the bench is at or
+                    # above its floor) while consensus is permanently hiding
+                    # one displayed row, so actionable sits one short of
+                    # target forever. The hidden slot is correct; chasing a
+                    # 10th actionable slot consensus will always suppress is
+                    # not a failure, so do NOT increment the zero-progress
+                    # streak and do NOT double the back-off. Settle into the
+                    # same steady-state "satisfied for now, check again later"
+                    # cadence the no-candidates branch uses
+                    # (_FILL_NO_CANDIDATES_COOLDOWN_SECONDS, ~5 min) and reset
+                    # the per-session cycle count so a healthy full path never
+                    # drifts into the cold-start 50-cycle cap. Leaves the
+                    # streak/cooldown stores untouched (path is healthy).
+                    no_cand[path] = now + _FILL_NO_CANDIDATES_COOLDOWN_SECONDS
+                    serviced[path] = tick_n
+                    cycles[path] = 0
+                    _hidden = max(0, int(nd) - int(_actionable_after))
+                    _log_routine(
+                        app,
+                        f"[fill-mode] {path}: full ({nd}/{dt} raw, "
+                        f"bench {nb}) — {_hidden} slot"
+                        f"{'' if _hidden == 1 else 's'} consensus-hidden, "
+                        f"steady-state (no backoff)")
                 else:
                     _prior = int((getattr(
                         app, '_fill_zero_progress_streak', {})

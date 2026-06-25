@@ -79,3 +79,7 @@ data/logs/
 # OS junk
 Thumbs.db
 .DS_Store
+
+# v109 build/backup byproducts (never commit)
+*.bak_pre_*
+_build_*.log

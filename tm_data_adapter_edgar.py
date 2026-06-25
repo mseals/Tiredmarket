@@ -1028,6 +1028,20 @@ def _normalize_filings(submissions: dict, cik: int,
 # its row is merged with the others in _v415_cache_read_fundamentals.
 EDGAR_COMPANYFACTS_URL = 'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json'
 
+# v4.14.6.108-standalone-prep: stale-fundamentals floor. EDGAR happily
+# returns a company's LAST-EVER filing for a delisted/dormant issuer
+# (the live example: JXG, whose newest 10-K is fiscal_period_end
+# 2013-12-31 — twelve years stale). That row is real data, but it must
+# NOT be treated as current by any freshness check or fundamentals gate.
+# A fetched record whose as_of (== latest fiscal_period_end) is older
+# than this floor is flagged stale on the returned row; the currency
+# reader (_v415_cache_read_fundamentals) derives the same staleness from
+# the stored fiscal_period_end so a stale row never serves as a current
+# snapshot. ~18 months — wide enough that a normal annual+quarterly
+# filer (newest period <= ~95 days old in steady state, ~15 months in
+# the worst late-annual gap) is never flagged; tune here only.
+_FUNDAMENTALS_MAX_AGE_DAYS = 548  # ~18 months
+
 # System field -> ordered XBRL tag alternates. Selection picks the most-recent
 # ANNUAL (fp='FY') value ACROSS alternates, so a company that switched tags
 # (e.g. Apple: us-gaap:Revenues froze in 2018, now uses
@@ -1276,6 +1290,22 @@ def fetch_fundamentals(ticker: str) -> Optional[list]:
                             if operating_income is not None and revenue else None)
         fiscal_period_end = max(ends) if ends else None
 
+        # v4.14.6.108-standalone-prep: stale-fundamentals floor. Age the
+        # as_of (== latest fiscal_period_end) against today. A NULL/missing
+        # fiscal_period_end is UNKNOWN, NOT stale — leave it to the existing
+        # have_to_period / 90-day backstop downstream; don't flag and don't
+        # do the date math on it. Only a parseable date that exceeds the
+        # floor is flagged. Never raises (bad string -> treated as unknown).
+        _is_stale = False
+        if fiscal_period_end:
+            try:
+                _age_days = (datetime.now()
+                             - datetime.fromisoformat(
+                                 str(fiscal_period_end)[:10])).days
+                _is_stale = _age_days > _FUNDAMENTALS_MAX_AGE_DAYS
+            except Exception:
+                _is_stale = False
+
         # v4.14.6.76-growth-factor: retain the multi-year ANNUAL series for
         # revenue + EPS (already present in the companyfacts JSON just parsed)
         # and derive growth metrics. Pure parse — NO new HTTP. The latest-FY
@@ -1332,9 +1362,17 @@ def fetch_fundamentals(ticker: str) -> Optional[list]:
             'quality_current_ratio':    _quality.get('quality_current_ratio'),
             'quality_interest_coverage': _quality.get('quality_interest_coverage'),
             'quality_cf_to_sales':      _quality.get('quality_cf_to_sales'),
+            # v4.14.6.108-standalone-prep: in-memory staleness marker. The
+            # fundamentals TABLE has no `stale` column and adding one would
+            # be a migration (out of scope), so the upsert allowlist drops
+            # this key on write — the raw row is still preserved in cache,
+            # and currency is derived on read from fiscal_period_end. This
+            # flag is for the in-memory consumers (adapter() snapshot below).
+            'stale':             _is_stale,
         }
         n_fields = sum(1 for k, v in row.items()
-                       if k not in ('ticker', 'source', 'fiscal_period_end')
+                       if k not in ('ticker', 'source', 'fiscal_period_end',
+                                    'stale')
                        and v is not None)
         if n_fields == 0:
             return None
@@ -1344,10 +1382,16 @@ def fetch_fundamentals(ticker: str) -> Optional[list]:
         # every per-ticker fetch logged `[edgar]` only, so the audit's
         # daemon-liveness grep mistakenly thought fundfile had stalled
         # overnight when it was healthy (110 fetches in the first hour).
-        _adapter_log(
-            f"[fundfile] [edgar] fundamentals fetched for "
-            f"{ticker.upper()}: {n_fields} fields, "
-            f"as_of={fiscal_period_end}", 'muted')
+        if _is_stale:
+            _adapter_log(
+                f"[fundfile] [edgar] {ticker.upper()} "
+                f"as_of={fiscal_period_end} is stale (>18mo) — flagged, "
+                f"not used as current", 'amber')
+        else:
+            _adapter_log(
+                f"[fundfile] [edgar] fundamentals fetched for "
+                f"{ticker.upper()}: {n_fields} fields, "
+                f"as_of={fiscal_period_end}", 'muted')
         return [row]
     except Exception:
         return None
@@ -1441,6 +1485,10 @@ def adapter(profile, data_type: str, **kwargs):
             'dividend_yield':     None,
             'as_of':              row.get('fiscal_period_end'),
             'source':             'edgar',
+            # v4.14.6.108-standalone-prep: carry the staleness marker into
+            # the snapshot so FACTS/consumers can honor it; derived fresh
+            # from as_of so it's correct even if `row` lacked the key.
+            'stale':              bool(row.get('stale')),
         }
 
     if data_type != 'filings':
