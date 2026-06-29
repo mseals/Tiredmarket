@@ -10,9 +10,6 @@ Runs instantly on weak end-user hardware. Reads files, never mutates.
 Rules implemented (approved by the user, v4.14.6.57):
     R1  AI provider has a key but is disabled              -> suggest
     R2  AI provider enabled but key is empty               -> warn
-    R3  Only one news source enabled                       -> suggest
-    R4  Only one fundamentals source enabled               -> suggest
-    R5  Only one earnings source enabled                   -> suggest
     R6  Zero AI providers enabled                          -> warn
     R7  Only one AI provider enabled (thin consensus)      -> suggest
     R8  Cerebras enabled (context-guard informational)     -> info
@@ -48,10 +45,6 @@ from typing import Optional
 SEVERITY_INFO = 'info'
 SEVERITY_SUGGEST = 'suggest'
 SEVERITY_WARN = 'warn'
-
-# Data types that should normally have at least 2 enabled sources for
-# resilience. Tied to DATA_TYPES in tm_data_providers.py.
-_RESILIENCE_TYPES = ('news', 'fundamentals', 'earnings')
 
 
 def _load_json(path) -> Optional[dict]:
@@ -108,23 +101,6 @@ def _has_key(provider: dict) -> bool:
 
 def _is_ai_enabled(provider: dict) -> bool:
     return bool(provider.get('enabled', False))
-
-
-def _is_data_enabled_for(provider: dict, data_type: str) -> bool:
-    """True if this data provider is enabled, usable, and serves the type."""
-    if not provider.get('enabled', False):
-        return False
-    needs_key = bool(provider.get('needs_key', False))
-    if needs_key and not _has_key(provider):
-        return False
-    priorities = provider.get('priorities')
-    if not isinstance(priorities, dict):
-        return False
-    pri = priorities.get(data_type)
-    try:
-        return pri is not None and int(pri) > 0
-    except (TypeError, ValueError):
-        return False
 
 
 def _provider_display(provider: dict) -> str:
@@ -254,21 +230,6 @@ def provider_config_recommendations(
                 findings.append((SEVERITY_WARN,
                     f"{name}: default model '{model}' is deprecated. "
                     f"Switch to '{rep}'."))
-
-    # ── Data-side rules (R3, R4, R5) ─────────────────────────────────
-    for data_type in _RESILIENCE_TYPES:
-        enabled_count = sum(
-            1 for p in dp_providers if _is_data_enabled_for(p, data_type))
-        label = data_type
-        if enabled_count == 0:
-            findings.append((SEVERITY_WARN,
-                f"No enabled {label} source. The app will have no "
-                f"{label} data. Enable a provider that serves "
-                f"{label} in the Data Providers config."))
-        elif enabled_count == 1:
-            findings.append((SEVERITY_SUGGEST,
-                f"Only one {label} source enabled. No fallback if it "
-                f"stumbles. Consider enabling a backup."))
 
     # ── Sort: warns first, then suggests, then infos. Stable within. ─
     order = {SEVERITY_WARN: 0, SEVERITY_SUGGEST: 1, SEVERITY_INFO: 2}

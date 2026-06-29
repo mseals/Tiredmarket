@@ -234,11 +234,21 @@ def _select_tier2_providers(app, providers, cfg):
                 ok = True
             if not ok:
                 continue
+            # v4.14.6.111: un-pin tier-2. Keep the provider's FULL models[] so
+            # the consensus dispatch rotates it (flat round-robin + per-model
+            # cooldown-skip via _rotation_pick_model) instead of pinning one
+            # model and hammering it every pass (the Groq 70B daily-cap burn).
+            # Only when the provider has <2 usable models do we resolve a single
+            # capable+servable model so a thin provider still sends a valid one.
             copy = dict(base)
-            model = _validation_model_for(base, model)  # v4.14.6.68: capable + servable
-            if model:
-                copy['model'] = model
-                copy['models'] = [model]   # pin (resolve_provider_model)
+            _ms = base.get('models') if isinstance(base, dict) else None
+            _ms = ([str(m).strip() for m in _ms if str(m).strip()]
+                   if isinstance(_ms, (list, tuple)) else [])
+            if len(_ms) <= 1:
+                _pin = _validation_model_for(base, model)
+                if _pin:
+                    copy['model'] = _pin
+                    copy['models'] = [_pin]
             picked.append(copy)
             seen.add(id(base))
             if len(picked) >= _TIER2_CAP:
@@ -378,10 +388,16 @@ def _select_tier2_providers_flexible(app, providers, cfg):
             status, secs = _callability(app, base)
             if status == 'skip':
                 continue       # long-exhausted → backfill from next candidate
+            # v4.14.6.111: un-pin (see _select_tier2_providers). Keep the
+            # provider's full models[] for rotation; pin a single resolved model
+            # only when the provider has <2 usable models.
             copy = dict(base)
-            if model:
+            _ms = base.get('models') if isinstance(base, dict) else None
+            _ms = ([str(m).strip() for m in _ms if str(m).strip()]
+                   if isinstance(_ms, (list, tuple)) else [])
+            if len(_ms) <= 1 and model:
                 copy['model'] = model
-                copy['models'] = [model]   # pin (resolve_provider_model)
+                copy['models'] = [model]
             picked.append(copy)
             picked_pids.add(bp)
             if status == 'wait':
@@ -1080,6 +1096,37 @@ def _loop(app, stop_event, interval: int) -> None:
             except Exception as _se:
                 _log(app, f"[layer2] stamp skipped for {tk}/{path}: "
                           f"{type(_se).__name__}", 'muted')
+            # v4.14.6.111-layer2-target-persist (Prompt-build): persist the
+            # per-model TARGETS Layer 2 already has in `res['votes']` into
+            # predictions.jsonl, so the Recommend card aggregator
+            # (_compute_ai_target_for, source != 'algo_tier1') finds them and the
+            # cards stop showing "AI target n/a". ADDITIVE — no prompt/consensus/
+            # verdict change, no AI re-run, no extra tokens (reuses votes in hand).
+            #   GATE: only on a positive validation (VALIDATED_BUY) — weak/mixed
+            #     picks write no target rows.
+            #   FLOOD BOUND: a STABLE consensus_id per (ticker, path) lets the
+            #     shared writer's existing (consensus_id, model) dedup REPLACE-by-
+            #     skip — re-validating the same pick writes ONE row per model, not
+            #     a new one each tick (the store stays ≈ picks × models).
+            #   SOURCE 'consensus_vote' (the tag Look Up/Verify use; NOT
+            #     'algo_tier1', so the aggregator includes it). Non-responders
+            #     (no numeric target/stop) are skipped by the writer.
+            try:
+                if sc.get('verdict') == 'VALIDATED_BUY':
+                    _plog2 = (getattr(app, '_holdings_state', None)
+                              or {}).get('predictions_log')
+                    _votes = (res or {}).get('votes') or []
+                    if _plog2 is not None and _votes:
+                        import tm_consensus as _tc_l2
+                        _cid_l2 = f"layer2:{tk}:{path}"   # STABLE → dedup = write-once/model
+                        _tc_l2.write_consensus_vote_predictions(
+                            _plog2, tk, path, _votes, _cid_l2,
+                            source='consensus_vote', consensus_kind='fresh_buy',
+                            skip_model_key=None, current_price=None,
+                            log_fn=lambda m, c='muted': _log(app, m, c))
+            except Exception as _te:
+                _log(app, f"[layer2] target-persist skipped for {tk}/{path}: "
+                          f"{type(_te).__name__}", 'muted')
             _bm_validations += 1
             _bm_models_sum += int(sc.get('n_models') or 0)
             _log(app,

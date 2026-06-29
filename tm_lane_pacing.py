@@ -97,6 +97,21 @@ LANE_BOUNDS = {
         'attr':    ('tm_fill_executor',
                     '_CHUNKED_INTER_CHUNK_DELAY_SECONDS'),
     },
+    # v4.14.6.111: Yahoo EARNINGS (Ticker.calendar) lane. Earnings was previously
+    # unpaced by this controller — its only throttle was the fundfile daemon's
+    # flat 55/min (sized as a buffer under FINNHUB's 60/min, NOT Yahoo's lower
+    # .calendar ceiling), so a ~33s burst of 30 seed fetches overran Yahoo and
+    # tripped a reactive 60s cooldown. SEEDED CONSERVATIVELY: 3.0s (~20/min) is
+    # clearly under the 55/min that demonstrably trips it; the controller tightens
+    # toward the floor on clean windows and backs off toward the ceiling on a 429,
+    # self-tuning to Yahoo's real (unknown) earnings ceiling from observed
+    # outcomes. floor 1.5s (~40/min) stays under the trip rate even fully tight.
+    'yahoo_earnings': {
+        'seed':    3.0,
+        'floor':   1.5,
+        'ceiling': 20.0,
+        'attr':    ('tm_fundfile_fetcher', '_EARNINGS_MIN_INTERVAL_SEC'),
+    },
 }
 
 # Tighten/back-off multipliers. Conservative on the way down (×0.85 ≈
@@ -203,6 +218,7 @@ def init(data_dir: Optional[Path] = None,
             _apply_locked(lane, float(rec['interval']))
         _outcomes.setdefault('edgar', deque())
         _outcomes.setdefault('yahoo_price', deque())
+        _outcomes.setdefault('yahoo_earnings', deque())   # v4.14.6.111
         _save_locked(force=True)
 
 

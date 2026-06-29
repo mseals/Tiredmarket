@@ -465,17 +465,35 @@ def _runner_loop(app) -> None:
                 # the flags are off, behavior is byte-identical to today.
                 if _fill_mode_has_pending_work(app):
                     _suppress_fast_poll = False
+                    # v4.14.6.110: market-closed sweep relaxation (DEFAULT, not
+                    # flag-gated). When the market is truly closed (overnight/
+                    # weekend/holiday per the holiday-aware calendar) there's no
+                    # fresh movement to analyze, so let the backoff relax 60->600s
+                    # instead of hammering the heavy sweep. Pre/after-hours are NOT
+                    # "closed" — stocks still move, keep fast-poll. Fails OPEN
+                    # (today's behavior) on any error.
+                    _market_closed = False
                     try:
-                        _qcfg = getattr(app, 'cfg', {}) or {}
-                        _suppress_fast_poll = (
-                            bool(_qcfg.get('event_sweep_smart_gating', False))
-                            and bool(_qcfg.get(
-                                'event_idle_when_unactionable', True))
-                            and bool(_qcfg.get(
-                                'event_gate_market_closed', True))
-                            and not _market_is_live(app))
+                        import tm_market_calendar as _mc
+                        _, _market_closed, _ = _mc.market_status()
                     except Exception:
-                        _suppress_fast_poll = False
+                        _market_closed = False
+                    if _market_closed:
+                        _suppress_fast_poll = True
+                    else:
+                        # Existing flag-gated data-driven liveness suppressor —
+                        # UNCHANGED (only active when smart-gating is on).
+                        try:
+                            _qcfg = getattr(app, 'cfg', {}) or {}
+                            _suppress_fast_poll = (
+                                bool(_qcfg.get('event_sweep_smart_gating', False))
+                                and bool(_qcfg.get(
+                                    'event_idle_when_unactionable', True))
+                                and bool(_qcfg.get(
+                                    'event_gate_market_closed', True))
+                                and not _market_is_live(app))
+                        except Exception:
+                            _suppress_fast_poll = False
                     if not _suppress_fast_poll:
                         sleep_seconds = min(
                             sleep_seconds, _FILL_FAST_POLL_SECONDS)
@@ -4715,6 +4733,85 @@ def _algo_gate_decide(app, chosen: dict, ticker: str, path: str,
         enrichment_enabled=enrichment_enabled,
         survivor_threshold=survivor_threshold,
         trend_filter_enabled=trend_filter_enabled)
+
+    # v4.14.6.111 (Tier-1): fetch the ticker's daily bars ONCE for both the
+    # relative-strength score (vs SPY) and the dollar-volume liquidity gate
+    # below. Pure read from cache.db; any failure degrades to no-RS / no-gate.
+    _algo_bar_dicts = []
+    try:
+        import tm_cache as _tcb_t1
+
+        def _row_get(r, key, idx):
+            try:
+                return r[key]
+            except Exception:
+                try:
+                    return r[idx]
+                except Exception:
+                    return None
+        # daily_bars columns: ticker,date,open,high,low,close,adj_close,volume
+        for r in (_tcb_t1.get_daily_bars(ticker) or []):
+            _algo_bar_dicts.append({
+                'open': _row_get(r, 'open', 2),
+                'high': _row_get(r, 'high', 3),
+                'low': _row_get(r, 'low', 4),
+                'close': _row_get(r, 'close', 5),
+                'volume': _row_get(r, 'volume', 7)})
+        _spy_bars = _tcb_t1.get_daily_bars('SPY') or []
+        _spy_closes = []
+        for r in _spy_bars:
+            _c = _row_get(r, 'close', 5)
+            if _c is not None:
+                try:
+                    _spy_closes.append(float(_c))
+                except (TypeError, ValueError):
+                    pass
+        _t_closes = []
+        for b in _algo_bar_dicts:
+            if b['close'] is not None:
+                try:
+                    _t_closes.append(float(b['close']))
+                except (TypeError, ValueError):
+                    pass
+        # rel-strength (prior build)
+        _rs = _algo.relative_strength_pct(_t_closes, _spy_closes)
+        if _rs is not None:
+            feats['rel_strength_pct'] = float(_rs)
+            feats['_has_rel_strength'] = True
+        # ── Tier-1 bundle (v4.14.6.111): breakout / consec / gap (per-ticker) ──
+        _off = _algo.pct_off_high(_algo_bar_dicts)
+        if _off is not None:
+            feats['pct_off_high_20'] = float(_off)
+            feats['_has_breakout'] = True
+        _cu = _algo.consecutive_up_days(_algo_bar_dicts)
+        if len(_algo_bar_dicts) >= 2:
+            feats['consec_up_days'] = int(_cu)
+            feats['_has_consec'] = True
+        _gp = _algo.gap_pct(_algo_bar_dicts)
+        if _gp is not None:
+            feats['gap_pct'] = float(_gp)
+            feats['_has_gap'] = True
+        # ── market regime: computed ONCE per scan, memoized on app (~5 min) ──
+        try:
+            _now_ts = time.time()
+        except Exception:
+            _now_ts = 0.0
+        _reg = getattr(app, '_algo_regime_cache', None)
+        if (not _reg) or (_now_ts - _reg.get('ts', 0.0) > 300.0):
+            _spy_bar_dicts = [{'close': _row_get(r, 'close', 5)}
+                              for r in _spy_bars]
+            _reg = {'state': _algo.market_regime(_spy_bar_dicts),
+                    'ts': _now_ts}
+            try:
+                app._algo_regime_cache = _reg
+            except Exception:
+                pass
+        if _reg.get('state') and _reg['state'] != 'unknown':
+            feats['regime_state'] = _reg['state']
+            feats['_has_regime'] = True
+    except Exception:
+        pass
+
     score, reasons = _algo.score_for_promotion(feats)
 
     # ALGOGATE: surface the gate decision so the shadow log can stamp
@@ -4766,6 +4863,32 @@ def _algo_gate_decide(app, chosen: dict, ticker: str, path: str,
         gate_reason = (
             f'gate rejected ({gate_reason_text}); '
             f'pre-override gate_reason was: {gate_reason}')
+
+    # v4.14.6.111 (Tier-1): DOLLAR-VOLUME LIQUIDITY FLOOR — a hard GATE that
+    # removes untradeable names before promotion (fixes the "great signal,
+    # can't actually fill it" failure mode). Band-aware floor; UNKNOWN avg$vol
+    # (thin history) does NOT gate (absence of data ≠ illiquid). Sits with the
+    # other gates, after the score decision, before the emit. Read-only against
+    # the bars already fetched above.
+    if promote:
+        try:
+            _advol = _algo.avg_dollar_volume(_algo_bar_dicts)
+            if _advol is not None:
+                # v4.14.6.111 (display-only): stash so the emit breakdown can
+                # show the avg$vol that CLEARED the floor (not only rejects).
+                feats['_avg_dollar_volume'] = _advol
+                _liq_floor = _algo.liquidity_floor_for_band(path, cfg)
+                if _advol < _liq_floor:
+                    promote = False
+                    gate_reason = (
+                        f'illiquid (avg$vol ${_advol:,.0f} '
+                        f'< floor ${_liq_floor:,.0f})')
+                    _log_amber(
+                        app,
+                        f"[algo-gate] {ticker}/{path} rejected: illiquid "
+                        f"(avg$vol ${_advol:,.0f} < floor ${_liq_floor:,.0f})")
+        except Exception:
+            pass
 
     # ── EMIT-BRIDGE (algo-tier1-emit-2026-06-14): write a real BUY ──
     #
@@ -4913,6 +5036,19 @@ def _algo_gate_decide(app, chosen: dict, ticker: str, path: str,
                                 f"timeframe {levels['timeframe_days']}d "
                                 f"RR {levels['rr_ratio']:.1f}:1 "
                                 f"(score {score:.1f}, id={pred_id})")
+                        except Exception:
+                            pass
+                        # v4.14.6.111 (display-only): per-signal breakdown on
+                        # EMITTED picks only (verbosity choice a) so Mike can
+                        # audit WHAT drove the promotion. Read from the contribs
+                        # score_for_promotion already recorded — no recompute.
+                        try:
+                            _bd = _algo.format_score_breakdown(
+                                feats, feats.get('_avg_dollar_volume'))
+                            if _bd:
+                                _log_amber(
+                                    app,
+                                    f"[algo-tier1]   └ signals: {_bd}")
                         except Exception:
                             pass
                     else:
@@ -5116,6 +5252,18 @@ def _algo_log_shadow(app, ticker: str, path: str, decision: dict,
             os.path.dirname(os.path.abspath(__file__)),
             'data', 'algo_shadow.jsonl')
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        # v4.14.6.110: cap algo_shadow.jsonl growth (write-only diagnostic).
+        # Nothing reads this file (A/B telemetry only), so rotating it has no
+        # functional risk. Keep one backup (.1); os.replace overwrites the prior
+        # rotation, so disk use is bounded at ~2x the cap.
+        try:
+            _ALGO_SHADOW_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+            if os.path.getsize(log_path) > _ALGO_SHADOW_MAX_BYTES:
+                os.replace(log_path, log_path + '.1')
+        except FileNotFoundError:
+            pass  # not created yet — nothing to rotate
+        except Exception:
+            pass  # rotation is best-effort; never block the write
         with open(log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, default=str) + '\n')
     except Exception:

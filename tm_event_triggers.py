@@ -53,10 +53,17 @@ from typing import Any, Optional
 #   lottery (6%): $1-$10 names are volatile; 6% filters daily noise
 #   penny_lottery (10%): sub-dollar names routinely move 10-30%
 PRICE_DRIFT_THRESHOLDS_PCT = {
+    # v4.14.6.110: price-drift band keys (loose backstop; target_stop is primary).
+    # Inverse-scaled — cheaper bands move more in % terms, so a looser % avoids
+    # hair-triggering; the real "left the buy range" relook is target_stop.
+    'lottery':       0.10,
+    'band_5_10':     0.08,
+    'band_10_50':    0.06,
+    'band_50_up':    0.05,
+    # Legacy time-path keys retained as aliases (other call sites may read them).
     'slow_safe':     0.08,
     'moderate':      0.05,
     'aggressive':    0.04,
-    'lottery':       0.06,
     'penny_lottery': 0.10,
 }
 
@@ -140,12 +147,99 @@ PER_KIND_DEDUP_WINDOWS_SECONDS = {
 #   aggressive: tighter (2 articles in 1 day)
 #   lottery/penny_lottery: thin names where any single article matters
 NEWS_TRIGGER_THRESHOLDS = {
+    # v4.14.6.110: count is now only the "unusual volume" FALLBACK — the
+    # materiality check (sentiment magnitude / source tier, below) is primary.
+    # Band keys added so band candidates have a real count bar (was None ->
+    # the count fallback silently never fired for the 3 dollar bands).
+    # Tuple = (count, max_age_hours).
+    'lottery':       (1, 24),   # rare news on cheap names -> low volume bar
+    'band_5_10':     (8, 24),
+    'band_10_50':    (8, 24),
+    'band_50_up':    (8, 24),
+    # Legacy time-path keys retained as aliases.
     'slow_safe':     (5, 72),
     'moderate':      (3, 48),
     'aggressive':    (2, 24),
-    'lottery':       (1, 24),
     'penny_lottery': (1, 24),
 }
+
+# v4.14.6.110: news materiality settings — fire on ONE material article and
+# ignore routine volume. Fire rule: material_sentiment OR tier_a OR high_count.
+# Safe to tune toward CATCHING news: in default config a false-fire only wastes
+# a Tier-2 call + re-scores (Layer 3 auto-remove is dormant); dedup/cooldown cap
+# the AI-call rate.
+MATERIAL_SENTIMENT = 60        # |sentiment_score| >= this (on -100..+100) fires
+TIER_A_FIRES_ALONE = True      # any Tier-A (SEC/regulatory) source fires alone
+TIER_B_FIRES_ALONE = False     # Tier-B (Yahoo/Finnhub/wires) does NOT auto-fire
+MATERIAL_MAX_AGE_HOURS = 48    # only consider articles published within this window
+COUNT_FALLBACK = 8             # >= this many recent articles fires (volume backstop)
+
+# news_cache stores fetcher-tag source strings ('yahoo','finnhub','rss',
+# 'google_news',...) which differ from tm_source_weights.SOURCE_TIERS ids
+# ('yahoo_news','finnhub_news','rss_news',...). Normalize, then read the
+# canonical tier — this ACTIVATES the (previously dormant) source-tier system
+# at trigger time only. NOTE: no Tier-A source currently feeds news_cache
+# (sec_edgar is the FILINGS pipeline, not news), so the tier_a path is a
+# forward-looking hook that fires only if/when a Tier-A news source is added.
+_NEWS_SOURCE_TIER_ALIASES = {
+    'yahoo':         'yahoo_news',
+    'yahoo_deep':    'yahoo_news',
+    'finnhub':       'finnhub_news',
+    'finnhub_deep':  'finnhub_news',
+    'rss':           'rss_news',
+    'google_news':   'google_news',
+    'reddit':        'reddit',
+    'stocktwits':    'stocktwits',
+    'edgar':         'sec_edgar',
+    'sec':           'sec_edgar',
+    'sec_edgar':     'sec_edgar',
+}
+
+
+def _news_source_tier(source) -> "str | None":
+    """Resolve a news_cache source string to its category tier ('A'/'B'/'C'/'D')
+    via tm_source_weights (the dormant tier system, activated here). Returns None
+    if unmappable. Cycle-safe lazy import; never raises."""
+    if not source:
+        return None
+    try:
+        import tm_source_weights as _sw
+        sid = str(source).strip().lower()
+        sid = _NEWS_SOURCE_TIER_ALIASES.get(sid, sid)
+        return _sw.tier_for(sid)
+    except Exception:
+        return None
+
+
+def _news_materiality_decision(rows, count_window_iso, threshold_count):
+    """Pure fire decision over recent news rows (no DB). Each row is a dict with
+    'sentiment_score', 'source', 'eff_iso'. Fires on:
+      material_sentiment  — any |sentiment_score| >= MATERIAL_SENTIMENT
+      tier_a              — any Tier-A source (when TIER_A_FIRES_ALONE)
+      high_count          — >= threshold_count rows newer than count_window_iso
+    Returns (fire: bool, reason: str|None, recent_count: int). Never raises."""
+    material = False
+    tier_a = False
+    recent_count = 0
+    for r in rows:
+        try:
+            mag = abs(float(r.get('sentiment_score') or 0.0))
+        except (TypeError, ValueError):
+            mag = 0.0
+        if mag >= MATERIAL_SENTIMENT:
+            material = True
+        if TIER_A_FIRES_ALONE and _news_source_tier(r.get('source')) == 'A':
+            tier_a = True
+        if str(r.get('eff_iso') or '') >= str(count_window_iso):
+            recent_count += 1
+    high_count = recent_count >= int(threshold_count)
+    if material:
+        return True, 'material_sentiment', recent_count
+    if tier_a:
+        return True, 'tier_a', recent_count
+    if high_count:
+        return True, 'high_count', recent_count
+    return False, None, recent_count
 
 
 # v4.14.4.3 (2026-05-15): per-path earnings trigger windows.
@@ -162,10 +256,17 @@ NEWS_TRIGGER_THRESHOLDS = {
 #   penny_lottery: widest — earnings data is sparse for penny names,
 #     so when we DO have a date, treat it as load-bearing
 EARNINGS_TRIGGER_WINDOWS = {
+    # v4.14.6.110: earnings-trigger band keys (price-scaled lead time).
+    # Cheaper/speculative bands get a wider earnings window (more lead time);
+    # expensive bands tighter. Tuple = (upcoming_days, recent_days).
+    'lottery':       (7, 5),
+    'band_5_10':     (7, 5),
+    'band_10_50':    (5, 3),
+    'band_50_up':    (3, 2),
+    # Legacy time-path keys retained as aliases.
     'slow_safe':     (3, 2),
     'moderate':      (5, 3),
     'aggressive':    (7, 5),
-    'lottery':       (7, 5),
     'penny_lottery': (14, 7),
 }
 
@@ -1312,21 +1413,35 @@ def check_news_triggers(app, path: str,
             last_ana_iso = (
                 datetime.fromtimestamp(last_ts_int).isoformat()
                 if last_ts_int > 0 else '')
+            # v4.14.6.110: materiality replaces count-only. Anchor on the
+            # MATERIAL_MAX_AGE_HOURS recency window (since the analysis
+            # baseline), using published_at when present (COALESCE fallback to
+            # first-seen timestamp for sources that leave it NULL) so stale
+            # backfilled articles can't inflate the fire.
+            material_cutoff_ts = now_ts - (MATERIAL_MAX_AGE_HOURS * 3600)
+            material_cutoff_iso = datetime.fromtimestamp(
+                material_cutoff_ts).isoformat()
             # Lexicographic max — ISO strings sort correctly.
-            anchor_iso = max(last_ana_iso, max_age_cutoff_iso)
+            anchor_iso = max(last_ana_iso, material_cutoff_iso)
+            # The dict's max_age window drives the high-COUNT volume fallback.
+            count_window_iso = max_age_cutoff_iso
 
-            # Count new articles + grab top headline in one query.
-            # news_cache schema (per tired_market.py:411):
-            #   timestamp, ticker, headline, source, sentiment_score,
-            #   raw_data
-            # Index idx_nc on (ticker, timestamp) makes this fast.
+            # Pull recent rows once: source (for tier), sentiment, headline,
+            # and the effective (published-or-first-seen) date.
             try:
                 cur = conn.execute(
-                    "SELECT COUNT(*) FROM news_cache "
-                    "WHERE ticker = ? AND timestamp > ?",
+                    "SELECT source, sentiment_score, headline, "
+                    "COALESCE(NULLIF(published_at,''), timestamp) AS eff_date "
+                    "FROM news_cache "
+                    "WHERE ticker = ? "
+                    "AND COALESCE(NULLIF(published_at,''), timestamp) > ? "
+                    "ORDER BY eff_date DESC",
                     (ticker, anchor_iso))
-                row = cur.fetchone()
-                count = int(row[0]) if row and row[0] is not None else 0
+                news_rows = [
+                    {'source': r[0], 'sentiment_score': r[1],
+                     'headline': r[2], 'eff_iso': r[3]}
+                    for r in cur.fetchall()
+                ]
             except Exception as e:
                 if not news_sql_fail_logged:
                     _log_amber(
@@ -1338,31 +1453,36 @@ def check_news_triggers(app, path: str,
                     news_sql_fail_logged = True
                 continue
 
-            if count < threshold_count:
+            if not news_rows:
                 continue
 
-            # Top headline for prompt framing (best-effort; failure
-            # leaves it as None).
-            top_headline = None
+            # material_sentiment OR tier_a OR high_count (pure, testable).
+            fire, reason, recent_count = _news_materiality_decision(
+                news_rows, count_window_iso, threshold_count)
+            if not fire:
+                continue
+
+            # Top headline for prompt framing — prefer the most material
+            # (highest |sentiment|) row, else the newest. Best-effort.
             try:
-                cur = conn.execute(
-                    "SELECT headline FROM news_cache "
-                    "WHERE ticker = ? AND timestamp > ? "
-                    "ORDER BY timestamp DESC LIMIT 1",
-                    (ticker, anchor_iso))
-                row = cur.fetchone()
-                if row and row[0]:
-                    top_headline = str(row[0])
+                top_row = max(
+                    news_rows,
+                    key=lambda r: abs(float(r.get('sentiment_score') or 0.0)))
+                top_headline = (str(top_row.get('headline'))
+                                if top_row.get('headline') else None)
             except Exception:
-                pass  # headline is non-essential context
+                top_headline = (str(news_rows[0].get('headline'))
+                                if news_rows[0].get('headline') else None)
 
             fires.append((ticker, {
                 'kind': 'news',
-                'new_article_count': count,
+                'fire_reason': reason,
+                'new_article_count': recent_count,
                 'since_ts': anchor_iso,
                 'top_headline': top_headline,
                 'threshold': threshold_count,
                 'max_age_hours': max_age_hours,
+                'material_max_age_hours': MATERIAL_MAX_AGE_HOURS,
             }))
 
         return fires

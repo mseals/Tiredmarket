@@ -89,6 +89,139 @@ except Exception:
 _PARALLEL_CONSENSUS = False
 _PARALLEL_CONSENSUS_MAX_WORKERS = 5
 
+# v4.14.6.111 (Item 5): a consensus finalizing with fewer than this many
+# COMMITTED live voices is "starved" — a verdict resting on 0-1 voices is
+# low-confidence (near-unanimous by construction). FLOOR=2 warns only when ≤1
+# voice survives (a 2-voice run is still a real cross-check; cooldowns/timeouts
+# routinely leave 2, so a higher floor would warn on legitimate runs). Tunable.
+CONSENSUS_STARVE_FLOOR = 2
+
+
+def format_votes_so_far(votes, weight_map=None, accuracy_enabled=False):
+    """v4.14.6.111-streaming: one-line running tally over the votes that have
+    landed SO FAR, for the live "consensus running" display on every path. e.g.
+    "3 HOLD · 1 BUY". Returns "" when no committed vote has a direction yet.
+
+    Partial-safe by construction: it calls the SAME tm_source_accuracy.
+    weighted_tally used at finalize, which needs no full-set normalization (the
+    weight_map is per-model constants pre-fetched at runner construction), so a
+    tally over a subset of voters is valid — the final verdict is just this tally
+    when the run completes. Display-only; never raises."""
+    try:
+        committed = [v for v in (votes or [])
+                     if isinstance(v, dict) and (v.get('direction') or '').strip()]
+        if not committed:
+            return ""
+        counts = None
+        try:
+            import tm_source_accuracy as _tsa
+            tally = _tsa.weighted_tally(
+                committed, weight_map, bool(accuracy_enabled))
+            counts = tally.get('raw_counts') or None
+        except Exception:
+            counts = None
+        if not counts:
+            from collections import Counter
+            counts = dict(Counter(
+                (v.get('direction') or '').upper() for v in committed))
+        if not counts:
+            return ""
+        # Most-agreed direction first, then alphabetical for stable ordering.
+        parts = [f"{n} {d}" for d, n in
+                 sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        return " · ".join(parts)
+    except Exception:
+        return ""
+
+
+def write_consensus_vote_predictions(plog, ticker, path, votes, consensus_id, *,
+                                     source='consensus_vote',
+                                     consensus_kind='owned',
+                                     skip_model_key=None,
+                                     current_price=None, log_fn=None):
+    """v4.14.6.111 — shared per-model accuracy writer (owned-position AND
+    fresh-buy). For each COMMITTED vote (real direction, not skipped/error) that
+    has a RESOLVABLE target+stop, write ONE predictions row attributed to that
+    model, carrying its OWN parsed direction/target/stop + the provider trailer,
+    tagged `source`, `consensus_id`, and `consensus_kind` ('owned'|'fresh_buy' —
+    a discriminator; source stays 'consensus_vote' so accuracy groups uniformly).
+
+    Resolves via the SAME tm_discover.check_outcomes (BUY -> target/stop axis,
+    HOLD -> hold axis; every row expires at timeframe_days -> none sit
+    forever-open). SKIPS: `skip_model_key` (a representative already written by
+    the caller -> no double-count), votes with no usable target+stop
+    (unresolvable -> would only pad the open pile), and any (consensus_id, model)
+    already present (dedup -> idempotent on re-fire).
+
+    SCORING INDEPENDENCE: these rows are scored purely on price vs the model's
+    own target/stop/timeframe. Nothing here references holdings/ownership — a
+    fresh-buy call on a ticker the user never bought still records and resolves.
+    Returns the count written. Never raises.
+    """
+    try:
+        if plog is None:
+            return 0
+        import tm_discover as _tmd
+        seen = set()
+        if skip_model_key:
+            seen.add(str(skip_model_key).strip().lower())
+        # Dedup vs rows already written for THIS consensus_id (re-fire guard).
+        try:
+            for r in (plog.get_all() or [])[-500:]:
+                if r.get('consensus_id') == consensus_id:
+                    seen.add((r.get('model') or '').strip().lower())
+        except Exception:
+            pass
+        n = 0
+        for v in (votes or []):
+            if not isinstance(v, dict):
+                continue
+            if v.get('skipped') or v.get('error'):
+                continue
+            if not (v.get('direction') or '').strip():
+                continue
+            mkey = (v.get('model') or '').strip().lower()
+            if not mkey or mkey in seen:
+                continue
+            resp = v.get('response') or ''
+            if not resp:
+                continue
+            try:
+                pred = _tmd.parse_prediction(resp, ticker,
+                                             current_price=current_price)
+            except Exception:
+                continue
+            if pred.get('target') is None or pred.get('stop') is None:
+                continue
+            _dir = (v.get('direction') or pred.get('direction') or '').upper()
+            if _dir:
+                pred['direction'] = _dir
+            pred['source'] = source
+            pred['path'] = path
+            pred['consensus_id'] = consensus_id
+            pred['consensus_kind'] = consensus_kind
+            for k in ('model', 'provider_id', 'provider_preset',
+                      'canonical_model', 'actual_provider',
+                      'actual_model_string', 'lineup_version'):
+                if v.get(k) is not None:
+                    pred[k] = v.get(k)
+            try:
+                plog.append(pred)
+                seen.add(mkey)
+                n += 1
+            except Exception:
+                pass
+        if n and log_fn:
+            try:
+                log_fn(f"[consensus-accuracy] {ticker}: recorded {n} per-model "
+                       f"{consensus_kind} vote(s) for scoring "
+                       f"(consensus_id={consensus_id})", 'muted')
+            except Exception:
+                pass
+        return n
+    except Exception:
+        return 0
+
 
 def set_parallel_consensus(enabled: bool, max_workers: int = 5) -> None:
     """Push the consensus dispatch-mode flag into this module. enabled=False
@@ -143,8 +276,9 @@ stock signal onto the user's existing position size:
   - Stock signal "BUY at this price" → for the user, that's BUY MORE
     (they should add to their existing position because the stock is still
     attractive at today's price)
-  - Stock signal "HOLD / fairly valued / wait" → for the user, that's HOLD
-    (don't add, don't exit, the stock isn't compelling enough either way)
+  - Stock signal "still expect upside, but price is near the target" → for
+    the user, that's HOLD (you still expect it to rise, but it's too close to
+    the target to justify the added risk of buying more — keep, don't add)
   - Stock signal "SELL / overvalued / thesis broken" → for the user, that's
     SELL (full exit) or TRIM (partial exit if they want to keep some
     exposure)
@@ -156,12 +290,10 @@ holder. The fact that the user is already in the position is context for
 sizing and timing, NOT a reason to soften your call.
 
 The choice is among BUY MORE / HOLD / SELL / TRIM. Do not say AVOID —
-they already own the stock; AVOID is meaningless here.
-
-If the stock is genuinely a HOLD on its merits — fair value, no clear
-catalyst either way, momentum unclear — then say HOLD honestly. But
-ask yourself: would I tell a fresh buyer this is attractive at today's
-price? If yes, the answer is BUY MORE. If no, HOLD or SELL.
+they already own the stock; AVOID is meaningless here. HOLD is "still
+bullish but near target" — NOT neutral: if there's real room to the
+target it's BUY MORE; if the thesis is broken or it's past target, SELL
+or TRIM.
 """.strip()
 
 
@@ -887,6 +1019,27 @@ def build_lookup_explain_prompt(holding: dict, path_key: str,
 
     prompt, debug = prompt_builder.build_holding_analysis(synthetic, path_key)
 
+    # v4.14.6.111-lookup-strip-strategy: Look Up evaluates the NAMED ticker on
+    # its OWN merits — it must NOT carry the user's price-band / trading-style
+    # strategy. The shared body builder prepends a "USER'S CHOSEN PATH: $5–$10
+    # (Stocks priced $5–$10/share…)" block (tm_holdings.build_holding_analysis),
+    # which made models reject out-of-range tickers ("outside the $5–$10 range")
+    # instead of judging them. Strip that block from the LOOK UP body ONLY — the
+    # same kind of string-surgery this builder already does for POSITION/QUESTION.
+    # build_holding_analysis itself is left intact, so Recommend/scan/Verify/
+    # Layer-2 (build_fresh_buy_prompt) keep their legitimate band-awareness.
+    _cp = prompt.find("USER'S CHOSEN PATH:")
+    if _cp != -1:
+        _pp = prompt.find("\nPOSITION:", _cp)
+        if _pp != -1:
+            # drop the path lines + their trailing blank, leaving the existing
+            # blank separator before POSITION (no dangling label / no doubled gap)
+            prompt = prompt[:_cp] + prompt[_pp + 1:]
+    # Neutralise the "analyzing a position for <user>" ownership framing — Look
+    # Up is a fresh evaluation, not a held position. (Literal, user-name-agnostic.)
+    prompt = prompt.replace("You are analyzing a position for ",
+                            "You are analyzing this ticker for ", 1)
+
     # Rebuild a CURRENT QUOTE section (same logic as the fresh-buy builder —
     # duplicated deliberately to keep the shared fresh_buy path untouched).
     cache = getattr(prompt_builder, 'cache', None)
@@ -1033,6 +1186,15 @@ class ConsensusRunner:
 
     PER_MODEL_TIMEOUT_SEC = 180  # 3 minutes per model — plenty for cold-start
 
+    # v4.14.6.111-finalize-deadline: total per-RUN wall-clock cap (from worker
+    # spawn) after which the verdict posts on whoever has returned and the rest
+    # are marked timed-out. Bounds the user-visible wait so one dead/hung model
+    # can't hold the panel for its full PER_MODEL_TIMEOUT_SEC. Chosen 120s:
+    # ABOVE the observed ~90s fast-cohort completion (real voters aren't cut),
+    # one-third BELOW the 180s per-model cap (a hung model can't wedge the
+    # verdict past 2 min vs the prior 3-4). Tunable; tests override it low.
+    FINALIZE_DEADLINE_SEC = 120
+
     def __init__(self,
                  ticker: str,
                  holding: dict,
@@ -1044,6 +1206,7 @@ class ConsensusRunner:
                  on_model_done: Optional[Callable[[str, dict], None]] = None,
                  on_model_error: Optional[Callable[[str, str], None]] = None,
                  on_all_done: Optional[Callable[[dict], None]] = None,
+                 on_late_vote: Optional[Callable[[str, dict], None]] = None,
                  log_callback: Optional[Callable[[str, str], None]] = None,
                  predictions_log: Any = None,
                  prompt_kind: str = 'owned_position',
@@ -1098,6 +1261,10 @@ class ConsensusRunner:
         self.on_model_done = on_model_done
         self.on_model_error = on_model_error
         self.on_all_done = on_all_done
+        # v4.14.6.111-finalize-deadline: fired (model, vote) when a timed-out
+        # model's vote lands AFTER finalize — for audit only; the caller must
+        # NOT use it to change the posted verdict or the scoreboard.
+        self.on_late_vote = on_late_vote
         self.log_callback = log_callback
         self.prompt_kind = prompt_kind
         # v4.14.5.14-layer2-decouple (2026-05-20): when False, the
@@ -1166,6 +1333,12 @@ class ConsensusRunner:
         # when the canonical-model loop runs on a thread pool. Uncontended
         # (and therefore behavior-identical) under sequential dispatch.
         self._cb_lock = threading.Lock()
+        # v4.14.6.111-finalize-deadline: late (post-finalize) votes captured for
+        # audit. Guarded by a DEDICATED lock — NOT _cb_lock — so the reverted UI
+        # lock discipline is untouched (the UI never reads these; only worker
+        # late-callbacks append, on pool threads).
+        self._late_votes: list = []
+        self._late_lock = threading.Lock()
         self._results: dict = {
             'ts': '',
             'ticker': self.ticker,
@@ -1385,7 +1558,22 @@ class ConsensusRunner:
             # order, so the vote SET and ORDER (hence _finalize's first-
             # winning-vote verdict_target) are identical — only wall-clock and
             # arrival order change.
+            # v4.14.6.111: consensus rotates CAPABLE-FIRST. Order the panel's
+            # canonical models most-capable -> least (lower rank = smarter) so the
+            # strongest eligible voices anchor the verdict. Graceful DESCENT is
+            # already provided downstream: _rotation_pick_model skips cooled/429'd
+            # models per provider, and _try_backfill_substitute substitutes a
+            # bench provider when a whole canonical model is exhausted — so the
+            # panel never collapses to one pinned model. Stable sort keeps the
+            # prior order for equal-rank ties. Fail-open (any error -> unordered,
+            # byte-identical to pre-patch).
             ordered_models = list(run.all_canonical_models())
+            try:
+                import tm_model_capability as _cap_order
+                ordered_models.sort(
+                    key=lambda _cm: _cap_order.model_capability_rank(_cm))
+            except Exception:
+                pass
             total_models = len(ordered_models)
 
             if not _PARALLEL_CONSENSUS or total_models <= 1:
@@ -1440,38 +1628,81 @@ class ConsensusRunner:
                 # concurrency-safe rate limiter; RouterRun (RLock, distinct
                 # per-model keys) and provider health (own lock) are safe too.
                 from concurrent.futures import (
-                    ThreadPoolExecutor, as_completed)
+                    ThreadPoolExecutor, wait as _f_wait)
                 max_workers = min(
                     total_models, max(1, _PARALLEL_CONSENSUS_MAX_WORKERS))
+                _deadline = float(self.FINALIZE_DEADLINE_SEC)
                 self._log(
                     f"Consensus on {self.ticker}: dispatching "
                     f"{total_models} models concurrently "
-                    f"({max_workers} workers).", 'muted')
+                    f"({max_workers} workers); finalize deadline "
+                    f"{_deadline:.0f}s.", 'muted')
                 votes_by_idx: dict = {}
-                with ThreadPoolExecutor(
-                        max_workers=max_workers,
-                        thread_name_prefix='consensus') as ex:
-                    future_to_idx = {
-                        ex.submit(
-                            self._dispatch_canonical_model,
-                            cm, idx, total, run,
-                            providers_by_id, prompt, registry): idx
-                        for idx, cm in enumerate(ordered_models, 1)
-                    }
-                    # Collect as workers finish (a slow model never blocks a
-                    # fast one); failure of one worker is isolated.
-                    for fut in as_completed(future_to_idx):
+                # v4.14.6.111-finalize-deadline: do NOT use the executor as a
+                # context manager — its __exit__ runs shutdown(wait=True), which
+                # blocks on the slowest model (the 180s straggler) and is the
+                # multi-minute freeze this build removes. Instead wait() with a
+                # wall-clock deadline, finalize on whoever returned, mark the rest
+                # timed-out, and shutdown(wait=False) so the run thread proceeds.
+                ex = ThreadPoolExecutor(
+                    max_workers=max_workers, thread_name_prefix='consensus')
+                future_to_idx = {
+                    ex.submit(
+                        self._dispatch_canonical_model,
+                        cm, idx, total, run,
+                        providers_by_id, prompt, registry): idx
+                    for idx, cm in enumerate(ordered_models, 1)
+                }
+                done, not_done = _f_wait(
+                    list(future_to_idx.keys()), timeout=_deadline)
+                deadline_fired = bool(not_done)
+                # Votes that returned in time.
+                for fut in done:
+                    w_idx = future_to_idx[fut]
+                    try:
+                        vote = fut.result()
+                    except Exception as e:
+                        self._log(
+                            f"Consensus on {self.ticker}: model "
+                            f"worker #{w_idx} crashed: "
+                            f"{type(e).__name__}: {e}", 'red')
+                        vote = None
+                    if vote is not None:
+                        votes_by_idx[w_idx] = vote
+                # Models still out at the deadline → mark TIMED-OUT (a distinct
+                # panel state: did not answer in time — not a vote, not an
+                # error-skip). Attach a late recorder so a vote landing AFTER
+                # finalize is captured for audit WITHOUT touching the verdict.
+                if deadline_fired:
+                    self._log(
+                        f"Consensus on {self.ticker}: finalize deadline "
+                        f"({_deadline:.0f}s) reached — posting verdict on "
+                        f"{len(done)} returned; {len(not_done)} model(s) "
+                        f"timed out.", 'amber')
+                    for fut in not_done:
                         w_idx = future_to_idx[fut]
+                        cm_to = (ordered_models[w_idx - 1]
+                                 if 1 <= w_idx <= len(ordered_models) else '?')
+                        votes_by_idx[w_idx] = {
+                            'model': cm_to, 'canonical_model': cm_to,
+                            'ts': _now_iso(), 'direction': '',
+                            'duration_sec': _deadline,
+                            'skipped': True, 'timed_out': True,
+                            'reason_one_line':
+                                'no response within finalize deadline',
+                        }
                         try:
-                            vote = fut.result()
-                        except Exception as e:
-                            self._log(
-                                f"Consensus on {self.ticker}: model "
-                                f"worker #{w_idx} crashed: "
-                                f"{type(e).__name__}: {e}", 'red')
-                            vote = None
-                        if vote is not None:
-                            votes_by_idx[w_idx] = vote
+                            fut.add_done_callback(
+                                self._make_late_recorder(cm_to))
+                        except Exception:
+                            pass
+                # Release the pool WITHOUT waiting — an abandoned straggler
+                # finishes in the background (its late recorder fires) then the
+                # pool thread exits; no orphan, no UI block.
+                try:
+                    ex.shutdown(wait=False)
+                except Exception:
+                    pass
                 # Re-assemble in canonical-model order → identical to sequential.
                 # v4.14.5.69-tier2-backfill: scan the assembled votes
                 # for skips and try to substitute. Done AFTER the
@@ -1516,7 +1747,12 @@ class ConsensusRunner:
                             pass
                     final_votes.append((idx, vote))
                 for idx, vote in final_votes:
-                    if vote and vote.get('skipped'):
+                    # v4.14.6.111-finalize-deadline: skip backfill entirely when
+                    # the deadline fired — backfill is a SEQUENTIAL substitution
+                    # of skipped slots and would re-add exactly the post-deadline
+                    # latency this build removes. (timed_out votes are skips, so
+                    # the deadline_fired guard also leaves them untouched.)
+                    if (not deadline_fired) and vote and vote.get('skipped'):
                         sub = self._try_backfill_substitute(
                             dropped_vote=vote, slot_index=idx,
                             total=total, prompt=prompt,
@@ -2204,6 +2440,92 @@ class ConsensusRunner:
             self.signals_log.append(entry)
         except Exception:
             pass
+
+    def _make_late_recorder(self, canonical_model):
+        """v4.14.6.111-finalize-deadline: build an add_done_callback for a model
+        that missed the finalize deadline. When its future finally completes (the
+        straggler returns), record the vote for AUDIT ONLY — tagged
+        late_post_finalize — and NEVER:
+          - touch the already-posted verdict,
+          - mutate the finalized self._results['votes'] / the signals rollup,
+          - trigger the forward predictions recording (on_all_done already ran).
+        So the posted verdict is immutable and the scoreboard (predictions.jsonl)
+        can't be flipped by a late vote. The late vote stays in self._late_votes
+        (in-memory audit) + is surfaced via on_late_vote(model, vote) if the
+        caller wired a sink. It is deliberately NOT folded into the signals
+        consensus rollup, because a future signals→predictions backfill would
+        then re-ingest it into the scoreboard. Runs on a pool worker thread; uses
+        the dedicated _late_lock (never _cb_lock). Never raises."""
+        def _cb(fut):
+            try:
+                vote = fut.result()
+            except Exception:
+                return
+            if not isinstance(vote, dict):
+                return
+            if not (vote.get('direction') or '').strip():
+                return  # skip/error straggler — no usable vote to audit
+            late = dict(vote)
+            late['late_post_finalize'] = True
+            late['canonical_model'] = (late.get('canonical_model')
+                                       or canonical_model)
+            with self._late_lock:
+                self._late_votes.append(late)
+            # v4.14.6.111 (Item 9): persist the late vote AUDIT-ONLY to the
+            # append-only signals.jsonl, under a DISTINCT kind 'per_model_late'.
+            # That kind is NOT read by the read-bridge (compute_per_model_stats_
+            # from_signals only scores 'per_model_owned'/'per_model_fresh_buy')
+            # NOR by the verdict scoreboard (which reads predictions.jsonl) — so
+            # a late vote can NEVER enter scoring or the verdict; it only records
+            # the late arrival (with latency) for later analysis. No double-count:
+            # the late recorder is attached ONLY to models that missed the
+            # deadline (not_done futures), so an on-time voter never produces a
+            # second entry. Never raises.
+            try:
+                if self.signals_log is not None:
+                    _lentry = {
+                        'ticker': self.ticker,
+                        'kind': 'per_model_late',
+                        'path': self.path,
+                        'model': late.get('model', canonical_model),
+                        'canonical_model': (late.get('canonical_model')
+                                            or canonical_model),
+                        'response': late.get('response', ''),
+                        'duration_sec': late.get('duration_sec', 0),
+                        'direction': late.get('direction', ''),
+                        'target': late.get('target', ''),
+                        'stop_loss': late.get('stop_loss', ''),
+                        'confidence': late.get('confidence', ''),
+                        'ts': late.get('ts') or _now_iso(),
+                        'late': True,
+                        'post_deadline': True,
+                        'finalize_deadline_sec': float(
+                            self.FINALIZE_DEADLINE_SEC),
+                        'manual_trigger': True,
+                    }
+                    for k in ('provider_id', 'provider_preset',
+                               'actual_provider', 'actual_model_string',
+                               'lineup_version'):
+                        if late.get(k) is not None:
+                            _lentry[k] = late[k]
+                    self.signals_log.append(_lentry)
+            except Exception:
+                pass
+            try:
+                self._log(
+                    f"Consensus on {self.ticker}: LATE vote from "
+                    f"{canonical_model} "
+                    f"({(late.get('direction') or '?').upper()}) arrived after "
+                    f"finalize — recorded for audit only; verdict unchanged.",
+                    'muted')
+            except Exception:
+                pass
+            if self.on_late_vote:
+                try:
+                    self.on_late_vote(canonical_model, late)
+                except Exception:
+                    pass
+        return _cb
 
     def _finalize(self) -> None:
         """Save the rollup to signals.jsonl and call on_all_done."""

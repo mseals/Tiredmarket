@@ -126,13 +126,17 @@ def _parse_groq_429_body(body: str):
         err_type = err.strip().lower()
     if not err_type:
         return None
+    # v4.14.6.111-token-learner (Part A): also tag the RESOURCE axis (tokens vs
+    # requests) — already named in err_type, previously discarded.
     if ('tokens_per_minute_exceeded' in err_type
             or 'requests_per_minute_exceeded' in err_type):
         return {'type': 'per_minute', 'source': 'groq_body',
+                'resource': ('tokens' if 'tokens' in err_type else 'requests'),
                 'retry_after_seconds': 60}
     if ('requests_per_day_exceeded' in err_type
             or 'tokens_per_day_exceeded' in err_type):
         return {'type': 'daily', 'source': 'groq_body',
+                'resource': ('tokens' if 'tokens' in err_type else 'requests'),
                 'retry_after_seconds': _seconds_to_utc_midnight()}
     return None  # unrecognised error type → fall through
 
@@ -173,11 +177,17 @@ def _parse_openai_compatible_429_body(body: str):
     _blob = ' '.join((err_code, err_type, err_msg))
     if not _blob.strip():
         return None
+    # v4.14.6.111-token-learner (Part A): tag the RESOURCE axis. 'tokens' only
+    # when the body explicitly says tokens; else 'requests' (the common case);
+    # generic "rate limit" with no token word → requests (safer: tightens the
+    # request cap, which is what those bodies usually mean).
+    _res = 'tokens' if 'tokens' in _blob else 'requests'
     # Daily-quota signals first (stronger; longer cooldown).
     if any(s in _blob for s in (
             'requests_per_day', 'tokens_per_day', 'daily_limit',
             'per day', 'daily limit', 'daily quota')):
         return {'type': 'daily', 'source': 'openai_compat_body',
+                'resource': _res,
                 'retry_after_seconds': _seconds_to_utc_midnight()}
     # Per-minute / short-window signals.
     if any(s in _blob for s in (
@@ -185,6 +195,7 @@ def _parse_openai_compatible_429_body(body: str):
             'rate_limit_exceeded', 'ratelimitreached', 'rate_limit',
             'rate limit', 'too many requests', 'slow down')):
         return {'type': 'per_minute', 'source': 'openai_compat_body',
+                'resource': _res,
                 'retry_after_seconds': 60}
     return None  # unrecognised → fall through
 
@@ -774,8 +785,77 @@ def note_success_headers(family: str, meta: dict,
                         f'{r["today_calls"]} calls, 0 429s — at 90% '
                         f'of {old}, raising 20%', model=model)
             changed = new
+        # v4.14.6.111-token-learner (Part C): self-updating TOKEN table from the
+        # SAME response headers the provider already returns. Captures the
+        # provider's REPORTED token-minute (TPM) and token-day budget into
+        # learned fields that R1/R2 prefer over the hardcoded _PROVIDER_TPM —
+        # so the 8 providers without a hardcoded TPM auto-fill, and changing
+        # limits track automatically (ground truth from the provider). Clamped
+        # to sane positive bounds (ignore zero/garbage); never raises.
+        for _hk, _field, _lo, _hi in (
+                ('x-ratelimit-limit-tokens-minute', 'learned_tpm',
+                 100, 100_000_000),
+                ('x-ratelimit-limit-tokens-day', 'learned_token_budget_day',
+                 1000, 100_000_000_000)):
+            try:
+                _v = headers.get(_hk)
+                if _v is None:
+                    continue
+                _iv = int(float(_v))
+                if _lo <= _iv <= _hi and _iv != r.get(_field):
+                    _old = r.get(_field)
+                    r[_field] = _iv
+                    _log_change(family, _field, _old, _iv,
+                                f'provider header {_hk} reported {_iv}',
+                                model=model)
+                    changed = changed if changed is not None else _iv
+            except (TypeError, ValueError):
+                pass
         _save_locked()
         return changed
+
+
+def get_learned_tpm(family: str, model=None) -> Optional[int]:
+    """v4.14.6.111-token-learner: the provider-reported tokens/min limit
+    (header-sourced), or None. R2 prefers this over the hardcoded _PROVIDER_TPM.
+    """
+    if not family or family == 'unknown':
+        return None
+    try:
+        with _lock:
+            _load_locked()
+            fam_rec = _state.get(family)
+            if not isinstance(fam_rec, dict):
+                return None
+            rec = fam_rec.get(_model_key(model))
+            if not rec:
+                return None
+            v = rec.get('learned_tpm')
+            return int(v) if v and int(v) > 0 else None
+    except Exception:
+        return None
+
+
+def get_learned_token_budget_day(family: str, model=None) -> Optional[int]:
+    """v4.14.6.111-token-learner: the provider-reported tokens/DAY budget
+    (header-sourced), or None. R1 derives a day-cap = budget // avg-tokens/call
+    from this — the correct-axis replacement for a request-count learned from a
+    token-429."""
+    if not family or family == 'unknown':
+        return None
+    try:
+        with _lock:
+            _load_locked()
+            fam_rec = _state.get(family)
+            if not isinstance(fam_rec, dict):
+                return None
+            rec = fam_rec.get(_model_key(model))
+            if not rec:
+                return None
+            v = rec.get('learned_token_budget_day')
+            return int(v) if v and int(v) > 0 else None
+    except Exception:
+        return None
 
 
 def note_daily_429(family: str, trip_count: int, model=None) -> None:

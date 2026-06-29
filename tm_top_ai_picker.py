@@ -73,6 +73,10 @@ _burst_warned_this_session: set = set()
 # twice (live log 2026-05-23 08:13 / 16:46). This lock makes the
 # check-and-mark atomic.
 _burst_warn_lock = threading.Lock()
+# v4.14.6.111: dedup for the operational-fit (was "cold-start") notice. It used
+# to emit on EVERY dispatch burst and read like an error; now log at most once
+# per provider per session. Atomic check-and-mark reuses _burst_warn_lock.
+_coldstart_noted_this_session: set = set()
 
 
 def _maybe_warn_tight_burst(app, chosen: dict,
@@ -225,13 +229,14 @@ def _resolve_inference_mode(app) -> str:
     return 'api'
 
 
-def _picker_log(app, msg: str) -> None:
-    """Best-effort amber log. Falls back to stdout if app._log isn't
-    callable in the current context."""
+def _picker_log(app, msg: str, level: str = 'amber') -> None:
+    """Best-effort log (default amber). Falls back to stdout if app._log isn't
+    callable in the current context. `level` lets low-signal notices (e.g. the
+    operational-fit fallback) emit muted instead of shouting in the main log."""
     try:
         log = getattr(app, '_log', None) if app is not None else None
         if callable(log):
-            log(msg, 'amber')
+            log(msg, level)
             return
     except Exception:
         pass
@@ -832,7 +837,25 @@ def _rank_and_pick(app, eligible: list) -> Optional[dict]:
     scored = []
     db_conn = _get_db_conn(app)
     for e in eligible:
+        # v4.14.6.111: read accuracy under the SAME canonicalized key the writer
+        # stamps. The accuracy bridge keys rows by pred['model'], which is set at
+        # prediction time to display_label(provider) = canonicalize_model_label(
+        # provider.name). Reading the RAW prov.get('name') here meant a
+        # non-canonically-named provider ("My Groq", "Minstral", "Github",
+        # "Sambanova") never matched its own rows -> permanently cold-start, never
+        # learns to rank it. Mirror the write key via display_label. FAIL-OPEN:
+        # any fault / empty result falls back to the raw display_name (prior
+        # behavior). Cloud entries carry '_provider_dict'; locals keep raw.
         _src_id = (e.get('display_name') or '').strip()
+        try:
+            _prov = e.get('_provider_dict')
+            if isinstance(_prov, dict):
+                import tm_api_providers as _tmap_key
+                _canon = (_tmap_key.display_label(_prov) or '').strip()
+                if _canon:
+                    _src_id = _canon
+        except Exception:
+            pass  # keep the raw display_name key (unchanged behavior)
         ci_low = _query_wilson_ci_low(db_conn, _src_id)
         scored.append((e, ci_low))
 
@@ -897,12 +920,23 @@ def _rank_and_pick(app, eligible: list) -> Optional[dict]:
     if ranked_by_fit:
         chosen = ranked_by_fit[0]
         burst = _burst_for_entry(chosen)
+        _name = chosen.get('display_name', '?')
+        # v4.14.6.111: reword + dedup. This is a graceful fallback (rank by
+        # operational fit while decided-BUY accuracy is still accruing), NOT a
+        # failure — drop the alarming "cold-start / no accuracy data yet"
+        # phrasing, emit muted, and only once per provider per session (was once
+        # per dispatch burst). Selection is unchanged.
         try:
-            _picker_log(
-                app,
-                f"[picker] cold-start: "
-                f"{chosen.get('display_name', '?')} "
-                f"(burst={burst}, no accuracy data yet)")
+            with _burst_warn_lock:
+                _first = _name not in _coldstart_noted_this_session
+                if _first:
+                    _coldstart_noted_this_session.add(_name)
+            if _first:
+                _picker_log(
+                    app,
+                    f"[picker] ranking by operational fit — accuracy still "
+                    f"accruing ({_name}, burst={burst})",
+                    'muted')
         except Exception:
             pass
         return {
@@ -911,8 +945,8 @@ def _rank_and_pick(app, eligible: list) -> Optional[dict]:
             'registry_id': chosen.get('registry_id', ''),
             'display_name': chosen['display_name'],
             'reason': (
-                f"cold-start: no accuracy data yet "
-                f"(operational fit: burst={burst})"),
+                f"ranking by operational fit — accuracy still accruing "
+                f"(burst={burst})"),
         }
     return None
 

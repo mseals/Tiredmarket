@@ -35,8 +35,24 @@ FUNDAMENTALS_REFRESH_INTERVAL_SECONDS = 1800   # 30 min
 FILINGS_REFRESH_INTERVAL_SECONDS = 1800        # 30 min base tick
 FILINGS_TIER_CADENCE = {1: 1, 2: 4, 3: 12}     # ticks between runs
 FILINGS_TIER3_ROTATION_SLICES = 55
-FUND_STALE_DAYS = 90                           # quarterly cadence
+FUND_STALE_DAYS = 90                           # quarterly cadence (active filers)
 FUND_STALENESS_PER_CYCLE = 50                  # cold-rotation budget
+# v4.14.6.111-age-aware-fund-ttl: the 90d backstop re-pulls a ticker's
+# fundamentals once its last fetch ages past FUND_STALE_DAYS. For a name whose
+# NEWEST filing is already ancient (foreign/infrequent filers — Gold Fields,
+# Daxor: newest filing from 2011–2020), that means re-pulling the SAME stale
+# data every quarter forever, only to re-flag it ">18mo stale, not used as
+# current". These tiers stretch the recheck interval the OLDER the newest
+# filing is — never a permanent skip (so a new filing is still picked up within
+# a tier interval, and the EDGAR newly-filed index re-pulls immediately when
+# they DO file). Boundaries align with the existing 18-month stale flag
+# (_FUNDAMENTALS_MAX_AGE_DAYS=548) and the 5-year fundamentals retention.
+# Self-correcting: the tier is derived from the CURRENT newest-filing age each
+# cycle — when a stale name files, it drops back to the 90d tier automatically.
+FUND_STALE_FILING_DAYS = 548                    # ~18mo: the stale-flag boundary
+FUND_ANCIENT_FILING_DAYS = 1825                # ~5y: ancient (rarely-filing)
+FUND_BACKSTOP_DAYS_STALE = 180                 # newest filing 18mo–5y → 6-monthly
+FUND_BACKSTOP_DAYS_ANCIENT = 365              # newest filing >5y → yearly
 # v4.14.5.14-fundamentals-empty-cache: once every source confirms "no
 # fundamentals for this ticker" (router status 'empty'), cache that and skip
 # the ticker for this long instead of re-asking every 30-min cycle. Longer
@@ -60,6 +76,14 @@ INSIDER_FLOW_MAX_PER_CYCLE = 8
 # 30-min tick retries from scratch (recovered providers get another chance).
 FUNDFILE_RATE_LIMIT_PER_MIN = 55               # buffer under Finnhub's 60/min
 FUNDFILE_EXHAUSTION_BREAK = 3                  # consecutive no-source/failed → pause cycle
+
+# v4.14.6.111: Yahoo EARNINGS inter-call interval (seconds). This is the mutable
+# attribute the adaptive lane controller (tm_lane_pacing, lane 'yahoo_earnings')
+# tunes — seeded 3.0s and adjusted from observed 429/success outcomes. The
+# earnings seed loop honors THIS instead of the flat Finnhub-calibrated 55/min,
+# so earnings is paced to Yahoo's real .calendar ceiling. Fundamentals/filings
+# loops keep _make_pacer (FUNDFILE_RATE_LIMIT_PER_MIN) unchanged.
+_EARNINGS_MIN_INTERVAL_SEC = 3.0
 
 
 def _make_pacer():
@@ -259,6 +283,22 @@ def _have_to_period(ticker: str):
         return None
 
 
+def _last_attempted_filing(ticker: str):
+    """v4.14.6.111: return cache_metadata.last_attempted_filing for fundamentals
+    (the most-recent EDGAR filing_date we've already TRIED to ingest), or None.
+    Best-effort — any error → None → the index gate falls back to have_to_period
+    alone (its prior behaviour), so a read fault never freezes the rotation."""
+    try:
+        import tm_cache
+        rows = tm_cache.get_cache_metadata(ticker, 'fundamentals') or []
+        if not rows:
+            return None
+        v = tm_cache._row_get(rows[0], 'last_attempted_filing')
+        return str(v)[:10] if v else None
+    except Exception:
+        return None
+
+
 def _quarter_is_current(have_to_period: str, now_ts: float) -> bool:
     """True when the cached MAX(fiscal_period_end) is "current enough" —
     i.e. it lies within _FUND_CURRENT_QUARTER_GRACE_DAYS of today.
@@ -285,6 +325,35 @@ def _quarter_is_current(have_to_period: str, now_ts: float) -> bool:
         return age <= _FUND_CURRENT_QUARTER_GRACE_DAYS * 86400.0
     except Exception:
         return False
+
+
+def _fund_backstop_days(have_to_period, now_ts) -> int:
+    """v4.14.6.111-age-aware-fund-ttl: the backstop recheck interval (DAYS) for
+    a ticker, keyed on the age of its NEWEST filing (have_to_period).
+
+      newest filing < ~18mo   → FUND_STALE_DAYS (90, unchanged active cadence)
+      newest filing 18mo–5y    → FUND_BACKSTOP_DAYS_STALE   (180, 6-monthly)
+      newest filing > ~5y      → FUND_BACKSTOP_DAYS_ANCIENT (365, yearly)
+
+    NEVER a permanent skip — even the oldest tier rechecks yearly, and the
+    EDGAR newly-filed index re-pulls a name the moment it actually files. The
+    tier is recomputed from CURRENT have_to_period each cycle, so a stale name
+    that files drops straight back to the 90d tier (self-correcting, no stored
+    state). have_to_period None (pre-patch rows) → 90d default so coverage of
+    those still rotates exactly as before. Never raises."""
+    if not have_to_period:
+        return FUND_STALE_DAYS
+    try:
+        from datetime import datetime as _dt
+        age_d = (now_ts - _dt.fromisoformat(
+            str(have_to_period)[:10]).timestamp()) / 86400.0
+        if age_d > FUND_ANCIENT_FILING_DAYS:
+            return FUND_BACKSTOP_DAYS_ANCIENT
+        if age_d > FUND_STALE_FILING_DAYS:
+            return FUND_BACKSTOP_DAYS_STALE
+    except Exception:
+        pass
+    return FUND_STALE_DAYS
 
 
 def _edgar_in_backoff() -> bool:
@@ -365,12 +434,38 @@ def _earnings_seed_cycle(app, now_ts: float) -> dict:
             return s
         ttl = getattr(tm_discover, 'EARNINGS_CACHE_TTL_SECONDS', 24 * 3600)
         picked = 0
-        # v4.14.5.14-cascade-fixes (Fix 2): pace the live earnings fetches
-        # (<=55/min) and stop the cycle after FUNDFILE_EXHAUSTION_BREAK
-        # consecutive 'failed' results (real source faults). A 'failed' here
-        # is an infra fault; an 'empty' (no upcoming earnings) is the common
-        # honest case and does NOT count toward the breaker. Per-cycle only.
-        _throttle = _make_pacer()
+        # v4.14.5.14-cascade-fixes (Fix 2): pace the live earnings fetches and
+        # stop the cycle after FUNDFILE_EXHAUSTION_BREAK consecutive 'failed'
+        # results (real source faults). A 'failed' here is an infra fault; an
+        # 'empty' (no upcoming earnings) is the common honest case and does NOT
+        # count toward the breaker. Per-cycle only.
+        # v4.14.6.111: pace via the adaptive 'yahoo_earnings' lane interval
+        # (_EARNINGS_MIN_INTERVAL_SEC, controller-tuned) instead of the flat
+        # Finnhub-calibrated 55/min, and feed each outcome back to tm_lane_pacing
+        # so the controller tightens on a rate-limit and relaxes when clean. The
+        # reactive per-source cooldown (tm_data_providers _DATA_COOLDOWN_CURVE)
+        # still applies as a backstop — this proactive pace just prevents most
+        # 429s from happening in the first place. Re-reads the module global each
+        # call so a mid-cycle controller adjustment takes effect immediately.
+        try:
+            import tm_lane_pacing as _lp_earn
+        except Exception:
+            _lp_earn = None
+        _earn_last = [0.0]
+
+        def _throttle():
+            try:
+                iv = float(globals().get('_EARNINGS_MIN_INTERVAL_SEC', 1.09))
+            except Exception:
+                iv = 1.09
+            now = time.time()
+            gap = now - _earn_last[0]
+            slept = False
+            if gap < iv:
+                time.sleep(iv - gap)
+                slept = True
+            _earn_last[0] = time.time()
+            return slept
         _consec = 0
         for tk in uni:
             if picked >= EARNINGS_SEED_PER_CYCLE:
@@ -423,6 +518,21 @@ def _earnings_seed_cycle(app, now_ts: float) -> dict:
             except Exception:
                 s['errors'] += 1
                 _st = 'failed'
+            # v4.14.6.111: feed the outcome to the adaptive yahoo_earnings lane.
+            # 'ok'/'empty' = a clean call (relax); 'failed' = treat as a throttle
+            # signal (tighten). get_earnings_with_status collapses rate_limit into
+            # 'failed' (status is only ok/empty/failed), so we mark failed as
+            # was_429 — a deliberately CONSERVATIVE choice for this low-urgency
+            # lane: over-pacing earnings is harmless, under-pacing is what trips
+            # the Yahoo cooldown. The controller relaxes again after clean windows.
+            if _lp_earn is not None:
+                try:
+                    _lp_earn.record_outcome(
+                        'yahoo_earnings',
+                        success=(_st in ('ok', 'empty')),
+                        was_429=(_st == 'failed'))
+                except Exception:
+                    pass
             if _st == 'failed':
                 _consec += 1
                 if _consec >= FUNDFILE_EXHAUSTION_BREAK:
@@ -546,9 +656,18 @@ def refresh_fundamentals_universe(app, force_mode=None) -> dict:
 
     s['index_hits_total'] = len(newly_filed)
 
-    # Diff against have_to_period: queue ONLY tickers whose filing is
-    # newer than the cached fiscal_period_end.
+    # Diff against MAX(have_to_period, last_attempted_filing): queue ONLY
+    # tickers whose filing is newer than anything we've already INGESTED or
+    # ATTEMPTED. v4.14.6.111-last-attempted-filing: the last_attempted guard is
+    # what breaks the perpetual re-queue loop — a delinquent/foreign-20-F/
+    # amended filer (DXR/GFI/…) whose adapter-extracted have_to_period is FROZEN
+    # in the past was re-queued on every cycle (filing_date always > the stuck
+    # have_to_period). Now, once we've attempted that filing, last_attempted_
+    # filing == filing_date, so it's skipped until a genuinely NEWER filing
+    # lands. Never permanent (a newer filing clears the gate); self-correcting
+    # (an extractable new filing advances have_to_period back to normal).
     stale = []
+    _index_filing: dict = {}   # tk -> filing_date we're attempting (for stamping)
     for tk, filing_date_iso in newly_filed.items():
         if tk in earnings:
             continue
@@ -556,12 +675,36 @@ def refresh_fundamentals_universe(app, force_mode=None) -> dict:
             s['cached_empty_skipped'] += 1
             continue
         htp = _have_to_period(tk)
-        if htp:
-            # Both 'YYYY-MM-DD' -> lexicographic compare is valid.
-            if str(htp)[:10] >= filing_date_iso[:10]:
-                s['filing_current_skipped'] += 1
-                continue
+        la = _last_attempted_filing(tk)
+        # Lexicographic compare on 'YYYY-MM-DD' is valid. Gate on the LATER of
+        # the two so an already-attempted (even un-advancing) filing is skipped.
+        guard = max((str(htp)[:10] if htp else ''),
+                    (str(la)[:10] if la else ''))
+        if guard and guard >= filing_date_iso[:10]:
+            s['filing_current_skipped'] += 1
+            # v4.14.6.111 (Item 5): make the build-82 deferral AUDITABLE. When
+            # the skip is driven by last_attempted_filing (we already TRIED this
+            # filing and have_to_period couldn't advance — the stuck delinquent/
+            # foreign-20-F filer) rather than have_to_period already covering it,
+            # emit ONE concise [fundfile] line per name per cycle (this loop runs
+            # once per refresh cycle) so the backoff is VISIBLE in the log
+            # instead of inferred from absence. Log-only — the guard logic
+            # (build-80/82) is unchanged.
+            la10 = str(la)[:10] if la else ''
+            htp10 = str(htp)[:10] if htp else ''
+            if (la10 and la10 >= filing_date_iso[:10]
+                    and (not htp10 or htp10 < filing_date_iso[:10])):
+                try:
+                    app._log(
+                        f"[fundfile] {tk} fundamentals deferred — filing "
+                        f"{filing_date_iso[:10]} already attempted "
+                        f"(have_to_period {htp10 or 'none'}; next on a newer "
+                        f"filing)", 'muted')
+                except Exception:
+                    pass
+            continue
         stale.append(tk)
+        _index_filing[tk] = filing_date_iso[:10]
         if len(stale) >= FUND_STALENESS_PER_CYCLE:
             break
     s['index_queued'] = len(stale)
@@ -574,7 +717,6 @@ def refresh_fundamentals_universe(app, force_mode=None) -> dict:
         uni = sorted(_scope._universe(app))
     except Exception:
         uni = []
-    cutoff = now - FUND_STALE_DAYS * 86400
     pre_backstop = len(stale)
     if len(stale) < FUND_STALENESS_PER_CYCLE:
         in_queue = set(stale)
@@ -588,6 +730,10 @@ def refresh_fundamentals_universe(app, force_mode=None) -> dict:
             if htp and _quarter_is_current(htp, now):
                 s['filing_current_skipped'] += 1
                 continue
+            # v4.14.6.111-age-aware-fund-ttl: stretch the recheck interval for
+            # ancient-filing names (DXR/GFI-class) so we stop re-pulling the
+            # same decade-old data every 90 days. Active filers stay at 90d.
+            cutoff = now - _fund_backstop_days(htp, now) * 86400
             if lr is None or lr < cutoff:
                 stale.append(tk)
                 in_queue.add(tk)
@@ -656,7 +802,22 @@ def refresh_fundamentals_universe(app, force_mode=None) -> dict:
                 _fetched_this_cycle.add(tk)
             except Exception:
                 pass  # fail-safe
-            if not _one(tk, 'staleness_triggered'):
+            _cont = _one(tk, 'staleness_triggered')
+            # v4.14.6.111-last-attempted-filing: stamp the filing date we just
+            # ATTEMPTED for index-queued names (whether or not have_to_period
+            # advanced — the point is to not re-try this same filing). The
+            # upsert also refreshes last_refresh_at, which settles any lingering
+            # lr-is-None backstop backlog for the same ticker. Backstop-queued
+            # names (not in _index_filing) are unaffected.
+            _fd = _index_filing.get(tk)
+            if _fd:
+                try:
+                    import tm_cache as _tmc_stamp
+                    _tmc_stamp.upsert_cache_metadata(
+                        tk, 'fundamentals', last_attempted_filing=_fd)
+                except Exception:
+                    pass
+            if not _cont:
                 s['exhausted'] = True
                 break
     if s['exhausted']:

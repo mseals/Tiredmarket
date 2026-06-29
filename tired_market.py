@@ -27,6 +27,10 @@ import collections
 import json
 import sqlite3
 import time
+# v4.14.6.110: launch->ready timing anchor (diagnostic). Set as early as possible
+# (right after `import time`) so the heavy imports below + App construction all
+# count toward the startup_to_ready total logged at the end of App.__init__.
+_BOOT_T0 = time.perf_counter()
 import math
 import random
 import re
@@ -39,7 +43,9 @@ from io import StringIO
 from urllib.request import urlopen, Request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import yfinance as yf
+# yfinance is lazy-imported below (proxy `yf` defined alongside pd/np) — it is
+# unused on the synchronous launch path; deferring it (with pandas/numpy/bs4)
+# keeps ~1.3s of heavy imports off cold startup. See PANDAS_LAUNCHPATH_FINDINGS.md.
 
 # ── AI integration (optional — if missing, AI features simply don't appear) ──
 # v4.14.5.14-ollama-purge-3c (Ollama exit Step 3c): `import tm_ai` (the Ollama
@@ -172,14 +178,58 @@ except ImportError:
 # no fetcher is wired through here yet. See tm_cache.py for schema.
 import tm_cache
 
-import pandas as pd
-import numpy as np
+# ── Lazy heavy-library proxies (v4.14.6.109 startup-import deferral) ──
+# yfinance/pandas/numpy are UNUSED on the synchronous launch path (top-level body
+# + App.__init__ + _build, up to mainloop); every real pd./np./yf. call lives in
+# a deferred daemon (fills, discovery, news) that starts >=5s after the window is
+# up (see PANDAS_LAUNCHPATH_FINDINGS.md). Imported eagerly they cost ~1.3s cold.
+# These proxies bind the SAME module-global names (yf/pd/np) so every existing
+# call site works unchanged; the real module is imported, exactly once, on first
+# attribute access — which only happens in the deferred code.
+import importlib
+import importlib.util
 
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
+
+class _LazyModule:
+    """Import-on-first-attribute-access stand-in for a module. Keeps the heavy
+    library (yfinance/pandas/numpy) off the synchronous launch path. After the
+    first access the real module is cached and delegated to directly; only the
+    first access takes the lock (double-checked) so concurrent daemon threads
+    first-touching the proxy import it once with no race. `pd.DataFrame` /
+    `np.ndarray` resolve to the REAL classes via __getattr__, so
+    isinstance(x, pd.DataFrame) works once that attribute has been accessed."""
+
+    def __init__(self, name):
+        object.__setattr__(self, '_name', name)
+        object.__setattr__(self, '_mod', None)
+        object.__setattr__(self, '_lock', threading.Lock())
+
+    def _load(self):
+        mod = object.__getattribute__(self, '_mod')
+        if mod is None:
+            with object.__getattribute__(self, '_lock'):
+                mod = object.__getattribute__(self, '_mod')
+                if mod is None:
+                    mod = importlib.import_module(
+                        object.__getattribute__(self, '_name'))
+                    object.__setattr__(self, '_mod', mod)
+        return mod
+
+    def __getattr__(self, attr):
+        # __getattr__ fires only for names NOT found normally, so the proxy's own
+        # _name/_mod/_lock (set via object.__setattr__) never route through here.
+        return getattr(self._load(), attr)
+
+
+yf = _LazyModule('yfinance')
+pd = _LazyModule('pandas')
+np = _LazyModule('numpy')
+
+# bs4 binds a CLASS (BeautifulSoup), not a module, so a module proxy doesn't fit.
+# Defer it the same way: availability is checked WITHOUT importing it (find_spec
+# does not execute the module), and each consumer does a function-local
+# `from bs4 import BeautifulSoup` after its `if not HAS_BS4` guard.
+HAS_BS4 = importlib.util.find_spec('bs4') is not None
 
 # Sound alerts — Windows built-in
 try:
@@ -494,7 +544,7 @@ except Exception:
 
 # ─── App version / disclaimer ─────────────────────────────────────────────────
 STABILITY_FIX_CUTOFF_TIMESTAMP = 1778942236  # v4.14.5.1 ship moment (unix). Predictions made at/after this are "post-stability-fix" — accuracy surfaces should default to this cohort so churn-era results don't poison new numbers.
-APP_VERSION = "4.14.6.109"  # v4.14.5.19-accuracy-weighted-consensus (2026-05-28) Wires per-model Wilson-lower-bound accuracy into the consensus verdict math. Pre-patch: tier-M scores were measured (tm_source_accuracy v4.14.3, Wilson 95% CI from closed BUY predictions) and DISPLAYED in Track Record but never consumed in the verdict — every model's vote counted equally, regardless of track record. Now each vote is weighted by its model's Wilson lower bound (confidence_band_low, 0-100), normalized to 0-10, clamped to [1.0, 9.0]: proven model rises toward 9 (loud, never sole — ceiling 9 < two neutrals' 10, so one accurate model can't unilaterally override), poor model floors at 1 (quiet, never silenced — protects perspective-diversity votes), no/thin data (n<10) sits at neutral 5 (cold-start safe — new install with every model n=0 sees weighted tally == flat tally exactly until predictions resolve). Missing/error -> 5.0 neutral, never raises, never 0. Strictly positive multipliers — low accuracy means "trust less," NEVER "trust the opposite" (no inverse/contrarian weighting; separate someday-maybe). All three consensus paths weighted: owned-position (refresh-triggers ConsensusRunner), fresh-BUY scan (Layer 1 prefilter_history scoring), recommend/lookup. Architecture: ConsensusRunner stays DB-free — App._consensus_weight_kwargs(models) pre-fetches {model: weight} via tm_source_accuracy.build_weight_map() under self.db.lock and splats it into the runner constructor; _finalize calls tm_source_accuracy.weighted_tally() to compute BOTH raw and weighted summaries and attaches them to the result envelope so display sites show both lines (raw tally honest about vote counts; weighted line honest about data maturity with "limited data — N/M models" caveat). cfg['use_accuracy_weighted_consensus']=True (default); False+restart = byte-identical flat-tally rollback. Change 6 bundled: Track Record per-model matrix filters out Ollama/local rows (cloud-only post-v4.14.5.14-ollama-purge); display-only filter, predictions.jsonl rows preserved as historical record (rule: colon in model name = Ollama-shape). Verify-before-build discipline applied: resolver health spot-checked (zero stale-open BUYs, max open age 26d well within timeframes, 215 target_hit+stop_hit predictions feeding Wilson CI), Wilson conservatism confirmed (n<10 returns DEFAULT_WITHIN_TIER=5; thin 2/2 doesn't spike). Lessons: (1) measurement and consumption were disconnected for months (tier-M built v4.14.3, consumed v4.14.5.19) — building the measure-er and never wiring the consumer is a real failure mode; this closes it; (2) ConsensusRunner stayed pure — accuracy weights pre-fetched and passed in, not queried inside the consensus thread; (3) foundation verified before building (resolver, Wilson, cold-start) — same investigation-first discipline that caught EDGAR registry today, applied to a new feature instead of a bug. APP_VERSION_LEGACY=4.14.5.18-priority-promotion-overlay"  # v4.14.5.18-priority-promotion-overlay (2026-05-28) Permanent fix for the EDGAR-fundamentals-stripped-at-boot bug: tm_data_providers.Registry.load() previously did `existing.priorities = prof.priorities` at the persisted-state overlay step (~line 567), wholesale-replacing the code-seeded priorities dict with whatever the saved JSON held. The v4.14.5.15 EDGAR promotion set fundamentals=1 in default_profiles() (correct) but data/data_providers.json still carried the pre-promotion `null` (predated the patch), so every boot silently stripped the promotion — EDGAR never appeared in Registry.serving('fundamentals'), and the daemon went dark whenever Yahoo+Finnhub throttled (NTAP at 10:32 on 2026-05-28 the live proof; static call-graph investigation missed it because the bug lived in load-time STATE, not call-graph code). Manual verify edit (flip null->1 on disk, restart, observe one cycle) confirmed the diagnosis: ~30 consecutive `[edgar] fundamentals fetched` lines through a Yahoo cooldown at 11:30, including NTAP and MRVL. This patch codifies the rule structurally: per-(provider, data_type) merge — persisted non-null OVERRIDES (user reorders are preserved), persisted None KEEPS the seeded value (no demote), both None stays None. Per-key not per-provider — fixes the class of bug for every future priority promotion, not just EDGAR. Self-heals on next save() because the corrected in-memory value is what gets persisted. the user's machine (manual verify edit already applied) sees a no-op merge (persisted=1, seeded=1 -> 1); the patch's value is for fresh installs / any stale-null config / any future promotion. Lessons codified: (1) for any feature whose behavior depends on persisted state, verify on-disk values match code defaults — a call-graph trace alone can prove the code is wired right and miss that disk de-energizes it at load; (2) when a fix's mechanism isn't 100% certain, the cheap manual verify edit (flip one value, watch one live cycle) converts an assumption to a fact before the patch ships. APP_VERSION_LEGACY=4.14.5.17-empty-content-retry"  # v4.14.5.17-empty-content-retry (2026-05-28) Fix Zhipu (and any provider) being permanently dropped from consensus when it returns HTTP 200 with an empty `content` body. Static investigation proved the observed FISV symptom was NOT a timeout — Zhipu replied in well under 180s with an empty JSON envelope, got classified OUTCOME_FATAL by classify_failure(), the existing retry loop skipped it, and the vote was dropped (one minute later, an identical call returned a full 69s response — provider-side flake, not a code-side timeout). Change 1: classify_failure() in tm_ai_router.py now returns OUTCOME_TRANSIENT for error_text matching 'empty content' / 'empty choices' substrings (the exact ProviderError strings raised at tm_api_providers.py:748,752), so the existing transient retry loop (cap=2 retries, backoffs (1s, 3s) — _TRANSIENT_BUDGET in tm_consensus.py:1078-1079 and tm_api_providers.py) re-asks before giving up. After cap exhaustion, vote-as-error is recorded exactly as the pre-patch FATAL path did — graceful degrade preserved. Substring-specific so genuine 4xx (auth/404/malformed) still classify FATAL unchanged. Genuine TimeoutError and 5xx still TRANSIENT unchanged. Applies to all providers (empty body is provider-agnostic). Change 3 (plumbing-only, ships zero behavioral change): tm_consensus.py:1604 now reads provider.get('timeout_seconds', PER_MODEL_TIMEOUT_SEC) at dispatch; no provider sets a custom value today — every existing provider still on 180s. Future-proofing for a genuinely-slow provider. No UI 'slow provider' note shipped: investigation showed Zhipu isn't slow, it occasionally returns empty, so that label would be inaccurate. Lesson: investigate the mechanism before patching the symptom — geography (China-hosted endpoint) made 'slow' plausible but it was wrong; the fix was one branch in the classifier, not a timeout knob. APP_VERSION_LEGACY=4.14.5.16-sec-contact-prompt"  # v4.14.5.16-sec-contact-prompt (2026-05-28) Close-out of the EDGAR primary arc: 4.14.5.15 built the SEC contact READER (env var → generic fallback) but left the local-config slot as a comment stub. This patch wires the reader's (2) slot to read data/config.json['sec_contact_email'] (lenient: must contain '@'; falls through to generic fallback on garbage), and adds a one-time, disclaimer-gated, themed-Toplevel first-run prompt that writes that field — mirroring the existing _v415_check_first_launch_picker self-rescheduling after-loop. the user's machine (TIREDMARKET_SEC_CONTACT env set) silently flips the completed flag and never sees the dialog; only fresh public installs prompt. Blank/Skip is a respected choice (sets completed, falls to generic fallback). Resolution order is now env var → cfg['sec_contact_email'] → generic fallback. Privacy ledger updated: sec_contact_email is local-only; only ever leaves the machine in the SEC User-Agent header on EDGAR requests. Lesson: when an external API requires operator identity, ask each operator for their own — don't ship the developer's. Reader and writer are separate concerns and can land in separate patches. APP_VERSION_LEGACY=4.14.5.15-edgar-fundamentals-primary"  # v4.14.5.15-edgar-fundamentals-primary (2026-05-28) Promoted SEC EDGAR XBRL CompanyFacts to keyless PRIMARY for the router's fundamentals chain (was a side path the router couldn't call). New tm_data_adapter_edgar.adapter() 'fundamentals' branch reuses the existing fetch_fundamentals() (bulk companyfacts, ~99.5% universe coverage, 2/sec self-throttle) + CIK map for company_name; returns Yahoo's exact snapshot key-set with statement-derived fields populated and the four market-derived fields (market_cap/pe_ratio/beta/dividend_yield) + sector/industry left None so the existing _v415_overlay_derived_fundamentals fills them from Yahoo only when actually needed. Router priorities: EDGAR None→1, Yahoo 1→2, Finnhub 2→3. PLUS: replaced the placeholder UA 'research@example.com' (SEC soft-block risk at the new ~50x call volume) with a resolver: env var TIREDMARKET_SEC_CONTACT → generic fallback ('open-source-research-tool (no contact configured)', no email/personal data). the user's machine sets the env var via setx so SEC sees a real warn-before-block contact. Audit _audit_edgar_fundamentals_promotion.py. // v4.14.5.14-yahoo-ratelimit-fix (2026-05-28) URGENT — fixed the false-empty cache pollution from Yahoo IP rate-limits. Cascade Fix 1 (Yahoo's fundamentals/earnings branches swallow ALL exceptions to None) + yesterday's empty-cache (7-day skip on status='empty') interacted: a yfinance YFRateLimitError (Yahoo throttling the IP) was silently converted to None → router status 'empty' → cached as confirmed-empty for 7 days. 104 false-empties already written this morning (incl. MRVL/NTAP/NTNX/NCNO — all real companies with rich historical fundamentals on disk). Fix: new _is_yfinance_rate_limit(e) helper (exact YFRateLimitError class check + string sniff for yfinance renames) in tm_data_adapter_yahoo; both fundamentals and earnings branches now RAISE RateLimitError (the router's own class, which Cascade Fix 3's classify_429/cooldown already handles) on rate-limit, so the router records status='failed' (NOT 'empty') and the empty-cache correctly skips it. Non-rate-limit yfinance exceptions still degrade to None, preserving Cascade Fix 1's no-red-demotion intent. Plus a one-shot backfill of fundamentals_status (date-scoped DELETE) removed all 104 false-empties — next cycle will recheck them. Audit _audit_yahoo_ratelimit_classification.py. // v4.14.5.14-db-concurrency (2026-05-28) ROOT-CAUSE FIX for the 'Source-weight bridge error: bad parameter or other API misuse' (SQLITE_MISUSE) race. app.db.conn was opened check_same_thread=False (suppressing Python's same-thread guard) but SQLite itself still requires serialization — Database.lock existed but was DEAD CODE (the _exec/_query/_query_one helpers that took it had zero callers). 15 background-thread call sites (8 in tm_queue_runner, 7 in tm_event_triggers) plus the bridge all reached app.db.conn directly without locking, racing on the same Connection. Fix: (1) Database.lock is now an RLock (reentrant, belt-and-suspenders against any nested helper). (2) New _db_lock(app) context manager in tm_queue_runner + tm_event_triggers; every _conn(app) caller wraps its SQL block in `with _db_lock(app):` (AST-guided bulk-wrap, all 15 verified). (3) Both bridge call sites wrap in `with self.db.lock:`. (4) tm_source_accuracy._stamp_run() moved from the END of the bridge to right after the cooldown check passes — closes a TOCTOU window where a second concurrent caller (auto-refresh tick during the startup closer's run) could race in. AI router untouched; tm_cache.py untouched (its per-call connection pattern is independent and safe). Audit _audit_db_concurrency_fix.py. No backfill needed (the next successful bridge run self-heals any drift within 5-10 min). // v4.14.5.14-fundamentals-empty-cache (2026-05-27) Applied the earnings empty-cache pattern to fundamentals: when every source confirms 'no fundamentals for this ticker' (router status 'empty'), tm_fundfile_fetcher caches it in a new tm_cache `fundamentals_status` table (ticker/status/as_of, mirrors `earnings`) and the staleness rotation SKIPS that ticker for FUND_EMPTY_TTL_DAYS=7d — killing the per-cycle 'No fundamentals data for X' spam (COFS/CPF/CRML…). Skip happens in the stale-build (before the budget, so the 50/cycle goes to tickers that might have data); earnings-TRIGGERED tickers bypass the cache (new quarter may add data); an 'ok' result clears the marker; 'failed'/'no_source' are NOT cached (retry). Summary gains cached_empty_skipped (one line replaces 40+). Files: tm_cache.py (table + get/upsert/get_all_fundamentals_status), tm_fundfile_fetcher.py (TTL + _load_fresh_empty_fundamentals + _mark_fundamentals_status + loop skip + status writes + summary). Audit _audit_fundamentals_empty_cache.py 13/13. // v4.14.5.14-classify429-data-side (2026-05-27) Cascade Fix 3: wired classify_429 (the AI-side per-minute/daily 429 classifier) into the DATA router so transient rate-limits self-recover. tm_data_providers.Registry.record_failure no longer mis-learns a daily cap from any 429 (the old observed_limits['calls_per_day']=calls_today*0.95 that treated a per-MINUTE 429 as a permanent daily wall is REMOVED); instead it classifies the 429 and applies a TIME-BASED cooldown (per-minute/unknown → 60s/5m/30m escalating, auto-clearing; daily → until midnight or honored Retry-After) held in an in-memory Registry._cooldown. Generic non-429 failures only cool down after 3-in-a-row (preserving 1-2 blip tolerance), then escalate. _is_eligible now gates on cooldown expiry + declared daily cap, NOT health=='red' (the stuck-red bug — red only cleared on a success the provider was never allowed to attempt); health is now display-only. record_success clears the cooldown (trial succeeded → recovered). record_failure returns cooldown info; the router logs it amber ('<provider> per-minute — cooldown 60s, retry at HH:MM:SS'). AI-side classify_429 usage untouched. Audit _audit_cascade_fix_3_classify429.py. // v4.14.5.14-gui-cleanup-h (2026-05-27) Watchlist moved from the left column to a dedicated Watch window (new 'Watch' toolbar button between Look Up and Stop), mirroring Track Record -> Performance. Removed the left-column WATCHLIST panel (left column is back to just the Portfolio panel; the 4 Phase D/F panel methods replaced). New window (_make_styled_toplevel, single-instance lift): add-ticker input row + scrollable list of COLLAPSIBLE cards (default collapsed, Portfolio-card style). Collapsed header: chevron + verdict dot + ticker + TRADABLE + price + change% + age + 'AI: <verdict>' + Remove. Expanded body: aggregate consensus (gui_watch_consensus — one vote per canonical model: 'N BUY · N WATCH · N AVOID (M models, last analyzed …)'; NOT per-model — that's in the Performance matrix) + plan target/stop + 'Look Up fresh' (prefills the Look Up window) + 'Add to Holdings' (prefills the Portfolio add-form via its existing _form_ticker StringVar). Ticker-strip WATCHED section + backend Watchlist unchanged; refresh wiring repointed to the window (no-op when closed). Audit _audit_gui_cleanup_phase_h.py. // v4.14.5.14-indicator-honesty (2026-05-27) Persistent activity indicator now binds to REAL state, not a stale log echo. gui_activity_label gained (in_flight, msg_age, stale_after=10): a genuine in-flight AI call (holdings_window _consensus_running/_discover_running) always shows 'Analyzing'; the most-recent log line is mapped only while fresh (<10s) — an older line is a finished echo so the indicator falls back to Idle/Paused/Loading; and the generic 'consensus'/'analyz' substring fallback (which falsely showed 'Analyzing' on completion echoes like 'analyzed 1 via Groq' at idle) was REMOVED. _log now stamps _last_activity_at; the _set_status_mode indicator branch passes in_flight + msg_age. Phase C audit expanded 42->50 (8 honesty cases). // v4.14.5.14-gui-cleanup-f (2026-05-27) Watchlist panel REBUILT as a visual peer of the Portfolio panel (Phase D shipped a thin row; original design said 'a list similar to portfolio'). _build_watchlist_row now renders a bordered CARD mirroring tm_portfolio_panel._build_tradable_card styling (built in-style, NOT copied — that module stays Do-Not-Touch): line 1 = verdict-colored dot + ticker (accent 10b) + green TRADABLE pill + price + change% + right-packed age + Remove; line 2 = 'AI: <verdict>' (or 'AI: not yet analyzed' when no prediction on record). Header now matches PORTFOLIO typography (accent 10 bold); empty state is a bordered card-height block. Method names / data sources (get_recent_for_ticker, cache.quote, gui_watchlist_dot, gui_short_age) / refresh wiring (_schedule_ticker_refresh tick + add/remove) / ticker-strip WATCHED section all unchanged. Audit _audit_gui_cleanup_phase_f.py. // v4.14.5.14-watch-cerebras (2026-05-27) Watch-button regression fix + Cerebras model fix: (1) the Phase D "Add to watchlist" button lived in _render_quick_result, which is NEVER called — so the watchlist had no working populate path. Added a persistent "Add to watchlist" button to the LIVE Look Up input row (_on_watch_click; disabled until a ticker is typed; calls Watchlist.add → record_user_signal, refreshes the WATCHLIST panel + ticker strip immediately). (2) Deleted the dead _render_quick_result (+ nested _add_to_watchlist), breadcrumb left. (3) data/api_providers.json Cerebras llama3.1-8b → gpt-oss-120b (stale Llama id 404'd; live /models showed only gpt-oss-120b + zai-glm-4.7 remain, so the llama-3.3-70b fallback would also 404 — picked gpt-oss-120b: live, strong, distinct canonical model). Audit _audit_watch_button_and_cerebras_fix.py. // v4.14.5.14-cascade-fixes (2026-05-27) Earnings+fundamentals cascade fixes (1/2/4 from the investigation): (1) tm_data_adapter_yahoo fundamentals branch returns None on a yfinance hiccup instead of raising (mirrors the earnings-branch hardening) so a transient hiccup no longer demotes Yahoo to health=red session-wide; (2) tm_fundfile_fetcher paces the fundamentals + earnings seed loops at <=55/min (FUNDFILE_RATE_LIMIT_PER_MIN, news-fetcher parity) and breaks the cycle after FUNDFILE_EXHAUSTION_BREAK=3 consecutive no-source/failed results (per-cycle only; next 30-min tick retries) — kills the 40+ "no eligible source" burst; (4) tm_data_router reserves the red "All sources failed" log for status=='failed' (real fault) and logs honest 'empty' (every source reached, no data — e.g. no upcoming earnings) as a quiet muted "No <type> data ... from any source" line. Fixes 3 (classify_429 on data side) + 5 (per-data-type health) deferred. Audit _audit_earnings_fundamentals_cascade_fix.py 17/17. // v4.14.5.14-gui-cleanup-e (2026-05-27) Hamburger removal + Settings consolidation: the ≡ utility menu (Help/Settings/AI Providers/Data Providers/Exit) is gone, replaced by a direct ⚙ Settings button in the same rightmost toolbar slot (single click → _show_settings, no menu); _show_utility_menu removed; AI Providers + Data Providers became link-out sections INSIDE the Settings dialog (Open AI Providers... / Open Data Providers... buttons calling the unchanged standalone Toplevels); Help dropped from the UI (Teacher AI will own it — _show_help kept as dead code per Phase A precedent); Exit dropped (the window X already runs the same graceful _on_close). NO "API button" existed to remove — the top-bar "API" is the static _ai_mode_pill cloud-only mode tag (kept, on the Do-Not-Touch badge cluster). Look Up no-providers hint repointed "☰ menu → API Providers" → "⚙ Settings → Open AI Providers". Audit _audit_gui_cleanup_phase_e.py. // v4.14.5.14-gui-cleanup-d (2026-05-27) Watchlist UI: new WATCHLIST panel pinned at the bottom of the left column (its own holder frame below the whole Portfolio panel — tm_portfolio_panel.py untouched), compact one-line rows (verdict dot via gui_watchlist_dot / ticker / price / change% / verdict age via gui_short_age / Remove button), empty-state pointing to Look Up; top ticker strip restructured into PORTFOLIO (always) + WATCHED (only when non-empty) sections via gui_ticker_strip_sections, cell-build extracted to _build_ticker_cell (no scroll added — clip behaviour preserved); watchlist panel + strip refresh on the ~15s tick and on add (Look Up button — already existed, Part 2 skipped) / remove. Backend tm_discover.Watchlist (data/watchlist.json, shipped v4.14.4.3) reused as-is: .tickers / .add() [fires record_user_signal itself — not called twice] / .remove(). Audit _audit_gui_cleanup_phase_d.py. // v4.14.5.14-stale-cleanup (2026-05-27) Stale teacher-AI cleanup + universe reconcile: removed the dead path_universe_mismatch intercept chain (_V415_MISMATCH_RULES, both checkers, the emitted flag) and the orphaned open_universe_picker intent; reconciled cache-fill universe to Russell 3000 (cfg v415_universe russell3000 -> ETF iwv ~3,000 tickers; _V415_DEFAULT_UNIVERSE too); banner path label now uses _RECO_STYLE_LABELS (Speculative) and PATHS['lottery'].name -> 'Speculative'; de-staled ~9 playbook entries (freshness indicator -> phase-progress row, dropped Ollama/AI Chat/Choices-summary/Slow & Safe/Penny Lottery refs -> cloud-only + current labels) and stale related_feature_ids (freshness_indicator/freshness_states_concept/choices_modal/ai_chat/setting_storage_cleanup), KEEPING live ai_mode_pill/ai_badge/setting_data_backups. Audit: _audit_stale_content_cleanup.py 35/35. // v4.14.5.14-gui-cleanup-c (2026-05-27) Top-bar status: startup phase-progress row [Startup/Conservative/Moderate/Aggressive] dots that turn green as each path's initial fill completes (Speculative omitted — event-driven, no completion state), a brief "All set" completion announcement, then collapse to an enriched persistent activity indicator (reuses _state_icon_lbl; adds Checking news / Analyzing / Filling X states). Logic in pure gui_* helpers (testable); a ~2.5s _tick_status_bar poll drives the widgets; completion detected read-only (recommend_cache counts vs target OR fill-mode 'nothing to analyze' log line) — no fill-loop edit. New data/teacher_knowledge/paths_and_recommendations.md (foundation for future Teacher AI; not yet consumed). Audit _audit_gui_cleanup_phase_c. # v4.14.5.14-gui-cleanup-b (2026-05-27) Merged Track Record + Accuracy Matrix into one "Performance" window: the Track Record toolbar button now opens a ttk.Notebook (first Notebook use) with "Summary" (Track Record content) + "Per-Model Matrix" (former Accuracy Matrix) tabs; the Accuracy Matrix hamburger item is removed (menu → 5: Help/Settings/AI Providers/Data Providers/Exit). tm_holdings._show_track_record gained a container/tab mode (win+_track_record_win point at the Performance Toplevel so async chunked-render + winfo_exists guards + the consensus-view dropdown all keep working; standalone path preserved as fallback). The matrix now counts HOLD/TRIM/BUY MORE outcomes (decided + hits), consistent with the Track Record headline. Audit _audit_gui_cleanup_phase_b; phase_a/phase_a2 updated (Accuracy Matrix menu gone, hamburger=5). # v4.14.5.14-gui-cleanup-a2 (2026-05-27) GUI removals round 2 (no behavior change): hamburger trimmed to 6 items (removed Restore from Backup / Scan Settings / Show Prompt Template); Settings dialog reduced to UPS + DISPLAY (removed the Show-advanced toggle + AI BEHAVIOR + AUTO-REFRESH + DATA & BACKUPS + STORAGE & CLEANUP sections + the _save references to their vars); the underlying daemons/hooks (auto-backup-on-exit, background scheduler, auto-refresh loop, startup cleanup) keep running on their cfg defaults. _open_fill_mode_picker KEPT (Teacher AI onboarding _step3 still calls it). Backing handlers left as dead code. Audit _audit_gui_cleanup_phase_a2; _audit_hamburger + _audit_settings_dialog_cleanup updated. # v4.14.5.14-gui-cleanup-a (2026-05-27) GUI removals (no behavior change): removed the Scan + Scan All toolbar buttons, the Refresh All Holdings / Stock selection / Data Mode hamburger items, the first-run "Set up your data" picker auto-open, and the "data: Xm old" freshness label (_freshness_lbl). The Idle/state indicator (_state_icon_lbl) stays. Backing methods (_consensus_quick_scan/_scan_all_paths/_refresh_all_holdings/_show_data_mode) + _open_fill_mode_picker (Settings still uses it) remain defined; only UI entry points removed. Audit _audit_gui_cleanup_phase_a; _audit_hamburger_universe_shortcut inverted. # v4.14.5.14-trim-buy-more-grading (2026-05-27) Closes the parked HOLD-grading follow-up: TRIM and BUY MORE owned-position verdicts (written verbatim by _write_refresh_prediction since 2026-05-26) were expiring ungraded. tm_discover.check_outcomes now grades them on their own verdict tracks — TRIM correct on decline/in-band-plateau, wrong on surge past target; BUY MORE graded like BUY (target=correct, stop=incorrect, in-band expiry=inconclusive/expired). _compute_stats_dict gains trim_/buy_more_ correct/incorrect/decided/accuracy_pct (accuracy None until decided, isolated from BUY n_decided like HOLD). tm_holdings Track Record shows TRIM/BUY MORE lines only when decided>0. Forward-looking: 0 such predictions exist yet (writer is 1 day old). Audit _audit_track_record_trim_buy_more_grading. # v4.14.5.14-keep-awake (2026-05-27) New module tm_keepawake.py prevents Windows SYSTEM hibernation ONLY during active queue-runner work (a fill pass or an event-driven dispatch) via SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED); monitor sleep is still allowed (ES_DISPLAY_REQUIRED deliberately omitted, so the screen can still turn off). request_keep_awake is called at the two dispatch points in tm_queue_runner; _manage_keepawake releases the hold after 2 consecutive idle cycles; _on_close releases it on graceful shutdown. No-op on non-Windows. Audit _audit_keep_awake.  # v4.14.5.14-queue-runner-log-honesty (2026-05-26) The queue-runner pass summary now counts REAL AI calls separately from gated/skipped candidates. Old line called (candidate_count - skipped) 'analyzed', so a pass where everything was gated (dropped before any AI call via drop_reasons) read identically to one that did N real analyses. New: _emit_summary_log takes a gated count (= sum(drop_reasons.values()), passed from both success-path emits); analyzed = checked - gated - skipped. Formats: all-gated -> 'N candidates checked, all gated; 0 AI calls, 0 new picks'; mixed -> 'N checked, G gated, A analyzed via X, I new picks queued'; zero -> 'nothing to check this cycle'. Per-provider counts kept (v4.14.3.11 load-distribution; more honest in silent-fail cases). Pure reporting change — dispatch/gating logic untouched. Audit _audit_queue_runner_log_honesty 10/10; _audit_provider_exhaustion updated to new wording (38/0).  # v4.14.5.14-ai-verdict-indicator (2026-05-26) Portfolio card headers now show a quiet 'AI no longer recommends BUY' hint: when the AI's CURRENT predominant consensus verdict for a held ticker is not BUY, the header shows AI: HOLD (amber) / AI: SELL|AVOID|TRIM (red). BUY/BUY MORE or no-consensus -> no indicator. Current-price-relative by design (what the analysis says now, independent of cost basis). New module helpers _predominant_verdict + _ai_verdict_indicator (reuse the consensus tally) and method _compute_ai_current_verdict; rendered on the always-visible header (line 2 for tradable cards, header row for written-off) so it shows collapsed AND expanded. State badges + Sell Triggers untouched. Audit _audit_position_header_verdict 18/18.  # v4.14.5.14-manual-sell-tracking (2026-05-26) Investigation found the manual-sell Track Record gap was MOSTLY already closed: the portfolio Sell handler already records every sale in the holdings Trade History (closed list / realized stats) via sell_holding AND grades any open AI prediction at the sell price via mark_position_sold (the RIG fix). Residual gap: a manual buy/sell with NO AI prediction was invisible in the Track Record CARD (it lived only in the Trade History view). Closed by surfacing the holdings managers full realized record (get_realized_stats) on the Track Record headline as a 'Your actual trades (incl. ones the AI never predicted)' line. Deliberately did NOT inject synthetic manual_sell records into predictions.jsonl (would duplicate Trade History + pollute AI per-model/accuracy stats). Display-only in the AI card; no prediction-store or BUY/SELL grading changes. Audit _audit_manual_sell_track_record 9/9.  # v4.14.5.14-hold-grading (2026-05-26) Track Record now grades HOLD predictions (written by Refresh-Triggers) on their OWN verdict track. Before, HOLD could only reach OUTCOME_EXPIRED -> excluded from accuracy, so HOLD calls were silently uncounted. tm_discover.check_outcomes gains a DIRECTION_HOLD branch: a target/stop breach -> hold_broken (BUY/SELL would have won); surviving the timeframe in-band -> hold_held (correct); no band -> expired (ungradable, skipped). New OUTCOME_HOLD_HELD/BROKEN; _compute_stats_dict adds hold_held/hold_broken/hold_decided/hold_accuracy_pct, kept SEPARATE from the BUY target/stop denominator (n_decided unchanged -> no BUY/SELL regression). Track Record shows a HOLD-accuracy line. Audit _audit_track_record_hold_grading 12/12.  # v4.14.5.14-macro-keyless (2026-05-26) Eliminated the LAST keyed-only data capability. FRED macro is now keyless-first: tm_data_adapter_fred uses FRED's own public CSV endpoint (fredgraph.csv, date-limited <1KB) for all 8 series when no key is set, with keyless fallbacks (Treasury par-yield XML for 2Y/10Y, BLS v1 API for CPI/unemployment; Yahoo VIX/10Y merged upstream). A FRED JSON key is now OPTIONAL (higher rate ceiling). fred needs_key=False in tm_data_providers.py + data/data_providers.json; FRED removed from provider_signup_specs.json (now zero data-provider entries). Every data type has a keyless primary -> teacher AI recommends zero data keys, only cloud-AI-inference keys. Audit _audit_macro_keyless 12/12; _audit_honest_key_recommendations updated. macro consumer + cache schema unchanged.  # v4.14.5.14-honest-key-recommendations (2026-05-26) Compliance fix for the Honest key recommendations principle (DECISIONS.md): removed the teacher-AI playbook nudge to 'add a Finnhub key' / 'configure a keyed quote source' for Yahoo price rate-limits (prices are keyless via Yahoo+Stooq, and Finnhub price=None so the nudge was also ineffective); reworded the provider-exhausted entry to a generic example instead of singling out Finnhub; removed the orphaned Reddit entry from provider_signup_specs.json (Reddit was dropped). Only FRED (legit keyed-only macro) remains in the cheat-sheet. Audit _audit_honest_key_recommendations 6/6. data files only; no code logic changed.  # v4.14.5.14-daemon-keyless-first (2026-05-26) Daemon snapshot fundamentals path is now keyless-first: Yahoo (keyless) primary at priority 1, Finnhub (keyed) demoted to bonus at priority 2, in both tm_data_providers.py defaults AND data/data_providers.json (4th touchpoint). Runtime serving('fundamentals') == [yahoo, finnhub]. No behavior change for keyless users (already got Yahoo via fallthrough); keyed users get field-equivalent Yahoo snapshot first. EDGAR analysis path untouched. Audit _audit_fundamentals_keyless_first 6/6.  # v4.14.5.14-derived-overlay (2026-05-26) AI prompt FACTS block now gets BOTH statements AND derived/market fields (company_name, sector, industry, market_cap, pe_ratio, beta, dividend_yield) for keyless users. The fundamentals cache table is statement-only (no columns for derived fields), so a cache-reader overlay was structurally impossible; instead module-level _v415_overlay_derived_fundamentals overlays the live router snapshot onto each deep-statement dict at return time in _fetch_fundamentals (fills only Nones, deep statement values win, best-effort, memoized 6h by DataCacheLayer._get so ~1 Yahoo call per ticker per 6h).  # v4.14.5.14-portfolio-collapsed-default (2026-05-26) Portfolio holding cards now default to COLLAPSED on startup (was a size-based smart default that started small portfolios expanded). One-line flip in _get_card_expanded (default=False); the compact two-line collapsed view (header + state badge) is the at-a-glance scan surface. Badge already renders collapsed (it lives in header_section, always packed; only the body toggles), so no badge change needed. Tradable AND written-off cards share _get_card_expanded -> uniform. State is session-only (plain instance dict, no persistence) -> every restart resets to collapsed; within a session a card stays as last toggled. Chevron toggle unchanged (expands body, ▼/▶ glyph). Audit _audit_portfolio_collapsed_default.py 9/9; all 7 audits green. --- prior: v4.14.5.14-edgar-fundamentals (2026-05-26) Added EDGAR XBRL CompanyFacts as the keyless PRIMARY deep-statement fundamentals source. New tm_data_adapter_edgar.fetch_fundamentals(ticker): reuses the existing CIK lookup + UA + politeness, fetches data.sec.gov/api/xbrl/companyfacts, extracts the most-recent ANNUAL (fp=FY/10-K) revenue, net_income, EPS, gross/operating margin, total_assets/liabilities, shares (selecting most-recent end across alternate tags so Apple-style frozen-tag traps are avoided — e.g. us-gaap:Revenues froze 2018). Wired as the FIRST deep fetcher in _fetch_fundamentals (before Finnhub-deep/yfinance-deep); writes an "edgar" deep row, then re-read. _v415_cache_read_fundamentals now FIELD-MERGES across deep sources in priority order edgar>finnhub_deep>yahoo_deep (a field EDGAR lacks falls back to the next source). Architecture note: EDGAR is a DEEP fetcher, NOT a router fundamentals profile entry (the router path is only the derived-field snapshot last-resort, and is single-source — adding EDGAR there would drop Yahoo derived fields). Derived fields (beta/pe/market_cap/sector) stay None in the cache reader, unchanged — a statements+derived live-snapshot overlay is a parked follow-up. Verified live (AAPL FY2025 revenue $416B/net_income $112B; FISV FY2025). Audit _audit_edgar_fundamentals_provider.py 23/23; all 6 audits green. --- prior: v4.14.5.14-nasdaq-observability (2026-05-26) Nasdaq earnings adapter now logs its bulk sweep to the activity log (was DB-only): a start line ("[nasdaq] startup sweep: fetching ~N business days"), a "[nasdaq] sweep complete: N dates, M events, K unique tickers cached" line, and an amber "[nasdaq] sweep partial: X of N dates fetched" when some dates fail. Routed via the router note-logger captured at register_with(); adapter behavior (caching/refresh/response shape) unchanged. Also recorded the decision to KEEP Finnhub at earnings priority 3 as a resilience layer (no unique fields, but real redundancy — see DECISIONS 2026-05-26). Audit _audit_nasdaq_earnings_provider.py 23/23 (+3 observability checks); all 5 audits green. --- prior: v4.14.5.14-nasdaq-earnings (2026-05-26) Added Nasdaq earnings calendar as the keyless PRIMARY earnings source (new tm_data_adapter_nasdaq.py). Endpoint api.nasdaq.com/api/calendar/earnings (keyless, browser-UA required, bulk-by-date) verified live. Adapter sweeps a bounded ~45-day near-term window once/24h into an internal {ticker->next_event} cache and answers the router per-ticker from it (router days_ahead ignored; Nasdaq is bulk-by-date). Earnings priority is now keyless-first: nasdaq(1) > yahoo(2) > finnhub(3, keyed bonus, demoted from 1). finnhub demotion + the nasdaq profile applied to BOTH tm_data_providers.py defaults AND data/data_providers.json (JSON priorities override defaults at load — same 4th-touchpoint lesson as the social removal). Nasdaq is dense near-term / sparse far-term, so distant dates (e.g. FISV July) stay Yahoo-sourced until they enter the window. Failures return None -> Yahoo fallback (never raises). News/fundamentals/etc priorities unchanged. Audit _audit_nasdaq_earnings_provider.py 20/20 (+live 49-row fetch); all 5 audits green. --- prior: v4.14.5.14-social-dropped (2026-05-26) Social (Reddit + StockTwits) removed as a supported data type per DECISIONS.md (Reddit keyless path is gatekept-impossible; StockTwits alone not worth maintaining). Removed: reddit/stocktwits ProviderProfiles + the social DATA_TYPE from tm_data_providers.py; the two register_with() calls (commented w/ DECISIONS ref); and the reddit/stocktwits entries from data/data_providers.json (the registry re-injected them via load()s user-added branch, so the JSON had to be cleaned too — verified serving('social')==[] after load). Adapter files + imports + _fetch_social/_social_block scaffolding left on disk (degrade to None/empty gracefully); social_signals cache table preserved (no new writes). Audits 4/4. --- prior: v4.14.5.14-recommend-density-v1 (2026-05-26) Recommend dialog (basket columns) conservative density pass: column header 12->10, Consolas number rows (shares/cost/target) 9->8, and a scoped _rs spacing dict (md 12->9, sm 8->6, xs 4->3) inside _render_recommendations ONLY. Ticker stays Consolas 10; already-8pt body text + consensus pill + Layer2 badge left as-is (Recommend baseline was already ~8pt; 7pt body is a future v2). Shared self.fonts/self.space untouched; layout-only, no logic change. Also de-brittled the live-FISV smoke checks in _audit_compact_holding_row.py + _audit_sell_trigger_dated_rule.py to assert against current data instead of a frozen verdict (they went stale once refresh-triggers wrote FISV fresh HOLD — not a regression). Audits 4/4 green. --- prior: v4.14.5.14-refresh-triggers-writes-prediction (2026-05-26) Refresh-Triggers (and Re-run consensus) now WRITE a prediction record when the owned-position consensus completes, closing the loop: the SELL TRIGGERS block re-renders from the fresh verdict and the OUTDATED warning clears. New PortfolioPanel._write_refresh_prediction re-parses a representative WINNING-direction vote's response via tm_discover.parse_prediction (the consensus rollup has no aggregated numeric target/stop — only free-text per-vote strings) -> one prediction with direction=winner, source='refresh_triggers', numeric target/stop/timeframe_days; writes nothing if no winning vote has a usable target+stop or the winner is SELL/AVOID. Mirrors the Look Up writer. is_consensus_outdated unchanged. Audit _audit_refresh_triggers_writes_prediction.py 13/13. --- prior: v4.14.5.14-target-stop-override-recency (2026-05-26) target_stop event-driven fires now BYPASS the verdict-recency gate (a price crossing its target/stop is the high-signal event the verdict was waiting for, so re-analyse even if the verdict is recent); price_drift/news/earnings/staleness stay gated as before. Threaded a recency_bypass set (built in _run_event_driven_sweep from fires where kind=='target_stop') through run_one_pass_for_triggers -> _unified_dispatch_ticker -> _eligible_paths_for, where it skips ONLY the verdict-recency check (pool + price-band gates still apply, 5-min target_stop dedup still applies). Optional param defaults None so cadence/fill callers are unchanged. Audit _audit_target_stop_recency_override.py 11/11. Cost: more Groq calls on real target/stop crossings (intentional; revert = flip the bypass off). --- prior: v4.14.5.14-writeoff-density (2026-05-26) Written-off (and shared locked) cards in _build_locked_card brought to match/beat the tradable card density so they read as a quiet record, not dominant content: ticker 11→10, chevron 10→8, position sub-line 8→7 (via _card_fonts), italic explanation 8→7; spacing now reuses _card_space (md 12→7, sm 8→4, xs→2). WRITTEN OFF/LOCKED pill stays 7, Remove button stays 8pt (click target preserved). Scoped reuse of existing _card_fonts/_card_space — shared app.fonts/app.space untouched; layout-only, no logic change (audits 12/12 + 7/7). --- prior: v4.14.5.14-portfolio-header-density (2026-05-26) PORTFOLIO header (summary card) brought into proportion with the v1-v3 compacted holding cards: "$ total" 18→14 bold (still the headline, no longer dominant), PORTFOLIO label 12→10 bold, breakdown + "N tradable" lines 9→8, Active-watching ON/OFF + written-off lines 8→7; card pad 12→8, header→first-card gap 8→6, element pady ~30-40% tighter. "Set cash" button left at 8pt (already small, preserved as click target). Scoped to _build_summary_card via explicit literals — shared app.fonts/app.space (used by window titles/big numbers elsewhere) untouched; layout-only, no logic change (audits 12/12 + 7/7). --- prior: v4.14.5.14-density-pass-v3 (2026-05-26) Portfolio tradable-card density pass v3 (final tightening): font floor stays 7pt, main lever is SPACING — self._card_space md 9→7 / sm 6→4 / xs 3→2. Selective font trims: ticker 11→10, dot 9→8, SELL TRIGGERS values 8→7. Chevron AND the line-2 state badge stay 8pt (badge now pops even more above 7pt neighbours). Shared app.fonts/app.space untouched; layout-only, no logic change (audits 12/12 + 7/7). If too cramped the easy revert is _card_space['sm'] back to 5-6. --- prior: v4.14.5.14-density-pass-v2 (2026-05-26) Portfolio tradable-card density pass v2: design target moved to a 1366x768 laptop at 125% Windows scaling, so the font floor dropped 8pt→7pt. self._card_fonts now 7pt (body/mono/body_bold/caption), self._card_space md 11→9 / sm 7→6 / xs 4→3, and in-card font literals dropped one more point (ticker 12→11, dot 10→9, chevron 9→8, SELL TRIGGERS values 9→8, labels/snippets/pills 8→7). EXCEPTION: the line-2 state badge stays 8pt so the OUTDATED/DATED/TARGET/STOP glance-signal pops above its 7pt neighbours. Shared app.fonts/app.space untouched; layout-only, no logic change (audits 12/12 + 7/7). --- prior: v4.14.5.14-density-pass-v1 (2026-05-26) Portfolio tradable-card density pass v1 (FIRST iteration, baseline to tune): ~10% smaller fonts + spacing INSIDE the tradable holding card only, via scoped self._card_fonts (body/mono/body_bold 9→8) + self._card_space (md 12→11, sm 8→7, xs 4) and in-method font-literal scaling (ticker 13→12, dot 11→10, chevron 10→9, SELL TRIGGERS values 10→9, labels 9→8); floor 8pt, nothing enlarged, pills/captions at 7-8 left as-is. Shared app.fonts/app.space (PORTFOLIO header, written-off cards, add-form, activity panel) untouched; no logic change (compute_holding_state/is_consensus_outdated/is_sell_trigger_dated unchanged; audits 12/12 + 7/7). --- prior: v4.14.5.14-compact-holding-row-fix-2line (2026-05-26) Collapsed holding row split from one line to TWO predictable lines, fixing the single-line clipping that hid the state badge AND the expand/collapse chevron on narrow windows. Line 1 = dot+ticker+TRADABLE+position/P&L (left), scan-age+chevron (right, chevron right-packed first so it never clips); Line 2 = state badge (left only), omitted when FRESH. compute_holding_state / is_consensus_outdated / is_sell_trigger_dated logic unchanged; audits _audit_compact_holding_row.py 12/12 + _audit_sell_trigger_dated_rule.py 7/7. --- prior: v4.14.5.14-compact-holding-row (2026-05-26) Portfolio collapsed holding row compacted to asingle ~one-line strip (dot+ticker+TRADABLE+position/P&L left; scan-age+state badge+chevron right) so 5+ holdings stay scannable; the old separate position row and redundant "consensus:" line removed (the breakdown still shows in the expanded CONSENSUS block). New at-a-glance state badge via tm_portfolio_panel.PortfolioPanel.compute_holding_state (priority: TARGET_HIT>STOP_HIT>OUTDATED>DATED>FRESH); the superseded consensus-disagreement check extracted to is_consensus_outdated and shared with the loud expanded OUTDATED warning. Expanded view + written-off cards unchanged. Audit _audit_compact_holding_row.py 12/12. --- prior: v4.14.5.14-sell-trigger-dated-rule (2026-05-26) SELL TRIGGERS dim tag is now thesis-based, not clock-based: shows "DATED — <reason>" only when the prediction's stated timeframe expired, a target/stop price was hit, or a new SEC filing arrived after the prediction (filings-only this version; news/earnings parked). New tm_portfolio_panel.PortfolioPanel.is_sell_trigger_dated; loud OUTDATED consensus-disagreement warning left untouched. Audit _audit_sell_trigger_dated_rule.py 7/7. --- prior: v4.14.5.14a.8 (2026-05-17) Recommendations filter-consistency bug fixes (post-a.7 live testing). Phase 0 trace = Scenario A: v4.13.58 made price/conviction filters SOFT (build_recommendations built columns from the full pool; _filter_passes only moved the survivor counter, never the columns — explicit code comment) AND _cache_key excluded price/conviction so changing the tier didn't even rebuild. BUG 1 fix: filter_eligible_predictions/build_recommendations gained an optional post_filter= (applied to fully-normalized picks) + prefilter_eligible_count; _render_recommendations builds _hard_filter (price tier/min-max + conviction + consensus gate), passes post_filter=_hard_filter, and _cache_key now includes the filter signature → columns == survivor counter (single source of truth). BUG 2 fix: _consensus_quality_ok — recent per-ticker direction tally from the same prediction pool the badges reflect; ≥2 votes & non-BUY plurality & BUY doesn't tie → excluded (no data / clear BUY / BUY-tie → kept, original tag stands); honest "X of Y survive" via prefilter count. BUG 3 fix: Min consensus slider removed (label+Scale+v4.13.60 auto-clamp deleted; consensus_var kept as fixed IntVar(1) no-op so 2 downstream refs stay valid). post_filter defaults None = legacy behaviour (other build_recommendations callers untouched, verified). Audit _audit_recommendations_filters.py 35/35; regression green. UI structural/AST-verified ONLY — the user must visually confirm filtered columns match the counter, bad-consensus picks no longer Top option, no Min-consensus slider. Files: tm_recommend.py, tired_market.py, _audit_recommendations_filters.py. --- prior: v4.14.5.14a.7 (2026-05-17) CHOICES DIALOG REMOVED + Recommendations inline filters. Phase 0 found the prompt's assumptions wrong: the Recommendations dialog ALREADY had cash + a path OptionMenu + a min/max price filter + conviction/min-consensus; the user approved the reduced split. (A) Choices modal retired: _open_choices_window → inert no-op (orig body kept as _open_choices_window_DEPRECATED_REMOVED dead code to avoid blind structural excision in this 19k-line unrunnable-here tkinter file), summary strip not built, onboarding step2 → informational (no Choices, no key creation), _v415_format_choices_for_prompt early-returns '' + prompt builder user_preferences_fn=lambda:'' (soft sentence was ~no-op per a.5), _selected_bands always returns all bands (drops the v415_price_ranges momentum-sort tiebreak), App.__init__ no longer seeds the keys, v415_price_ranges/v415_style deleted from config.json (v415_universe/v415_fill_mode KEPT — separate picker). Shared _v415_get_choices/_set_choices/_estimate_universe_size PRESERVED (universe/fill picker still uses them; they safe-default when keys absent). (B, additive only) Recommendations: "Path:"→"Trading style:" with friendly labels (Conservative/Moderate/Aggressive/Speculative/Penny Stocks → slow_safe/moderate/aggressive/lottery/penny_lottery), bound to GLOBAL cfg['analysis_path'] (Q2 — one intent place); new "Price tier:" OptionMenu in the FILTERS row that DRIVES the existing min/max (single source of truth; power users still type exact values), persisted as cfg['last_price_tier'], applied on open. New module-level _RECO_STYLE_LABELS/_RECO_PRICE_TIERS/_reco_tier_bounds (single source shared with audit). Deployment math untouched (C no-op; already correct). Audit _audit_recommendations_filters.py 24/24 (source/AST-based — tk not importable headless). UI is structural/AST-verified ONLY — the user must visually confirm the dialog. Files: tired_market.py, tm_recommend_cache.py, _audit_recommendations_filters.py. --- prior: v4.14.5.14a.6 (2026-05-17) PER-PATH CANDIDATE SOURCING (Option-3 hybrid). a.5 found Recommend won't fill because the momentum filter fed volatile small-caps to slow_safe, whose "established/dividend" lens correctly AVOIDs them all. Phase 0 data assessment: fundamentals has NO market_cap/dividend_yield (only 671/2490 have shares_outstanding; market_cap_tier all-NULL) — the prompt's dynamic-market-cap design unsupported. the user chose Option 3: slow_safe/moderate = curated SEED LISTS, aggressive/lottery/penny_lottery = DYNAMIC price/volatility pools. New tm_path_candidate_pools.py (get_path_universe, 1h cache, seed paths filtered to ≥min price-history, dynamic paths filter price/history/volatility + progressive-loosen to floor). _layered_candidate_batch + _build_candidate_shortlist (new restrict= param) + event-driven dispatch now operate WITHIN each path's pool. Ship-time live pools: slow_safe 76 (JNJ/PG/KO/MCD/COST… — was RCEL/MVST/CSGP), moderate 109, aggressive 300, lottery 300, penny_lottery 172 — all above floor. cfg['path_candidate_pools'] tunable; cfg['use_path_candidate_pools'] (default True) rollback. Component C: AI prompts already pass path semantics (a.5 evidence) → no prompt change. New audit _audit_path_pools.py 8/8; legacy _audit_layered_candidates pinned use_path_candidate_pools=False (tier-composition orthogonal to pooling; test-only) + _build_candidate_shortlist mock signatures updated for restrict=. FUTURE ARC (flagged, not this patch): when the fundamentals fetcher backfills market_cap+dividend_yield universe-wide, slow_safe/moderate migrate seed-list→fully-dynamic. Files: tm_path_candidate_pools.py(new), tm_queue_runner.py, tired_market.py, _audit_path_pools.py(new), _audit_layered_candidates.py, _audit_layer1_fill.py. --- prior: v4.14.5.14a.5 (2026-05-17) Gemini classify + GitHub sanity ceiling + popup dedup + verdict-rate investigation. (A) classify_429 now parses Google/Gemini's body format (RESOURCE_EXHAUSTED + error.details[].retryDelay "30s") — Gemini 429s are per-minute (15 RPM free tier), get a short retry not the 5-min legacy; unparsed Gemini 429 → 60s (was 300s 'unknown') — ends the Gemini cooldown loop. (B) Root cause of GitHub "(73/68) learned from 429": NOT per-minute false-learning (that was Cerebras/a.4). GitHub-via-Azure reports a bogus X-RateLimit-Limit-Requests-Day=60000 (real GitHub Models free ≈50/day); the learner trusted it then a real daily wall at ~72 looked like a crash. Added _SEED_SANITY_MULT=20 ceiling to note_success_headers: a header day-cap >> the URL seed is ignored (60000 vs seed 40 → ignored, keeps 40; Cerebras 2400 vs 1500 / Groq 14400 vs 14000 still learned fine). Cleared the bogus learned github=72 in provider_learning.json + the parallel provider_health observed_max=68 (single source of truth). (C) INVESTIGATION ONLY, no code: today's verdicts since 16:00 = AVOID 61% / WATCH 25% / NO_CALL 13% / BUY 0%; historical BUY was only 4.5%. Every pass is slow_safe (fill targets the most-starved path; moderate full, slow_safe stuck) and the momentum filter feeds volatile small-caps which the slow_safe "established/dividend" lens correctly AVOIDs → structural candidate↔path mismatch, the real Phase-A blocker, deferred to a design decision (v4.14.5.14a.6). (D) Per-session popup dedup: tm_teacher_intercept._popup_should_show keyed by entry_id::provider; same error pops once/session (still logged to activity.log), new types still pop, resets on restart; cfg['use_session_popup_dedupe'] default True. Audits: _audit_provider_exhaustion 37/37, new _audit_popup_dedup 6/6; 127 total checks green, no regressions. Files: tm_provider_learning.py, tm_ai_router.py, tm_teacher_intercept.py, tired_market.py, _audit_provider_exhaustion.py, _audit_popup_dedup.py(new). --- prior: v4.14.5.14a.4 (2026-05-17) DYNAMIC PROVIDER-LIMIT LEARNING + 429 classification. Phase 0 found: caps are NOT in api_providers.json — they're hardcoded URL-detection in tm_ai_router._resolve_provider_cap (so a.3's PRESETS['mistral']=5000 NEVER took effect; Mistral stayed 1000→300 scan); and EVERY 429 got a flat 5-min cooldown with NO per-minute-vs-daily distinction (Groq hits 30 RPM → 5-min penalty → never approaches real 14,400/day; Cerebras false-learned to 48/day from one burst 429 because the soft-floor guard used the preset default, which is None for preset:'custom' providers). (A) URL seeds raised to researched reality + extracted to _url_detected_cap(): Mistral 1000→15000, Groq 5000→14000 (Cerebras 1500/Gemini 1500/GitHub 40 already correct). (B) new tm_provider_learning.classify_429() distinguishes per_minute (Retry-After/X-RateLimit headers/body) → SHORT cooldown, NO daily-cap tighten — vs daily → escalating cooldown + tighten + learner; unknown → legacy 5-min. Headers captured at the HTTP chokepoint (tm_api_providers._capture_http_meta thread-local; no signature/return changes). Soft-floor guard now uses the URL seed (_floor_reference_cap) so preset:'custom' Cerebras/GitHub are protected. Cleared the live falsely-learned Cerebras observed_max_per_day=48. (B4) tm_rate_limiter RPM tuned to researched values (Mistral 50→30, Gemini rpd 800→1400, custom 30→25). (B5) tm_provider_learning: successful-response X-RateLimit-Limit-Requests-Day headers update the learned cap (reality wins; seeds defer); observed-90%-no-429 → +20%; daily-429-at-N → cap=N; persisted to data/provider_learning.json + .log audit trail; re-verified from first fresh header; learned cap overrides seed (B5f). No-signal case = no change (never drifts). (C) scan cap_factor 0.3→0.8 (Layer 2 not built until .14b). Audit _audit_provider_exhaustion.py 32/32; 116 total checks green, no regressions. Files: tm_api_providers.py, tm_provider_learning.py(new), tm_ai_router.py, tm_rate_limiter.py, tired_market.py, _audit_provider_exhaustion.py. --- prior: v4.14.5.14a.3 (2026-05-17) PROVIDER-EXHAUSTION FOLLOW-UPS. (A) Mistral "300/300" was NOT a real limit: it = declared cap (was 1000, an internal non-RPD guess per its own v4.13.58.1 comment — Mistral is token/RPS-capped, no published RPD; observed_max_per_day=null = never hit a real daily wall) × the 'scan' call_type cap_factor 0.3 (tm_ai_router reserves 70% for high-value consensus). Raised tm_api_providers PRESETS['mistral'].default_max_per_day 1000→5000 (Groq parity, same documented rationale; router observed-quota learning still auto-tightens on real 429s) → fill mode gets 5000×0.3=1500 scan calls/day vs 300. Other caps audited & all correctly derived (Groq 5000/Gemini 1500/Cerebras 1500 = generous-with-429-learning; GitHub 40 = real documented 50/day−margin; Cerebras 48 = correctly LEARNED from a real 429). Deeper lever (0.3 scan cap_factor reserving 70% for Layer 2 consensus not built until .14b) flagged for follow-up, NOT changed (affects all providers). (B) v4.14.5.14.2's circuit-breaker pre-check used tm_top_ai_picker.pick_top_ai, which evaluates GENERAL provider caps and does NOT apply the scan cap_factor — so it said "available" while the scan router rejected everything and fill dispatched into a wall (2:41pm-2026-05-17, no pause line). New tm_api_providers.scan_can_run() runs the EXACT scan-eligibility path the dispatch uses (load providers→resolve registry→select_provider_groups call_type='scan'); _scan_availability now decides on that (pick_top_ai used only to phrase the reason). Pre-check now actually engages. (C) Pass-stats: PROVIDER_UNAVAILABLE skips now increment a `skipped` counter (NOT analyzed, no provider credit); _emit_summary_log shows "analyzed N … skipped M (no providers available)…" when skips occur, legacy format unchanged when none. Audit _audit_provider_exhaustion.py 20/20 (legacy tests 3/4/7 re-pointed to the scan_can_run seam — test-only); 104 total checks green, no regressions. Files: tm_api_providers.py, tm_queue_runner.py, tired_market.py, _audit_provider_exhaustion.py. --- prior: v4.14.5.14a.2 (2026-05-17) PROVIDER-EXHAUSTION HONESTY. The 2026-05-17 afternoon log showed a 75-min loop: once all free-tier providers hit daily caps/cooldowns, fill mode kept dispatching the same ~20 tickers every cycle, each writing a fake NO_CALL (455 in 4h) that advanced the analysis cursor as if judged. (A) tm_api_providers.run_apis_for_scan_prediction: when no provider is selectable (Site 1 `not groups`) or every provider for a canonical model is exhausted (Site 2 `not succeeded`), it no longer writes a NO_CALL — it signals result_meta['provider_unavailable']; tm_queue_runner._run_cloud_one returns the new PROVIDER_UNAVAILABLE sentinel, _analyze_candidate propagates it, and BOTH pass loops skip it WITHOUT advancing the cursor (ticker stays 'needs analysis' for when providers recover). cfg['use_no_call_on_provider_exhaustion'] (default False; True=legacy fake-NO_CALL) via set_no_call_on_provider_exhaustion(). Genuine AI no-call (parsed verdict) path untouched. (B) tm_queue_runner._run_fill_mode: circuit breaker — after computing a deficit, _scan_availability(app) (uses tm_top_ai_picker as the oracle, fail-open) gates dispatch; all-exhausted → set app._fill_paused/_fill_pause_reason, log `[fill-mode] pause: <reason>` once then `still paused` ≤ every 5 min, return without dispatching; recovers → `[fill-mode] resumed`. Only fill mode pauses — _run_event_driven_sweep/run_one_pass_for_triggers never reference _fill_paused (B3, audited). cfg['use_fill_mode_pause_on_exhaustion'] (default True). (C) cursor self-corrects (no code — A stops the pollution). Audit _audit_provider_exhaustion.py 13/13; 97 total audit checks green, no regressions. Legacy pre-a2 NO_CALL loop rows remain in predictions.jsonl as historical evidence (Track Record cleanup item, flagged in STATUS). Files: tm_api_providers.py, tm_queue_runner.py, tired_market.py, _audit_provider_exhaustion.py. --- prior: v4.14.5.14a.1 (2026-05-17) LAYERED FILL-MODE CANDIDATE SELECTION. v4.14.5.14a's fill mode pulled straight from the universe cursor (oldest-analyzed-first → alphabetical at startup), biasing every batch to A/B/C tickers so newsworthy names rarely got proactively analyzed. tm_queue_runner: the 20-ticker fill batch is now composed from 3 priority tiers — (1) _tier1_news_active_candidates: tickers with news_signals in the last 24h NOT yet analyzed since that news for this path (ranked newest-news then volume; restricted to daily_bars-filled tickers), (2) _tier2_filter_ranked_candidates: top-100 momentum names from the demoted filter, (3) _build_candidate_shortlist (gained exclude/limit params; legacy run_one_pass caller unchanged) as last-resort coverage. _layered_candidate_batch composes them, no dupes (each tier excludes prior). cfg['use_layered_candidate_selection'] (default True; False = v4.14.5.14a cursor-only). Fixed a real tz bug in _iso_to_epoch (UTC 'Z' was parsed as local → 24h news window skewed by machine offset; caught by audit Test 5). [fill-mode] dispatch log now shows the N news / N momentum / N cursor breakdown. Audit _audit_layered_candidates.py 13/13; all prior audits green (84 total). Files: tm_queue_runner.py, tired_market.py, _audit_layered_candidates.py. --- prior: v4.14.5.14a (2026-05-17) FILL-VALIDATE-REPLACE Layer 1 + filter demotion. Recommend showed 2 picks while ~46 open AI BUYs sat hidden because the momentum filter gated population to top-30-per-band. (A) tm_recommend_filter: top-30-per-band truncation removed — filter is now a SORT KEY not a population gate; MIN_PRICE_COVERAGE coverage gate UNCHANGED; cfg['use_filter_as_sort_key'] (default True, False=legacy gate) via set_filter_as_sort_key(). (B) tm_recommend_cache.refresh_recommend_cache: when cfg['use_open_buys_as_recommend_source'] (default True), source = ALL current open BUYs per path (most-recent-wins via new _current_buy_tickers_for_path), sorted momentum DESC then FIFO (first_seen/_epoch_from_rec) then ticker; legacy filter-walk preserved behind the flag. (C) tm_queue_runner Layer 1 fill: _run_fill_mode() after each event-driven sweep tops up the most-starved fill_enabled path via _build_candidate_shortlist + run_one_pass_for_triggers (single-AI throughput, full reuse) then refreshes recommend_cache; per-path cfg['path_fill_targets'] (lottery/penny fill_enabled=False); bench_floor hysteresis; 50-cycle/session runaway cap → 30-min cooldown; cfg['use_layer1_fill_mode'] (default True). Audit _audit_layer1_fill.py 18/18; regression-pinned legacy audits _audit_recommend_cache (9/9) + _audit_recommend_filter (6/6) to their pre-default flags (test-only, flagged). Layer 2 (background consensus validation) = v4.14.5.14b, Layer 3 (consensus-flagged replace) = v4.14.5.14c. Files: tm_recommend_filter.py, tm_recommend_cache.py, tm_queue_runner.py, tired_market.py, _audit_layer1_fill.py, _audit_recommend_cache.py, _audit_recommend_filter.py. --- prior: v4.14.5.13 (2026-05-17) DEAD-LANE TAIL FIX. Investigation found neither filings nor fundamentals was dead (122K/84K rows, refreshed today) — the "All sources failed" spam was two stuck tails. (A) EDGAR symbol-format variant fallback: universe writes dual-class as BRKB, SEC uses BRK-B; tm_data_adapter_edgar._ticker_variants() tries original→hyphen-1→dot-1→hyphen-2, per-ticker session cache (_resolved_ticker_cache) resolves+logs each once, recovers ~20 real large-caps (Berkshire B, Brown-Forman, Lennar, Liberty Media, Under Armour, HEICO, U-Haul, Moog, Greif). Confirmed-miss returns the new tm_data_router.TICKER_UNRESOLVABLE sentinel so the router suppresses the per-pass red 'All sources failed for filings' line. cfg['use_edgar_variant_fallback']. (B) Yahoo fundamentals stamp-on-success: the Yahoo fallback returned data but never wrote cache.fundamentals / stamped cache_metadata, so the ~7 tickers Finnhub can't serve were re-fetched every 30-min tick forever; _v415_cache_write_fundamentals_yahoo() now mirrors the Finnhub path. cfg['use_yahoo_fundamentals_stamp']. (C) New _audit_fetcher_convergence.py (20 checks) closes the audit blind spot: v4.14.5.9/.10 audits tested fail-gracefully but never success+convergence. Also corrected pre-existing v4.14.5.11 drift in _audit_fundamentals_filings.py test 15 (gate widened to earnings/universe flags; test wasn't updated). Both flags default True, independent rollback. Files: tm_data_adapter_edgar.py, tm_data_router.py, tm_data_adapter_yahoo.py, tm_fundfile_fetcher.py, tired_market.py, _audit_fetcher_convergence.py, _audit_fundamentals_filings.py. --- prior: v4.14.5.12 (2026-05-17) DAEMON STARTUP WIRING — closes the Arc B integration gap found in the overnight investigation. The recommend_cache / news / fundfile daemons were code-complete in v4.14.5.4-.11 but ONLY launched by the toolbar Stop->Resume handler (_resume_auto_refresh, ~lines 17727-17740), never at app startup. On a normal launch all three stayed dormant; the visible 'healthy' behaviour came from the legacy slow-fill, not Arc B. NEW: _v45012_launch_arc_b_daemons() scheduled near the end of App.__init__ startup (mirrors the Resume wiring exactly, same flag guards, logs '[recommend_cache]/[news]/[fundfile] daemon started' lines, surfaces launch failures amber not silent) + a '[startup] Tired Market vX - APP_VERSION confirmed' banner at the top of the startup sequence. All three launchers made idempotent via a thread-alive guard (store ._recommend_cache_thread/._news_refresh_thread/._fundfile_thread; return early if alive) so pressing Resume after startup is a no-op for an already-running daemon. Files: tired_market.py, tm_news_fetcher.py, tm_fundfile_fetcher.py. Audit _audit_daemon_wiring.py. Arc B is now GENUINELY integrated at startup (was code-complete but dormant before .12). --- prior: Arc B CLOSEOUT — earnings daily refresh + universe maintenance (2026-05-16). Two small independent fixes hooked into the existing v4.14.5.10 30-min daemon (NO new threads). (1) Earnings: tm_discover._load_earnings_calendar gains force=False; the per-process freeze (finally: _EARNINGS_CALENDAR_LOADED=True) now also stamps _EARNINGS_CALENDAR_LOADED_AT; both the lock-free fast-path and the under-lock recheck gain `and not force`. Hot-path latency is UNCHANGED — arbitrary callers still get the zero-latency cached read; ONLY the new _maybe_refresh_earnings_calendar(app) tick passes force=True, and only once the calendar is >= EARNINGS_CALENDAR_MAX_AGE_HOURS(=24) old (so a long session no longer misses earnings reported mid-session). No-op before the initial lazy load; flag cfg['use_earnings_daily_refresh']. (2) Universe: tm_fundfile_fetcher.refresh_universe_list reuses tm_fill_executor._seed_universe_if_needed (already fetches the configured source via _v415_universe_source_for(cfg['v415_universe']) + UNION-upserts into cache.db.tickers, never removes, handles source-unreachable). _maybe_refresh_universe seeds its timestamp on first tick WITHOUT refetching (startup fill already covered it) then fires ~weekly (UNIVERSE_REFRESH_INTERVAL_HOURS=168) in long sessions; flag cfg['use_universe_maintenance']. Both maybe-helpers run at the top of the daemon _cycle (cheap no-ops unless past max-age); the launch gate widened so the daemon starts if ANY of fundamentals/filings/earnings/universe is enabled (independent flags). No-key safety inherited (earnings already degrades gracefully; ITOT/universe keyless). Adapter-hardening principle honored (fail-open: stale-but-served, never freeze/crash). Audit _audit_earnings_universe.py. **THIS CLOSES ARC B — the fetcher layer now matches the IDEAS.md spec for every data type; the three-surface arc is genuinely complete at all three layers (trigger+cache+fetcher).** Remaining future work is separate arcs: salience, server download, Phase B. Prior body: Arc B patch 3 — fundamentals + filings incremental (2026-05-16). New module tm_fundfile_fetcher: a PURE scheduling/scope layer (same shape as v4.14.5.8 news) over the existing per-ticker router chokepoint tm_data_router.get_router().fetch('fundamentals'|'filings',ticker=T). The finnhub/yahoo fundamentals adapters self-tap _v415_cache_write_fundamentals (fundamentals table + cache_metadata('fundamentals') stamp); the EDGAR filings adapter self-taps _v415_cache_write_filings (filings table, PK accession_number = idempotent dedup + cache_metadata('filings') stamp). NO reinvention of fetch/parse/cache; repeat calls produce zero dup rows. Fundamentals: earnings-triggered (tickers with an earnings date in [yesterday,today] from the bulk _load_earnings_calendar) + cold staleness rotation (cache_metadata('fundamentals') older than 90d, capped 50/cycle); graceful when the earnings calendar is empty (staleness-only). Filings: tiered (T1 holdings+Recommend-displayed, T2 bench+watchlist, T3 universe 1/55 slice) REUSING tm_news_fetcher's already-audited scope helpers (DRY), freshness-skip via cache_metadata('filings') last_refresh_at (6h/24h/72h by tier). NO-KEY SAFETY INHERITED (router fallthrough; EDGAR keyless; fundamentals finnhub→yahoo) — module never gates on a key. ADAPTER-HARDENING PRINCIPLE APPLIED: filings refresh checks the v4.14.5.9 EDGAR CIK-map backoff state and SKIPS the pass (logs once, resets when healthy) instead of hammering SEC / exception-storming — no new fail-closed-and-sticky path. Single 30-min daemon (fundamentals every tick + filings tier cadence {1:1,2:4,3:12}) + startup one-shot + pause-aware; independent flags cfg['use_fundamentals_incremental'] / cfg['use_filings_incremental'] (both default True). Deferred (justified, matches v4.14.5.6/.8): per-call window-narrowing (adapters' fixed windows + dedup + freshness-skip already make repeat calls correct/cheap). Prereq verified: v4.14.5.9 retry-safe EDGAR shipped; no EDGAR failures after the latest restart in activity.log; finnhub lane='direct', edgar lane='keyless'. Audit _audit_fundamentals_filings.py. Live network/daemon structural/AST-verified only — the user verifies on restart. Remaining Arc B: earnings calendar daily refresh, universe-list maintenance. Prior body: EDGAR CIK retry-safe + adapter-hardening principle (2026-05-16). Filings investigation root cause: tm_data_adapter_edgar._load_ticker_cik_map cached an EMPTY dict permanently on ANY first-call failure (network-not-ready-at-startup / transient SEC hiccup), so every subsequent per-ticker call resolved no CIK and the router reported 'edgar: returned no data' for all ~1888 tickers for the whole session (endpoint+UA verified working by direct calls — 10,353-ticker index 200, AAPL submissions 200). THIS PATCH (Patch 0, the prerequisite): the CIK map is now SUCCESS-ONLY cached — only a non-empty parse is stored; failures (and successful-but-empty responses) set a 5-min backoff and return None ('not loaded, retry later'), NOT a sticky empty dict; so a transient early-session failure self-recovers instead of freezing filings until restart. `_ticker_to_cik` now returns a distinct `_MAP_NOT_LOADED` sentinel vs None, and adapter() surfaces the REAL failing layer ONCE per session ('[edgar] ticker->CIK index not loaded this session ... auto-retry') instead of 1888 misleading 'no data' lines — the wrong-layer-message fix. Flag cfg['use_edgar_retry_safe'] (default True) restores exact legacy sticky-empty for rollback. Patch 1 (doc): IDEAS.md gains the 'Adapter-hardening principle' codifying the recurring fail-closed-and-sticky defect class (earnings/lane_config v4.14.5.7, Finnhub gate, EDGAR CIK) so future adapters don't repeat it. SCOPE SPLIT (measure-twice, session pattern; the prompt's own framing makes Patch 0 the prerequisite that must be verified before the dependent layer): the bundled fundamentals + filings INCREMENTAL fetchers (Patches 2-3) are SEQUENCED to v4.14.5.10 — two new tiered network fetchers built on top of this still-unverified EDGAR fix, untestable vs live network here; building them on an unverified prerequisite repeats exactly the anti-pattern v4.14.5.7→.8 correctly avoided. Audit _audit_edgar_retry_safe.py. EDGAR is keyless (no lane trap); no-key safety automatic. Prior body: Arc B patch 2 — universe-wide news incremental (2026-05-16). New module tm_news_fetcher: a PURE scheduling/scope layer over the existing per-ticker chokepoint tired_market.deep_news_scan(ticker,db) (tired_market.py:3223 — the same fn tm_scheduler's holdings scan uses; it already does multi-source RSS->Yahoo->Finnhub->GoogleNews fallback, (url,timestamp) dedup, news_signals/news_cache/news_scans writes, and cache_metadata('news_signals').last_refresh_at). NO reinvention of fetch/parse/dedup/cache. Tiers: T1 holdings+Recommend-displayed+recent-lookups every 5min; T2 Recommend-bench+watchlist every 30min; T3 universe alphabetical 1/50 slice every 60min (full sweep ~50h). Budget: per-ticker freshness skip (cache_metadata last_refresh_at within 4h/12h/36h by tier — the real saver) + a 55/min rate limiter (buffer under Finnhub free 60/min). NO-KEY SAFETY is INHERITED from deep_news_scan's existing fallback chain (no Finnhub key => Finnhub adapter returns None, Yahoo/RSS/GoogleNews still run) — not reimplemented. Daemon tick + startup tier-1 one-shot + pause-aware; flag cfg['use_news_incremental'] (default True). DEFERRED (justified, matches v4.14.5.6 gap-fetch deferral): narrowing each scan to from=last_refresh_at — deep_news_scan exposes no end-to-end lookback param; threading one through it + 4 source fetchers is a cross-module change untestable vs live network here AND not needed for correctness (dedup makes repeat 7-day calls produce zero duplicate rows; the freshness-skip removes the redundant calls). Prereq satisfied: v4.14.5.7 self-heal flipped lane_config.finnhub->'direct' (verified on disk) and direct /company-news returns 237 articles. Audit _audit_news_incremental.py. tkinter/daemon/live-network are structural/AST-verified only — the user verifies on restart. Remaining Arc B: fundamentals/filings incremental, earnings daily refresh, universe-list maintenance. Prior body: Lane bootstrap self-heal (2026-05-16). Root cause of the earnings/Finnhub outage: _v415_bootstrap_lane_config is idempotent-never-overwrite, so when the user added a Finnhub key AFTER first bootstrap (by editing data_providers.json directly, bypassing the _v415_sync_lane_config_after_key_change UI hook), lane_config.finnhub stayed 'skip' forever and the finnhub adapter returned None pre-network for ALL Finnhub data types (earnings/news/fundamentals). The endpoint/key/tier were always fine (verified by direct API calls). THIS PATCH: _v415_bootstrap_lane_config gains a narrow self-heal — a keyed lane whose row is the no-key-default 'skip' is promoted to 'direct' once the provider has a key (returns the promotions; App.__init__ logs '[lane] finnhub: promoted skip->direct'). Retroactive: fixes the user's install automatically on next launch, no manual re-save needed. Flag-gated cfg['use_lane_selfheal'] (default True). No-key users unaffected (no key => stays 'skip', untouched, no error/nag). DELIBERATELY OMITTED (justified, not oversight): the spec's proposed user_chosen column/cfg marker — there is no code path today that can create a deliberate skip-with-key state (only producers of 'skip' are the no-key default and key-removal; no UI opts a keyed provider out), so guarding it would be speculative complexity; the future Teacher-AI per-lane opt-out flow owns that marker (seam already noted in the sync-hook docstring). SCOPE SPLIT (measure-twice, consistent with this arc's pattern): the bundled Arc-B-patch-2 universe-wide news incremental is SEQUENCED to v4.14.5.8, NOT shipped here — it is large, network-dependent, un-runnable in the build env, and per the earnings investigation is dead-on-arrival until THIS lane fix lands and is verified live in the user's real environment. Building the news layer on an unverified prerequisite, bundled with a small retroactive correctness fix, would dilute both. Audit _audit_lane_heal.py. Prior body: daily_bars universe freshness — CORRECTNESS FIX for the three-surface arc (2026-05-16, Arc B patch 1). Phase-0 verified the load-bearing gap: cache_metadata.have_to_date was NEVER written for the daily_bars lane (edgar/finnhub/stocktwits write it for filings/fundamentals/social, but no daily_bars writer existed), and get_unfilled_tickers was presence-only — so once a ticker had any daily_bars rows the slow/bulk fill never refreshed it. The v4.14.5.0 filter scores momentum/relative-volume off daily_bars, so post-bootstrap Recommend was ranking on frozen prices. THIS PATCH: (1) get_unfilled_tickers honors max_age_days for lane=='daily_bars' — a ticker is fresh only if it has rows AND a cache_metadata.have_to_date >= today-DAILY_BARS_MAX_AGE_DAYS(=2); zero-rows / no-metadata / stale-metadata all return as unfilled (legacy presence-only preserved for other lanes / when max_age_days is None). (4) upsert_daily_bars — the single chokepoint for ALL daily_bars writes — now widens cache_metadata have_from/have_to_date per ticker (best-effort; never loses a bar write); this is the ADD the freshness check reads against. (3) slow + bulk fill pass max_age_days for daily_bars via _daily_bars_max_age(app,lane), flag-gated by cfg['use_freshness_fill'] (default True). DELIBERATELY DEFERRED with reason (NOT shipped): the gap-only incremental fetch (fetch just have_to_date+1→today instead of full history). The per-ticker fill calls fetcher(ticker) with NO date range — making it gap-aware is a cross-module signature change through a closure built in tired_market.py into the yahoo adapter, untestable against the live fill in the build env, and NOT required for correctness: upsert_daily_bars is INSERT OR REPLACE (idempotent) and Patch 4 freshness-tracking makes the refresh CONVERGE (a refreshed ticker is marked fresh and not re-selected next pass — no per-pass storm), it just refetches full history rather than a gap (heavier bandwidth, still free-tier-fine at daily cadence; Yahoo daily_bars is batchable). Gap-only is an Arc B fast-follow optimization. First slow-fill pass after upgrade does a one-time universe-wide catch-up (every ticker has no daily_bars cache_metadata yet → all come due once), then converges to ~once-per-2-days per ticker. Audit _audit_freshness_fill.py. STATUS.md/BUILT.md "arc complete" corrected: trigger+cache layers complete at v4.14.5.4, daily_bars fetcher freshness at v4.14.5.6; news/fundamentals/filings/earnings/universe freshness remain Arc B. Prior body: Small bug bundle (2026-05-16). Bug 1 (FIXED): Portfolio "Re-run consensus" (_on_run_consensus in tm_portfolio_panel.py) refused with a misleading "Install Ollama / set Consensus models" error whenever cfg['consensus_models'] was empty AND no Ollama model was installed — even with 6 cloud providers ready — because it never consulted the unified availability check. Its sibling "Refresh triggers" (_on_refresh_triggers) gates on tm_top_ai_picker.has_any_ai_available (cloud OR local) and worked. Fix: _on_run_consensus now uses the same has_any_ai_available gate (empty `models` is fine — the router fans out to configured cloud providers exactly as Refresh Triggers does); the refusal message is now accurate. Bug 2 (DIAGNOSED, not blind-fixed): the perennial "All sources failed for earnings (last: None)" is NOT a code crash or captured key error — `last_error` is None because every earnings candidate is skipped without raising (no registered adapter / no API key, or adapter returns cleanly empty). Phase-0 evidence: data/api_providers.json has NO finnhub entry (no key/provider configured) while data/data_providers.json lists finnhub only as a data-source priority — i.e. a provider-provisioning gap (the user needs a Finnhub key configured), not a code defect safely fixable blind. Per the patch's own rule ("if Bug 2 is a needs-the-key issue, surface and ship Bug 1"), NO speculative earnings functional fix shipped. Instead a safe, in-scope diagnostic-quality fix lands in tm_data_router.fetch: it now records per-source skip reasons (no adapter/key, returned no data) and the "All sources failed" message reports the actual reason instead of "last: None" — so the real cause is actionable on next launch. Audit _audit_bug_bundle_v4_14_5_5.py. No architecture touched; three-surface arc unchanged. Prior body: Step 2 — WIRE FILTER INTO RECOMMEND (recommend_cache), COMPLETES THE THREE-SURFACE ARC (2026-05-16). New recommend_cache table (tired_market.db; PK ticker,path; displayed[10]/bench[20] tiers) + new module tm_recommend_cache.refresh_recommend_cache: calls the v4.14.5.0 filter, intersects with current open BUYs per path, tiers top-30, preserves first_seen_at, drops fallen-off tickers, atomic per-path rebuild (bench→displayed promotion is implicit in the rank-ordered rebuild), respects the filter coverage gate ('cache_filling' does NOT overwrite a good snapshot). Recommend wiring: _get_recommendation_source gains a top branch (cfg['use_filter_recommend'], default True) → _read_recommend_cache_picks(path) hydrates displayed-tier tickers into their current BUY prediction records (the exact shape tm_recommend.build_recommendations already consumes — TOP PICK/ALL IN/A FEW/DIVERSIFY logic unchanged, only the candidate SOURCE changes); empty → 'no candidates' (no legacy fallthrough by design). Background daemon tick _launch_recommend_cache_refresh (5-min, startup one-shot skipped if cache <5min old, pause-aware) + synchronous _refresh_recommend_cache_now hooked into the Choices-strip save. Flag-gated by use_filter_recommend (False = legacy queue/recency source restored). Patch 0: fixed a v4.14.5.2 regression — Track Record per-path section raised NameError ('tm_holdings' not defined inside tm_holdings.py); changed the self-reference to the bare module-level compute_path_track_stats. Audit _audit_recommend_cache.py. tkinter rendering + basket visual correctness are AST-verified only (not runnable in build env — the user verifies on restart); the data flow (shape parity with the legacy source) is integration-audited. THE THREE-SURFACE ARC IS NOW COMPLETE: Step1 filter v4.14.5.0, Step3 stability v4.14.5.1/.2, Step4 suspicion-staleness v4.14.5.3, Step2 cache+wiring v4.14.5.4. Downstream future work (separate arcs): news architecture, salience. Prior body: Step 4 — SUSPICION-STALENESS, closes the trigger-layer of the three-surface arc (2026-05-16). Replaces the clock-driven "data is old, re-analyze" staleness with the spec semantics: a re-check fires only when an OPEN BUY has had ZERO real-world change events (significant price move from daily_bars, news arrival, consensus result, earnings) for >= the path's suspicion window (slow_safe 30d / moderate 14d / aggressive 7d / lottery 5d / penny_lottery 5d) AND is past the v4.14.5.1 maturity guard. Suspicion-staleness is a CHECK not a KILL — it schedules re-analysis; the result keeps or exits the BUY via the normal flow. tm_event_triggers: new _check_suspicion_staleness_triggers + get_last_change_event_at (a mere prior re-analysis is deliberately NOT a change event — would let the system reset its own clock); legacy clock fn renamed _check_legacy_staleness_triggers and kept behind cfg['use_suspicion_staleness']=False for rollback; check_staleness_triggers is now a thin dispatcher so evaluate_all_triggers/the runner are unchanged (identical return shape, kind still 'staleness' with subkind 'suspicion'). Per-kind dedup gains 'staleness'=24h so a quiet BUY fires at most once/day. Phase-0 surfaced (not blockers, handled by graceful degradation): earnings calendar currently fails to load (separate tracked gap) and cache.db news_signals covers only ~2 tickers — so the reliable universe-wide change signal is the daily_bars price-move (3% main / 5% speculative) plus per-ticker consensus ts from signals.jsonl (~36 tickers); no persisted per-ticker user-action timestamp exists so user activity is proxied via consensus signals. Audit _audit_suspicion_staleness.py. Spec event coverage now complete at the trigger layer: 4.1/4.2 (user/consensus, v4.14.5.1-2), 4.4 (target/stop, always), 4.5 (suspicion, this patch), 4.6 (manual, always); 4.3 (news as a true change event) is partial pending the news-architecture arc. Next: Step 2 = v4.14.5.4 (recommend_cache + bench/displayed). Prior body: Step 3 fast-follow — CLOSES STEP 3 OF THE THREE-SURFACE ARC (2026-05-16). Phase-0 check resolved Patch 4 (consensus user-gating) as MOOT: the queue runner's per-pass analysis writes only predictions.jsonl via run_apis_for_scan_prediction — it never produces signals.jsonl 'consensus_fresh_buy' rollups (only user-initiated ConsensusRunner does), so _consensus_says_buy's existing kind=='consensus_fresh_buy' filter is already user-scoped; Patch 4 dropped, not deferred. Shipped: (3) _run_housekeeping price-shift 'invalidated' is now maturity-gated (reuses tm_discover MIN_MATURITY_DAYS_FLOOR/RATIO; per-path timeframe-day defaults since recommend_queue.timeframe is unreliable TEXT/NULL) AND uses per-path thresholds (slow_safe 10% / moderate 12% / aggressive 15% / lottery 25% / penny_lottery 30%) instead of the global 5%; graduated_target/stop (legitimate market resolution) are NEVER maturity-gated; flag-gated by cfg['use_stable_recommend']. (5) Staleness windows widened (STALENESS_WINDOWS_SECONDS_STABLE: aggressive 72h / moderate 7d / slow_safe 21d / lottery 5d / penny_lottery 7d) selected when the flag is True, legacy windows restored when False — aligns wasted-work cadence with the v4.14.5.1 maturity guard; Step 4 reimplements staleness semantics. (6) Recommend speculative-path banner: dynamic honest numbers from predictions.jsonl via tm_holdings.compute_path_track_stats (single source of truth) — additive, defensive, rebuilt per render so the Path dropdown updates it. (7) Track Record honest-numbers overhaul: interim churn disclosure (with code TODO for removal criteria), post-stability-fix cutoff toggle (cfg['track_record_show_historical'] default False), per-path breakdown segmented main vs speculative — additive, self-contained in a guarded subframe, legacy aggregate stats untouched. compute_path_track_stats verified to match the independent accuracy investigation (slow_safe 60%/+8 EV, moderate 58%/+6.6, aggressive 40%/+1, lottery 21%/-3.5, penny_lottery 0%/-13.4). Audit _audit_recommend_stability_v2.py. UI rendering is AST-verified only (tkinter not runnable in build env — the user verifies visually on restart). Step 3 of the arc is now closed; Step 4 (suspicion-staleness) is v4.14.5.3. Prior body: Recommend stability fix — STEP 3 OF THE THREE-SURFACE ARC (2026-05-16): the load-bearing patch. Diagnosed cause of the 75%-of-BUYs-killed-before-verdict churn: PredictionsLog.check_supersessions Tier 1 was keyed (model,ticker) NOT path-scoped, so a HOLD/AVOID under one path superseded a BUY under another path (cross-path verdicts answer different questions by design) AND there was no minimum-age guard, so a 2-hour-old BUY with a 42-day timeframe was killed by the next clock-driven re-analysis. THIS PATCH (verifiable core): (1) Tier 1 supersession is now PATH-SCOPED — same model non-BUY only supersedes a prior BUY under the SAME path; legacy no-path records use '' sentinel that cannot collide with a real path. (2) MATURITY GUARD on BOTH tiers — a BUY younger than max(MIN_MATURITY_DAYS_FLOOR=3, timeframe_days*0.25) is skipped entirely; the legitimate market closer check_outcomes (target/stop) is untouched. (3) cfg['use_stable_recommend'] (default True) gates both changes for instant rollback; both check_supersessions callers (_startup_close_outcomes, _auto_refresh_tick) pass it. (4) tm_holdings.PATH_TRACK + get_path_track() classify lottery/penny_lottery as 'speculative', rest 'main' (unknown → speculative, fail-safe-toward-warning). (5) STABILITY_FIX_CUTOFF_TIMESTAMP marks the ship moment so accuracy surfaces can separate post-fix data. Audit _audit_recommend_stability.py incl. a historical simulation over the real 771 predictions (old-vs-new supersession counts). DELIBERATELY SEQUENCED to a fast-follow (NOT shipped here, surfaced with reasons in the implementation report): _run_housekeeping path-aware thresholds (Patch 3 — separate recommend_queue surface, needs schema verification), _consensus_says_buy user-initiation gating (Patch 4 — hinges on call_type vocabulary), staleness-window retune (Patch 5 — non-urgent: the maturity guard already protects BUYs ≥3d regardless of staleness firing; retuning live event-driven-runner constants without flag-gating would violate the rollback-safety principle this patch establishes), and the Recommend speculative banner + Track Record overhaul (Patches 7/8 — substantial tkinter UI that cannot be run-tested in the build environment; shipping unverified UI into a surface the user uses, bundled into the most consequential behavioral patch, is the exact risk this patch's own working rules say to surface and pause on). Prior body: Two-stage Recommend filter — STEP 1 OF THE THREE-SURFACE ARC (2026-05-16): ships new module tm_recommend_filter.py (pure-function, cache-reads-only: stage 1 price-band membership reusing tm_cache._price_matches_ranges/_get_ticker_latest_prices; stage 2 activity ranking = normalized 5-day momentum + capped relative-volume, with sparse social/news additive bonuses) plus _audit_recommend_filter.py (6 integration-boundary checks, all green). The filter is CALLABLE but NOT yet wired into Recommend population — that is Step 2, a separate patch — so the user sees NO behaviour change from this patch alone (expected). Load-bearing fix carried in the module: the coverage gate (MIN_PRICE_COVERAGE=0.80) returns status 'cache_filling' with a partial result instead of a silently-empty 'ok' list — this is the explicit guard against the failure mode that demoted the original candidate-selection price filter (price-filtering before daily_bars was filled collapsed scope to ~0). Locked design decisions (the user, filter-design Q1–Q5): path is NOT a filter dimension and no per-ticker path classifier exists or was added; band is the sole per-ticker filter dimension (Option A); v415_style stays an orthogonal prompt-flavor concern; stage-two ranking is price/volume primary with news/social as non-gating bonuses; top ~30 per band. IDEAS.md "Three-surface model" gained a clarifying note (band vs path vs style orthogonality) and BUILT.md's candidate-shortlist-demotion entry gained a forward-pointer to this module. No change to the event-driven runner, triggers, or any existing surface. Prior body: Default flip + soak completion — FINAL PATCH IN THE v4.14.4 EVENT-DRIVEN ARC (2026-05-15): completes the architectural transition started in v4.14.4.0. Five-patch arc: v4.14.4.0 skeleton + staleness; v4.14.4.1 price_drift + target_stop; v4.14.4.2 news; v4.14.4.3 earnings + user-signal; v4.14.4.4 (this patch) default flip. Fresh installs now default cfg['event_driven_refresh']=True — no soak, immediate event-driven behavior. Existing installs preserved: their cfg.json on disk drives behavior, and missing-key existing users still hit the v4.14.4.0 False default + 14-day auto-flip soak. Detection signal is CONFIG_PATH.exists() captured BEFORE the file read — "has cfg.json ever been written?" not "is the specific key present?" — because the user (an existing user upgrading from v4.14.3.x) has the key missing AND must keep his soak. (1) load_config gains is_fresh_install local at function top; the event_driven_refresh default in the defaults dict becomes True if is_fresh_install else False. Fresh-install branch also sets a transient cfg['_v4_14_4_4_fresh_install']=True marker on the returned dict. The transient marker is consumed exactly once (in App.__init__ after Discover init) by a muted activity-log line explaining the default and pointing users at config.json for opt-out; the marker is then popped and save_config(self.cfg) persists, so subsequent launches never re-log. (2) The existing v4.14.4.0 _v4_14_4_0_handle_installed_at_and_auto_flip in tm_queue_runner is untouched: it still stamps installed_at on first run if None, still auto-flips at 14 days when flag is False AND installed_at >= 14d. Fresh installs hit auto-flip never (flag already True so should_auto_flip returns False); existing installs continue to soak. (3) save_config writes the in-memory cfg back to disk; the transient marker is gone before this happens (popped earlier), so the marker never persists to disk. (4) Installer template change: v4.14.4.4 onward use PowerShell 'Get-Date -Format yyyyMMdd_HHmmss' for timestamps. v4.14.4.3's installer used wmic which is deprecated/removed on modern Windows 11 (and even where present, has substring-fallback complications). The PowerShell call works on every modern Windows including the user's. Documented in installer header so future patches inherit the fix. (5) No new module, no schema change, no cfg field beyond the transient marker (which never lands on disk). End-to-end: fresh install user launches → load_config sees no cfg.json → defaults['event_driven_refresh']=True + transient marker → App.__init__ logs once → marker popped, save_config writes cfg with event_driven_refresh:True and no marker → runner thread reads cfg → event_driven branch → immediate event-driven sweeps. the user's case: load_config sees existing cfg.json with neither event_driven_refresh nor installed_at → defaults['event_driven_refresh']=False merged in → no transient marker → no first-launch log → runner's v4.14.4.0 handler stamps installed_at=now + flag stays False → 14-day soak begins. Out-of-scope flagged (carried from prior arc patches and still deferred): UI toggle for the flag (cfg-only is fine for now), earnings calendar daily TTL refresh, background universe-wide news refresh, soak telemetry/observability, additional user-signal action types (manual mark-as-interesting, lookup-performed), persistent pending user-signal list, multi-path user-signal targeting, salience layer (v4.14.5.x), legacy cadence-mode deprecation. Prior body: Earnings + user-signal triggers (2026-05-15): fourth + fifth trigger kinds in the v4.14.4 event-driven arc. Earnings is a COMBINED kind with signal_context['subkind'] = 'upcoming' (event ahead) or 'recent' (event just passed) — one kind in TRIGGER_PRIORITY keeps the priority slot and dedup tuple clean; subkind distinguishes only in the prompt-framing context. Per-path earnings windows (upcoming_days, recent_days): slow_safe (3, 2) / moderate (5, 3) / aggressive (7, 5) / lottery (7, 5) / penny_lottery (14, 7). Per-kind dedup: 6 hours (PER_KIND_DEDUP_WINDOWS_SECONDS['earnings'] = 21600). User-signal is a PUSH-based trigger — UI calls tm_event_triggers.record_user_signal(ticker, action) at the moment of user action; the call appends to an in-memory pending list AND sets app._trigger_wake_event so the next sweep fires within ~1s instead of waiting for backoff. Two action types in v4.14.4.3: 'watchlist_add' (tm_discover.Watchlist.add) and 'position_open' (tm_holdings.HoldingsManager.add_holding when result['created']=True). Push-time dedup 60s on the in-memory list catches UI fumbles (add/remove/re-add within one second); cross-sweep dedup also 60s against trigger_fire_log via the per-kind window. (1) tm_event_triggers.py extensions: EARNINGS_TRIGGER_WINDOWS constant + PER_KIND_DEDUP_WINDOWS_SECONDS gains 'earnings' (21600) + 'user' (60), module-level _pending_user_signals list + _pending_user_signals_lock + _app_ref + set_app(app) helper. (2) check_earnings_triggers(app, path, now_ts) iterates queue_runner_analysis_log for the path, applies cascading + per-kind dedup, calls tm_discover.get_earnings_for_ticker (Stage 0 module-cached lock-free fast path), picks soonest upcoming OR most-recent past event in the path's windows. Signal context: {kind, subkind, earnings_date, days_delta, hour, eps_estimate, eps_actual, revenue_estimate, revenue_actual, quarter, year}. Numeric fields normalized to float via _num() helper; bad input falls to None rather than crash. Event dates parsed via fromisoformat with YYYY-MM-DD slice. (3) record_user_signal(ticker, action, app=None, path=None, context_str='') is the push API — defaults app to module-level _app_ref, defaults path to app.cfg['analysis_path'] then tm_holdings.DEFAULT_PATH. Push-time dedup walks _pending_user_signals; same (ticker, path, action) tuple within 60s returns False (suppressed). Wake-event setter best-effort. Returns True if queued, False if suppressed/failed. Thread-safe: lock guards pending list. (4) drain_user_signals(app, now_ts) pops the entire pending list under the lock, then applies cascading 5-min + per-kind 60s dedup against trigger_fire_log; suppressed entries DROPPED (cascade cooldown means ticker just got analyzed, user's intent has effectively been served). Returns fire-dict shapes ready for evaluate_all_triggers flat output. (5) evaluate_all_triggers calls drain_user_signals ONCE per sweep (NOT per path — each pending signal carries its target path) before the per-path loop; per-path then adds check_earnings_triggers wrapped in independent try/except so failures don't suppress staleness/price/news for the same path. (6) tm_queue_runner.py _format_fire_inline adds two new branches: 'earnings' → 'TICKER subkind Nd' (e.g., 'AAPL upcoming 3d'); 'user' → 'TICKER action' (e.g., 'TSLA watchlist_add'). (7) tm_discover.py Watchlist.add hooks record_user_signal AFTER save() returns True (actual new add, not duplicate). Uses notes[:80] as context_str for prompt framing. (8) tm_holdings.py HoldingsManager.add_holding hooks record_user_signal AFTER the with self._lock block exits, gated on result.get('created') — fires only on NEW positions, not updates of existing tickers. Passes the holding's path argument if set (the user chose path on the Add UI); else falls back to cfg['analysis_path'] inside record_user_signal. (9) App.__init__ calls tm_event_triggers.set_app(self) once during init so UI callers don't need to plumb the app reference through every layer (Watchlist class has no self._app; the module-level registry pattern avoids invasive constructor changes). Crash-loses-signal accepted: pending entries die with the process. Worst case the user adds a ticker, the app crashes within 60s, the trigger never fires — staleness picks it up on the next sweep after restart. Persisting these would add complexity without meaningful payoff. EARNINGS CACHE FRESHNESS RISK FLAGGED, NOT FIXED: _load_earnings_calendar is module-cached for process lifetime with no TTL — process restart is the only way to refresh. For the user's typical short app sessions this is fine; future patch will add a daily refresh trigger. Out-of-scope flagged: v4.14.4.4 default flip + soak completion (final patch in event-driven arc), background news refresh, salience layer (v4.14.5.x), additional user-signal action types (manual mark-as-interesting, lookup-performed), persistent pending list, multi-path user-signal targeting, earnings calendar daily refresh. Prior body: News trigger (2026-05-15): third trigger kind in the v4.14.4 event-driven arc. Fires when count(news_cache rows with timestamp > anchor) >= path_threshold, where anchor = max(last_analyzed_at, now - max_age_hours). The max_age_hours floor is LOAD-BEARING — prevents never-analyzed tickers from firing on weeks-old news. Per-path thresholds (article_count, max_age_hours): slow_safe (5, 72) / moderate (3, 48) / aggressive (2, 24) / lottery (1, 24) / penny_lottery (1, 24). Per-kind dedup window 60 min added to PER_KIND_DEDUP_WINDOWS_SECONDS. (1) NEWS_TRIGGER_THRESHOLDS constant added to tm_event_triggers.py. (2) New check_news_triggers(app, path) iterates queue_runner_analysis_log for the path, runs a direct SQL COUNT against news_cache (NOT cache.news_features() — avoids the SWR side effect during passive sweep AND only needs count + top headline, not the full features dict). idx_nc on (ticker, timestamp) makes this fast (~1ms per ticker). (3) Anchor computed as lexicographic max of last_analyzed_at ISO + max_age_cutoff_iso. ISO 8601 strings are lexicographically sortable; matches news_cache.timestamp's naive-ISO format (datetime.now().isoformat()) so no epoch conversion overhead. (4) Top headline fetched via secondary SELECT ... ORDER BY timestamp DESC LIMIT 1; goes into signal_context for prompt framing. Failure is best-effort (NULL top_headline doesn't suppress the fire). (5) cache failures amber-logged ONCE per sweep via local flag — same pattern as v4.14.4.1's cache.quote() failure handling. Individual tickers with no news data silently skip (the common case, not an error). (6) evaluate_all_triggers extended to call check_news_triggers per path, wrapped in independent try/except so news SQL failures don't suppress staleness/price fires for the same path. (7) _format_fire_inline in tm_queue_runner.py adds the 'news' kind branch: 'TICKER +N' format (count only, no headline text — keeps the activity log line scannable). (8) signal_context schema: {kind, new_article_count, since_ts, top_headline, threshold, max_age_hours}. SPARSITY REALITY at ship: the user's live news_scans table has only 8 rows; news_cache has 18,330 article rows but ONLY for those 8 tickers. The news trigger will fire for 0-8 tickers in the user's install today. Coverage grows organically as Discover/holdings analysis flows scan more tickers. Background news refresh (universe-wide periodic scans) is deferred to a future patch — that's the substantial infrastructure change. Out-of-scope flagged: v4.14.4.3 earnings + user-signal triggers, v4.14.4.4 default flip + soak completion, background news refresh, salience layer (v4.14.5.x). Prior body: Price-drift + target_stop triggers (2026-05-15): adds two new trigger kinds to the v4.14.4.0 event-driven skeleton. Price-drift fires when |current_price / baseline_price - 1| exceeds the path's threshold (slow_safe 8% / moderate 5% / aggressive 4% / lottery 6% / penny_lottery 10% — constants in tm_event_triggers.py). Target_stop fires when current_price crosses the prediction's target or stop level (independent of percentage drift). Both kinds can fire for the same ticker in one sweep and get collated at dispatch per F4 (one analysis per (ticker, path) with combined trigger context). (1) Constants PRICE_DRIFT_THRESHOLDS_PCT (per-path) + PER_KIND_DEDUP_WINDOWS_SECONDS (target_stop 5min, price_drift 30min) added to tm_event_triggers.py. The per-kind dedup is layered ON TOP of the v4.14.4.0 5-min cascading cooldown — both must pass for a fire to land. (2) New tm_discover.PredictionsLog.get_most_recent_for_ticker_and_path(ticker, path) — returns the most-recent prediction record for the pair regardless of direction (BUY/WATCH/AVOID/HOLD/NO_CALL). Iterates _cache in reverse (newest first) for early exit; insertion order is guaranteed by v4.14.3.13's merge logic. Used by price-trigger sweep to determine baseline. (3) New tm_event_triggers.check_price_triggers(app, path) returns fires for both kinds. Iterates queue_runner_analysis_log for the path, fetches baseline via PredictionsLog accessor, current via cache.quote() (the SWR-backed path; warm cache ~1-5us, stale-but-recent triggers background refresh). Defensive skips: None baseline (NO_CALL records), None target/stop (AVOID/WATCH predictions skip the target_stop check but drift check still applies), cache.quote() returning None (network blip). cache.quote() exceptions are amber-logged ONCE per sweep (deduped via local flag) rather than per failing ticker. (4) Two new internal helpers _within_kind_dedup() and _within_cascading_cooldown() that query trigger_fire_log and queue_runner_analysis_log respectively. Cascading cooldown is per-(ticker, path); per-kind dedup is per-(ticker, path, kind). (5) evaluate_all_triggers() extended to call check_price_triggers for each path, tagging fires via context['kind']. Wraps in try/except so a price-check failure doesn't suppress staleness fires for the same path. (6) Activity log shape rewritten as a hybrid: counts always; inline ticker+context details for any kind with <=5 fires. Format: "[event-driven] sweep: 3 price_drift (AAPL +5.2%, TSLA -6.1%, NVDA +4.8%), 2 staleness; processing top 5". Kinds rendered in TRIGGER_PRIORITY order (user > target_stop > earnings > news > price_drift > staleness) so the line reads top-down by importance. Storm-cap drop count appended when applicable. (7) Signal_context schemas: price_drift carries {kind, baseline, current, drift_pct (signed), threshold_pct, baseline_prediction_ts}; target_stop carries {kind, baseline, current, target, stop, crossed (target|stop), baseline_prediction_ts}. Both useful for prompt context (AI can see "your last analysis was at $X, now at $Y"). (8) Sign convention: drift_pct stored signed for debug-ability (positive = up); threshold check uses abs(drift_pct). (9) Symmetric target_stop crossing detection handles both long (target above baseline, stop below) and short/inverse predictions cleanly. Gates met for salience layer (v4.14.5.x): staleness + price gives "fresh because what?" distinction. News (v4.14.4.2) + earnings (v4.14.4.3) are nice-to-have richness, not strictly required. Prior body: Event-driven refresh skeleton + staleness trigger (2026-05-15): kickoff of the architectural arc from IDEAS.md "Event-driven refresh model." Pre-v4.14.4.0 the queue runner ran a 15-min cadence "re-analyze the same 20 tickers per pass" loop that burned provider budget on unchanged data. v4.14.4.0 ships the trigger-driven skeleton that future patches (v4.14.4.1 price, v4.14.4.2 news, v4.14.4.3 earnings + user-signal, v4.14.4.4 default flip) plug into. (1) New module tm_event_triggers.py with the trigger registry, per-path staleness windows (slow_safe 7d / moderate 48h / aggressive 12h / lottery 6h / penny_lottery 4h), 5-min cascading-trigger cooldown (F3), 20-fire storm cap (F1), priority order ('user' > 'target_stop' > 'earnings' > 'news' > 'price_drift' > 'staleness' — only staleness fires in v4.14.4.0; the rest are placeholders for subsequent patches), tiered backoff (60s -> 120s -> 5min -> 10min on consecutive empty sweeps), and the 14-day auto-flip soak window. (2) New SQLite table trigger_fire_log(ticker, path, trigger_kind, fired_at, signal_context) for trigger dedup + audit trail; PRIMARY KEY (ticker, path, trigger_kind, fired_at); idempotent CREATE TABLE IF NOT EXISTS in Database._init. (3) New cfg fields: event_driven_refresh (default False; the coexistence flag) and event_driven_refresh_installed_at (timestamp stamped at first v4.14.4.0+ launch; drives the auto-flip soak). (4) tm_queue_runner._runner_loop branches on cfg['event_driven_refresh']. False path: v4.14.3.x cadence behavior unchanged. True path: trigger sweep via tm_event_triggers.evaluate_all_triggers, fire list capped + prioritized, dispatched via new run_one_pass_for_triggers helper that reuses the existing v4.14.3.11 router-rotation / v4.14.3.9 outcome-recording / v4.14.3.13 delta-append infrastructure. (5) New threading.Event app._trigger_wake_event interrupts the loop's sleep when user actions arrive (Watchlist add etc. — wired in v4.14.4.3). (6) Tiered backoff sleeps in event-driven mode reduce CPU at idle: 60s default, doubling progression up to 10min after 9 consecutive empty sweeps; resets to 60s on any non-empty sweep. (7) Auto-flip at 14 days: if cfg['event_driven_refresh'] is False on launch AND it's been 14+ days since installed_at, flip to True automatically + log amber 'Event-driven refresh auto-enabled after 14-day soak window.' Manual override via cfg respected. (8) Cursor rotation (v4.14.3.10) remains intact for cadence mode; in event-driven mode the cursor is unused because event-driven sweeps process ALL paths per sweep instead of rotating. Cursor resumes if user flips flag back to False. Out-of-scope flagged for future: v4.14.4.1 price-drift trigger, v4.14.4.2 news trigger, v4.14.4.3 earnings + user-signal triggers, v4.14.4.4 default flip + soak completion, salience layer (next arc). Prior body: Activity log persistence - closes v4.14.3.9 destructive-Clear gap (2026-05-15): pre-v4.14.3.15 app._log() wrote ONLY to the Tk activity-log widget; data/activity.log on disk only caught cleanup summaries from _cleanup_disk_usage_summary. Result: pressing Clear (even with v4.14.3.9's confirmation dialog) wiped diagnostic history that nothing on disk would ever recover. v4.14.3.15 fixes this with a single change: Tee inside app._log persists every log line to data/activity.log matching the cleanup-events format ('[<iso8601>] <message>\n'). Single source covers queue runner / picker / router / holdings / Teacher AI / every UI surface because they all route through app._log. (1) Tee added inside _log right after the existing UI buffer write. UI write happens FIRST; disk write second. If the disk write raises (disk full, AV lock, permission), the failure is caught and printed to stderr — does NOT break the UI write that already succeeded. (2) Persistence fires even when self._activity_text is None (early-startup pre-_build_activity_log). Early-init errors are the diagnostics MOST worth capturing; previously they were silent because _log returned early at the None guard. (3) Existing 30-second AI-router dedup at the top of _log returns BEFORE both writes — correct, dedup is about both surfaces (UI noise AND disk record completeness; the FIRST instance of any deduped line still goes to both UI and disk). (4) _confirm_clear_activity dialog copy softened: 'Clear activity log VIEW?' / explains disk persistence exists, view-clear leaves on-disk record intact. Still mentions data/activity.log so v4.14.3.9 audit B7 (which checks for that literal) stays green. (5) Uses the existing LOG_PATH = DATA_DIR / 'activity.log' module constant at tired_market.py:232 — defined unused since the v4.10.x era, finally wired. (6) Synchronous open-append-close per call matches the cleanup-events writer pattern at line 20356 — ~10-100us per call on the user's SSD; invisible at human-scale log rates (~100 lines/min during heavy use = ~10ms/min cumulative). No buffering, no async queue: every line on disk immediately so a crash never loses recent diagnostics. (7) No rotation in v4.14.3.15. File at 75 KB today (cleanup-only); estimated 100 KB/day post-fix; stays under 1 MB for ~10 days. Revisit if user-visible. Out-of-scope flagged for future: provider_rate_limit_hit per-(entry, provider) dedup keying (STATUS.md's framing was stale - existing entry-keyed cooldown already exists; the real subtler issue is its own design patch), activity log rotation (date-based partitions when file size becomes user-visible), unifying tm_ai.py's _LOG_PATH with the activity.log path (two parallel log files exist today). Prior body: Chronic-429 persistence fix + three lateral cleanups (2026-05-15): two small unrelated patches bundled because each is tiny. Part A — chronic-429 escalation gap (STATUS.md open follow-up): tm_provider_health.record_rate_limit() was the only counter-mutating method that didn't call self.save(). consecutive_429s lived in memory only between 429s. If the user's app exited (clean shutdown that failed to save, crash, laptop sleep), the counter reset to 0 on disk and the next 429 started fresh at consec=1 with a fresh 5-min cooldown — trapping chronic-429 providers in 5-min loops forever despite the >=3-strike LONG_COOLDOWN_SEC (1-hour) escalation logic at tm_provider_health.py:540 being correct. STATUS.md's framing missed that the in-session logic was fine; the bug was persistence. Fix: added a debounced save block to record_rate_limit mirroring record_success's pattern exactly (30s debounce, same _last_persist_at field, same exception handling with print-amber). the user's 93 decided BUYs already correctly keyed in source_weights start informing rankings AND, via this fix, chronic-429 providers now reliably escalate to 1-hour cooldown across restart boundaries. Part B — three lateral cleanups: (1) _V415_MISMATCH_RULES at tired_market.py:2213 keyed the lottery rule on 'lottery_ticket' instead of the canonical 'lottery' path id. The lookup at _v415_path_universe_mismatch returned None for every lottery pass — the user-facing path/universe mismatch warning has never fired for the lottery path since the v4.13.x detection feature shipped. Real production bug, not just a typo cleanup. Fixed the rule key + the 4 audit literals in _audit_combined_fix_may13.py that exercised the broken code. (2) _PATH_BLOCK_OVERRIDES in tm_context_builder.py:437-439 had a 'conservative_income' entry that didn't exist in tm_holdings.PATHS — dead config with no consumer. Identical to 'slow_safe''s value (copy-paste vestige). Deleted. (3) Path default fallbacks across the codebase were inconsistent: 7 sites defaulted to 'lottery', 4 to 'moderate', 2 to tm_holdings.DEFAULT_PATH. The canonical default in load_config is 'moderate' so the 'lottery' sites were wrong by value, and the inconsistent style would have made a hypothetical "cfg missing analysis_path" case resolve differently across code paths. Aligned all 11 sites to use tm_holdings.DEFAULT_PATH (the constant; not a literal). Future-proofs against the "read-before-cfg-seed" silent-bug class. Out-of-scope flagged for future: provider_rate_limit_hit Teacher AI dedup (deferred to v4.14.3.15 / activity.log persistence patch), record_failure non-429 errors don't trigger cooldown (intentional, not a bug), legacy + canonical health records get separate counters (intentional separation), _V415_MISMATCH_RULES is incomplete (only 3 of 5 paths have rules; product decision). Prior body: predictions.jsonl delta-append + compaction (2026-05-15): closes the write-amplification problem flagged in v4.14.3.12's Part B investigation. STATUS.md framed this as "rotation" but the real bug was that PredictionsLog._persist_full() rewrites the entire 8.5MB file on EVERY status mutation. With 688 closures already in the user's history, that's ~5.8 GB of cumulative I/O for what should have been ~140 KB of mutations. Each startup-closer + auto-refresh-tick can re-resolve 50+ predictions in one call -> 50 x 8.5MB = 425 MB of I/O per tick. (1) New tm_discover.PredictionsLog._persist_delta(pred_id, patch_dict) appends a ~200-byte delta record to predictions.jsonl instead of rewriting the file. Delta envelope: {"_d": 1, "id": "...", "patch": {field: value, ...}, "ts": "..."}. Multi-field shape because status closures always touch 3-5 fields atomically (status + closed_at + close_price + notes + optionally eval_method or close_note). The _d=1 discriminator doesn't collide with any existing record field. ~10x smaller per mutation than the full rewrite. (2) PredictionsLog._load rewritten as merge: walks file line-by-line maintaining a dict keyed by pred_id; full records overwrite, deltas apply via dict.update(patch) to the existing record. Orphan deltas (delta referencing pred_id not yet seen) log amber via print() and skip rather than crash. Insertion order preserved via auxiliary list so get_recent_for_ticker's reverse-iteration semantics stay correct. Tracks delta_count seen during load -> used by startup compaction trigger. (3) New PredictionsLog.compact(): writes the in-memory _cache (which IS the merged state) to a temp file at self.path.with_suffix('.jsonl.compact_tmp'), fsyncs, then os.replace -> atomic rename on Windows same-volume per Python docs. Original file untouched until rename succeeds. On any failure: temp file unlinked, original intact, amber logged. (4) Compaction triggers: at __init__ after _load if delta_count/full_count > 0.5 (DELTA_RATIO_TRIGGER); in-session every 100 deltas (DELTA_COMPACT_THRESHOLD). Both constants are module-level in tm_discover.py - no cfg fields. (5) self._lock switched from threading.Lock to threading.RLock. Pre-existing dormant deadlock: mark_position_sold held self._lock while calling _persist_full which tried to acquire the same non-reentrant Lock. Never triggered in practice because mark_position_sold is a rare user action, but v4.14.3.13's per-delta writes would have surfaced it constantly. RLock fixes both the dormant bug and the new delta-writing call patterns without changing any other locking semantics. (6) Five _persist_full call sites converted to _persist_delta loops: update_outcome (one record, 4 fields), check_outcomes (N records, 5 fields each including eval_method), check_supersessions happy-path AND exception-fallback paths (N records, 4 fields with close_note + superseded_by_id OR contradicted_by_id), mark_position_sold (N records per ticker, 4 fields). Sites #1 (restore_from_backup) + #2 (clear_older_than) intentionally remain _persist_full - structural rewrites can't be expressed as deltas. (7) Accuracy Matrix dialog (tired_market.py:12367-12384 area) was reading predictions.jsonl DIRECTLY line-by-line - under delta-append it would interpret delta records as full predictions and silently produce wrong stats. Converted to call self._holdings_state['predictions_log'].get_all() so the merge happens before this code sees data. Comment block above the change explicitly says "do NOT revert to direct file reads - they will silently corrupt the matrix." (8) Installer pre-emptively snapshots data/predictions.jsonl to data/backups/predictions.jsonl.pre_v4.14.3.13_<TS> before the code swap. Gives clean rollback - if the user reverts to v4.14.3.12 (which can't parse delta records), restore that snapshot first. Estimated pass-time delta: a startup closer that resolves 50 predictions used to do ~425 MB of I/O (50 full rewrites of 8.5MB each); now does ~10 KB (50 deltas at ~200 bytes each) plus possibly one compaction if the count hits the threshold. ~42,500x reduction per mutation. Compaction at current file size: ~80-130ms; scales linearly. No schema changes, no cfg defaults, no new modules. Out-of-scope flagged for future: non-BUY smaller-schema (~50% file size reduction; ~100 LOC, deferred to v4.14.3.14+), compaction latency at file sizes >50MB (revisit if/when reached), pruning of predictions_backup_*.jsonl files in data/backups/. Prior body: Wilson CI reader fix - one-line picker correction (2026-05-15): closes a long-standing writer-vs-reader key mismatch in the accuracy bridge that meant the picker's Wilson CI ranking has been theatrical since v4.14.3 shipped. The bug: tm_source_accuracy.compute_model_accuracy keys source_weights rows by pred.get('model') - the provider's display label (e.g. 'Mistral', 'Cerebras', 'GitHub'). tm_source_weights.initialize_source_weights seeds rows by iterating MODEL_TIERS, also display-label keyed. But tm_top_ai_picker._rank_and_pick queried _query_wilson_ci_low with e['id'] - the preset name (e.g. 'mistral', 'custom'). Preset name and display label never match. _query_wilson_ci_low has been returning 0 for every provider since the bridge shipped, which meant the picker's with_data branch never fired and cold-start operational-fit ranking (v4.14.3.8) ran every pass. STATUS.md's framing of "three custom-preset providers share one accuracy row" was a partial description of one symptom; the deeper bug is that NO provider's row was ever found because of the format mismatch. Fix: tm_top_ai_picker.py:_rank_and_pick now passes e['display_name'].strip() to _query_wilson_ci_low (was: e['id']). Matches the writer's normalization at tm_source_accuracy.py:301 ((p.get('model') or '').strip()). the user's 93 decided BUYs (target_hit 39 + stop_hit 54) currently sitting correctly-keyed in source_weights start influencing picker rankings on first launch post-upgrade. registry_id (v4.14.3.7's dispatch identifier) stays separate - Wilson CI keying by display_name is a distinct concern from dispatch keying. One-line production change in tm_top_ai_picker.py plus a long comment block explaining the writer-reader alignment rationale. No schema change, no migration, no replay of predictions.jsonl. Out-of-scope flagged for future: MODEL_TIERS preserves the user's typos verbatim ('My Minstral', case variants of 'GitHub'), bridge's seen_unregistered should surface to activity log on unknown provider names, picker doesn't rank per-path (per-path data accumulating organically post-v4.14.3.10), non-BUY predictions carry full ~2.5KB records but contribute no accuracy (bundle with v4.14.3.13's delta-append work), predictions.jsonl write amplification fix (v4.14.3.13). Prior body: Load distribution across providers (2026-05-15): closes STATUS.md gap #5 - single-provider lock per pass. Pre-v4.14.3.11 the queue runner set scan_provider_filter=chosen.registry_id on every candidate call, narrowing the smart router to one provider for the entire pass. With Mistral as the user's cold-start winner, every 20-candidate pass concentrated load on one provider and a single 429 mid-pass cascaded into 13+ NO_CALLs because the single-provider group had no failover. The smart router has had multi-provider rotation since v4.14.1.1 (begin_scan_run / end_scan_run / next_scan_canonical_pick at tm_ai_router.py:958-1018) - the foreground Discover scan has used it since shipping. The queue runner just never opened that window. v4.14.3.11 turns it on. (1) tm_queue_runner._run_one_pass_body wraps the candidate loop in tm_ai_router.begin_scan_run() / end_scan_run() in a try/finally. The finally fires end_scan_run on every termination route - success, no-candidates, pick-failure, uncaught exception - so RouterRun state never leaks across passes. Mirrors v4.14.3.10's cursor-advance try/finally pattern. (2) _run_cloud_one drops scan_provider_filter (was: chosen.registry_id; now: None). With None passed, the router builds multi-provider groups per canonical model and uses its existing v4.14.1.1 round-robin to pick one canonical model per candidate. Within each model, sticky-pick + retry-on-transient + failover-on-quota are all already there. A 429 mid-pass on Mistral now fails over to Cerebras/GitHub/etc. on the next candidate instead of cascading to NO_CALL. (3) Inter-call throttle deleted from the queue runner. The v4.14.3.8 throttle was the right answer when the runner concentrated 20 calls on one provider; under distribution it solves a problem that no longer exists AND would falsely apply one provider's spacing between calls hitting different providers. Removed: _last_call_by_provider module-level dict, _prov_dict_for_spacing setup block in run_one_pass, the per-candidate throttle wait. The rate limiter's per-provider RPM/TPM/RPD gates (via tm_rate_limiter.acquire_for_provider inside tm_api_providers.call_provider) remain the canonical throttle - same-provider bursts still get rate-limited correctly. (4) Picker continues to run once per pass as a pre-pass health gate. It still produces the cooldown/identifier/operational-fit diagnostics from v4.14.3.5/3.6/3.7/3.8 and still surfaces all_cooldown / all_exhausted / all_disabled / none_configured system events. The picker's chosen.registry_id is now informational (used for the activity-log "preferred" label) rather than dispatch-controlling. (5) Per-pass provider mix tally maintained during the candidate loop. The _analyze_candidate / _run_cloud_one path already returns a pred dict carrying the 'model' field (= display label of the provider that actually served the call). For each successful pred, increment provider_calls[pred.get('model', '?')]. Passed into _emit_summary_log. (6) _emit_summary_log signature gains provider_calls dict. The success-path summary line reports per-provider counts: 'Queue runner pass (aggressive): 18 picks added - Mistral 8, Cerebras 6, Gemini 4'. The dedup tuple gains a frozenset of provider_calls.items() so two passes with same totals but different distributions both log; identical-distribution passes still dedup. (7) Once-per-pass muted log line announces distribution: 'Queue runner ({path}): rotating across N eligible providers'. Fires after begin_scan_run succeeds and the candidate shortlist is non-empty. Estimated pass-time delta: the user's current ~38s pass (20 Mistral calls @ ~1.9s each including v4.14.3.8 throttle) drops to ~15-20s under distribution because consecutive different-provider calls don't trigger the throttle. The rate limiter still throttles same-provider bursts. Migration: none. No schema changes, no cfg defaults. tm_queue_runner.py + tired_market.py only. Out-of-scope flagged for future: preset-keyed Wilson CI (becomes more visible under distribution but the fix is its own schema patch), router preference-order accuracy-awareness (a future tm_ai_router patch could sort within each canonical-model group by accuracy), activity.log disk persistence (carried from v4.14.3.9). Prior body: Path-aware allocation (2026-05-15): closes STATUS.md gap #2 — only cfg['analysis_path'] (currently 'moderate') was getting new predictions, leaving Aggressive/Lottery/Penny/Slow-safe Recommend windows empty because nothing had ever populated them. Pure pass-rotation across all five paths: each pass picks one path from tm_holdings.PATHS in declaration order (slow_safe -> moderate -> aggressive -> lottery -> penny_lottery), runs the v4.14.3.9 cursor pass for that path, advances. Five-pass cycle at the 15-min cadence covers every path every 75 minutes. (1) New cfg field queue_runner_path_cursor (integer, default 0) added to load_config defaults — small integer index into the rotation tuple; survives restarts via save_config. (2) tm_queue_runner gains module-level helper _get_path_rotation() that returns tuple(tm_holdings.PATHS.keys()) lazily — derives from the canonical PATHS dict rather than duplicating the list, so a future patch that adds/removes a path doesn't require a runner edit. Lazy import (inside the function) avoids circular import at module load. (3) _read_rotation_path(app) returns (cursor_idx, rotation_path) with defensive handling: non-int / out-of-range cursor values are clamped to 0 with a one-time amber log. (4) run_one_pass body wrapped in try/finally. The finally block ALWAYS advances the cursor and persists via save_config regardless of termination route — success / no-candidates / pick-failure / exception all advance. Without this, a path that hits all-cooldown for one cycle locks the rotation on itself forever. (5) cfg['queue_runner_last_pass'] stamp moved out of the manual-try block and into the same single save_config call as the cursor write — one filesystem write per pass instead of two. (6) _build_candidate_shortlist(app, path) signature change — path is now an explicit argument, no internal cfg['analysis_path'] read. Caller passes rotation_path. The rest of the call chain (_analyze_candidate, _run_cloud_one, _record_analysis_outcome, _build_candidate_prompt, _PATH_BLOCK_OVERRIDES) already accepted path as a parameter from v4.14.3.9 — no other signature changes needed. (7) Pre-pick failure (all_cooldown / all_exhausted / all_disabled / none_configured) does NOT call _record_analysis_outcome for any candidate. Picker state has nothing to do with ticker freshness; falsely demoting tickers for picker-state problems would poison the oldest-first sort when the path becomes runnable again. The cursor still advances via finally so rotation doesn't lock. (8) _emit_summary_log signature change — path is required argument now, included in the user-visible message ("Queue runner pass (aggressive): Mistral analyzed 20 candidates, 18 new picks queued.") AND added to the dedup tuple (chosen_id, inserted, outcome, path). Without the path-in-dedup, consecutive different-path passes with identical (chosen_id, inserted, outcome) would silently dedup against each other and the second path's summary would disappear from the activity log. (9) cfg['analysis_path'] is the USER's view selector and is NEVER written by the runner during a pass — confirmed across all rotation paths. The user looking at the Moderate Recommend window keeps seeing Moderate; the runner rotates through paths independently. Migration: idempotent. queue_runner_analysis_log table (path-keyed since v4.14.3.9) holds existing 'moderate' rows from yesterday's work — they stay valid for moderate's Recommend view, and the first rotation hits 'slow_safe' which has zero rows, surfacing fresh never-analyzed tickers. Aggressive / Lottery / Penny / Slow-safe Recommend views populate organically over the first ~75 minutes after launch (5 paths x 15-min cadence). Out-of-scope flagged for future: per-path enable toggle, per-path budget tuning, top-AI indicator path-awareness, fix for the three lateral inconsistencies ('lottery_ticket' typo in old audit, ghost 'conservative_income' in _PATH_BLOCK_OVERRIDES, split 'moderate'/'lottery' defaults). Prior body: Universe cursor + copy-activity-log (2026-05-15): closes the dominant 'queue runner re-analyzes the same alphabetical first 20 tickers every pass, leaving 2470 of 2490 ITOT tickers untouched' coverage gap, plus the 'can't copy activity log into chat' diagnostic friction. (1) New table queue_runner_analysis_log (ticker TEXT, path TEXT, last_analyzed_at INTEGER, last_outcome TEXT, PRIMARY KEY (ticker, path)) created idempotently in Database._init via CREATE TABLE IF NOT EXISTS — no migration step needed, fresh installs and upgrades both reach the same shape. Index idx_qral_path_time on (path, last_analyzed_at) keeps the "oldest N for this path" query cheap as the universe grows. Storage cost on ITOT: ~700 KB for 2490 tickers x 5 paths. (2) tm_queue_runner._build_candidate_shortlist rewritten — still pulls from tm_cache for universe membership and still excludes active recommend_queue rows + 24h AVOID cooldown, but now orders the candidate pool by staleness instead of alphabetically. Never-analyzed tickers (NULL last_analyzed_at) float to the top; among analyzed tickers, the oldest analysis comes first. Alphabetical ticker is the deterministic tiebreak. With a 20-cap and 15-min cadence, the full ITOT universe cycles in ~125 passes (~31 hours). (3) New helper _record_analysis_outcome UPSERTs the (ticker, path, now, outcome) row after every candidate processed in run_one_pass, regardless of direction. BUY / WATCH / AVOID / NO_CALL all record their outcome; silent-drops and exceptions record 'failed'. The point is "we looked at this ticker, move on" — not "we successfully predicted it" — so failed tickers don't cycle back to the top of the queue every pass and re-burn budget. UPSERT failure logs amber and continues; a bad write never blocks the rest of the pass. (4) Storage shape is path-aware from day one (PRIMARY KEY (ticker, path)) so v4.14.3.10's path-aware allocation work inherits the schema without migration. Runtime in v4.14.3.9 still operates only on cfg['analysis_path'] — that's intentional, allocation policy is a separate design call. (5) Activity log header gains a "Copy All" button peer to the existing Clear button. Same styling, packed to the right so the order reads "Copy All | Clear". (6) New App method _attach_copy_context_menu builds a Tkinter context menu (tk.Menu, tearoff=0) on a Text widget with Copy (selection only), Copy All (entire buffer), and optionally Clear (if on_clear callable is supplied). Bound to <Button-3> for right-click; the Activity Text widget also gets <Control-c> bound to the Copy-selection handler. Works on state='disabled' widgets — selection happens via the standard Tk mechanism, the Copy action reads via widget.get() without state-flipping. Clipboard write uses clipboard_clear + clipboard_append + update() — the trailing update() is critical or contents disappear when the Tk loop yields. (7) Clear button now wrapped in _confirm_clear_activity which fires askyesno with copy that names what's lost: "Most queue runner and AI dispatch events are not written to data/activity.log, so they cannot be recovered after clearing." Default No. Existing _clear_activity logic untouched — the wrapper just gates the call. Out-of-scope flagged for follow-up: persisting runner/AI events to data/activity.log on disk (would remove Clear's destructiveness entirely; deserves its own design pass for rotation policy + write batching). "Copy last N lines" / "Copy since timestamp" stay out. Path-aware allocation stays gap #2 for v4.14.3.10. Prior body: Burst-tolerant queue runner foundation (2026-05-14): closes the dominant 'queue runner produces 1-7 predictions then burns NO_CALLs' pattern caused by TPM (tokens-per-minute), not RPM, blowouts on Groq/Cerebras free tiers. (1) tm_rate_limiter.py PRESET_DEFAULTS now carries tpm and burst_category per preset (groq/cerebras='tight'@6000 TPM, gemini='moderate'@32000, mistral/anthropic/openai='generous', ollama='generous'/None). New get_burst_category helper resolves a provider's category honoring optional rate_limit_tpm and burst_category overrides on the provider entry. (2) ProviderRateLimiter gains a token-time deque and acquire_with_tokens method that enforces TPM in addition to RPM; raises QuotaExhausted when a single call's tokens exceed the TPM cap. acquire_for_provider gains estimated_tokens kwarg and dispatches to acquire_with_tokens when TPM is configured. (3) call_provider in tm_api_providers.py computes len(prompt)/4 as the token estimate and passes it through. (4) tm_queue_runner.py gains a per-provider _last_call_by_provider dict and inter-call throttle: spacing = (est_tokens / (tpm/60)) when TPM is set; else 60/rpm; else 1.5s; +15% safety margin. Stop-event-aware via _queue_runner_stop. Surfaces a muted '[runner] Throttling X: Ns between calls' log when spacing waits >= 1s. (5) tm_top_ai_picker cold-start strategy rewritten — groups by burst_category, prefers generous > moderate > tight, within-category sorts by display name. Eliminates the hard-coded 'Groq if present' fallback so users without Groq get a sensible default (Mistral for the user's lineup). (6) New _maybe_warn_tight_burst hook fires a one-time-per-session log line when a tight-burst provider gets picked for a multi-candidate pass; warn_pinned_tight_burst_once fires at App init for legacy pins. (7) provider entries accept optional rate_limit_tpm and burst_category overrides with the same fall-through-to-preset-defaults semantics as the existing rpm/rpd overrides. Mid-pass rotation deferred to v4.14.3.9. Prior body: Picker/router identifier consistency (2026-05-14): closes the picker-vs-router identifier mismatch that silently 20/20-failed every queue runner pass for users whose top-ranked provider had preset='custom' (Cerebras, GitHub, SambaNova in the user's lineup). Picker entries now carry both 'id' (preset, kept for Wilson-CI continuity) AND 'registry_id' (per-install UUID). Queue runner passes registry_id as scan_provider_filter. Router (tm_api_providers.run_apis_for_scan_prediction) matches the filter against provider 'id' (UUID) primarily, falls back to display-name match with a soft-warn log for legacy callers. Override path uses a three-step resolver: registry_id (canonical) -> display_name (legacy) -> preset (very-legacy). App.__init__ runs an idempotent migration that translates legacy cfg['top_ai_override'] values to registry IDs on first launch and writes back. AI Providers dialog now shows the registry id under each provider's display name (muted small text) so users can identify which provider any dispatch log line refers to. Closes today's diagnosis that the v4.14.3.5 cooldown fix only worked because the user's first-tried provider (Groq) happened to have a name-matches-preset coincidence — every preset='custom' provider was unreachable through the dispatch chain. Prior body: Silent-drop diagnostics + log_fn wiring + HoldingsWindow auto-build + installer fix (2026-05-14): (1) _analyze_candidate's three None-return paths (hw is None, prompt-build exception, empty prompt) now record into a drop_reasons dict the caller threads through; run_one_pass emits one amber 'N/total candidates dropped before AI call — Nx <reason>, Mx <reason>' summary per pass listing each reason with count. (2) Queue runner's run_apis_for_scan_prediction call wires log_fn=_safe_log instead of None — the smart router's existing diagnostic surface (cooldown skips, transient retries, [degradation] tags, all-exhausted breadcrumbs) now reaches the activity log. (3) New _ensure_holdings_window App helper builds _holdings_state + _holdings_window idempotently from any thread (per-App lock); queue runner calls it at start of run_one_pass so fresh-launch passes can proceed without waiting for a user click. (4) Amber summary copy rewritten — 'Common cause: provider cooldown after a 429' replaced with 'See preceding log lines for per-candidate reason' since v4.14.3.5 fixed the cooldown case and the hint is misleading post-fix. (5) run_apis_for_scan_prediction's empty-groups silent return at line 1336 now logs + writes a NO_CALL prediction matching the all-exhausted path's shape. (6) Installer process-detection tightened from substring 'tired_market' to (python.exe|pythonw.exe AND command-line regex 'tired_market\\.py') so text-editor false positives stop refusing installs. Closes today's investigation of why predictions.jsonl was stuck at 7,950,276 bytes for 16+ hours despite multiple queue runner passes. Prior body: Picker cooldown awareness — Fix A bundle (2026-05-14): (1) tm_top_ai_picker.pick_top_ai now reads tm_provider_health and excludes providers in active cooldown from the eligible set before ranking; new failure reason 'all_cooldown' carries cooldown_remaining_sec for the surface; cold-start fallback chain (Groq -> first cloud -> first local) skips cooled providers naturally because they're excluded upstream; override path falls through with fallback_from when the pinned provider is cooled; per-exclusion picker_log line for upstream visibility into why a less-preferred provider was chosen. (2) has_any_ai_available shares the awareness automatically because it already delegates to pick_top_ai. (3) New playbook entry recommend_all_providers_cooldown (event=all_ais_in_cooldown, severity=soft_warn, no offered_action) — distinct from per-provider provider_rate_limit_hit. (4) tm_queue_runner gains the 'all_cooldown' branch in run_one_pass that emits the new system_event with cooldown_remaining_sec context for token substitution. Closes the picker-vs-cooldown bug surfaced by today's v4.14.3.1 amber summary line. Fix B (mid-pass rotation) and chronic-429 escalation deferred per investigation. Prior body: Lane ordering + chunked daily_bars + UX honesty bundle (2026-05-14): (1) BULK_FILLABLE_LANES is now a tuple in deterministic order (daily_bars first, fundamentals second, filings third) — was a frozenset, iteration order depended on PYTHONHASHSEED, both bulk and slow fill could randomly fill the wrong lane first and leave the queue runner starving for new daily_bars; (2) new chunked phase-1 helper _run_chunked_phase in tm_fill_executor.py plus per-lane chunked_fetchers parameter on start_bulk_fill / start_slow_fill — daily_bars lane front-loads a yf.download() batch fetch (~100 tickers per HTTP call) before falling through to per-ticker iteration, restoring the original 'usable in 30 seconds' speed for the daily_bars lane; (3) ITOT universe label fixed to ~2,500 (was ~3,500+; the real iShares ITOT holds ~2,490); (4) From-server picker radio is now state='disabled' with label 'coming soon — donor token required' and estimate copy 'not available in this build' — UX honesty fix since start_server_pull is still a stub. tm_fill_executor stop() signature unchanged from v4.14.3.3. Prior body: Bulk fill end-to-end fix (2026-05-14): (A) picker radio restores from cfg['v415_fill_mode'] → lane_config → INCREMENTAL fallback chain instead of hard-coding to INCREMENTAL on every open; (B) explicit-pick start methods (_v415_start_bulk_fill / _v415_start_slow_fill / _v415_start_server_pull) now STOP any running fill before starting their new mode via new _v415_stop_running_fill_for_mode_switch helper, instead of silently no-op-ing past it — launch-time auto-start path keeps its idempotence; (C) cfg gains v415_fill_mode field written from the picker's _on_save, with INCREMENTAL default in load_config so the picker has a persistent record of user intent that survives executor _maybe_transition rewrites; (D) bulk fill's get_scope_tickers call passes None for choices (the May 13 fix slow fill got, finally applied to bulk too) — without this, bulk fill against a partially-cached universe would self-abort because scope = already-filled set. tm_fill_executor.stop() now accepts optional timeout_sec kwarg and joins the worker thread. Bundled because all four problems combined silently swallowed every user attempt to switch into bulk mode. Prior body: Hamburger menu shortcut to universe + fill-mode picker (2026-05-14): new "Stock selection..." entry between AI Mode and Data Providers in the utility menu, calling self._open_fill_mode_picker with no arguments. Settings dialog's "Change data setup (universe + fill mode)..." button left in place — both entry points reach the same picker, with different labels suited to their context. UI discoverability only, no behavior change. Prior body: Queue runner visibility hotfix (2026-05-14): _emit_summary_log no longer suppresses "success, 0 inserts" passes (the runner looked dead when the picked AI was repeatedly in cooldown); _run_one_pass now emits an end-of-pass amber summary line when N/total candidates returned `pred is None` so silent provider failures are visible. No behavior change on the happy path. Prior body: Accuracy → source-weight bridge. The missing connector that activates dormant infrastructure from stages 6 and 7. New module tm_source_accuracy.py reads closed predictions out of PredictionsLog, computes per-model accuracy (target_hits / (target_hits + stop_hits) on closed BUY predictions only — expired/superseded/contradicted are tracked but excluded from the accuracy denominator), maps to within_tier_score on the stage-6 1-15 scale, computes Wilson 95% confidence intervals (stored as integer percent bounds in confidence_band_low/high), and UPSERTs into source_weights table. Three groupings populated: (model, '__global__', '__global__') overall, (model, path, '__global__') per-path, (model, '__global__', ticker) per-ticker (gated on ≥5 decided BUYs for that ticker to avoid creating thousands of low-confidence rows). MODEL_TIERS dict added to tm_source_weights.py with 23 model entries at tier 'M' — all observed in the user's predictions.jsonl. Initialize_source_weights now seeds both data sources (A/B/C/D) AND models (M). get_source_weight recognizes both registries via combined membership check; tier_for() and is_model() helpers added; new list_active_models() symmetric with list_active_sources_for_lane. Score mapping: <10 samples → 5 (default); ≥0.70 → 1-3 (best); 0.60-0.70 → 4-5; 0.55-0.60 → 6-7; 0.50-0.55 → 8 (active threshold); 0.45-0.50 → 9-10 (watched); 0.40-0.45 → 11-13 (watched, lower confidence); <0.40 → 14-15 (removed). Within each band, larger sample sizes pull toward better end. Wired into two existing triggers: _startup_close_outcomes (after the closer + supersession check) and _auto_refresh_tick (after check_outcomes + check_supersessions). 5-minute cooldown via module-level _last_run_at timestamp prevents hammering. Silent on success; visible on failure. Stage 7's source-quality prompt rendering activates automatically once scores differentiate. Stage 6's source_weights infrastructure stops being inert — sample_size and within_tier_score now reflect real prediction outcomes. Out of scope (deferred): state transition logic firing automatically on boundary crossings; per-data-source accuracy (predictions.jsonl doesn't capture which news/social sources informed each prediction — schema extension is a future stage); decay (old predictions weighted same as new); per-context scoring beyond per-path (high_variance vs standard contexts need a context detector that doesn't exist yet); UI surface for showing model accuracy to users. Real-data state at ship: 2,983 predictions in jsonl, 628 closed BUYs, only 59 decided (target+stop) — qwen2.5:14b is the only model crossing the n≥10 threshold (22/46 = 47.8%, lands in score 9 'just-watched'); all other models stay at default score 5 due to insufficient data. Track Record / Recommend / Look Up unchanged in this version. — epistemic humility prompt rendering for source disagreement. Threshold-based detection (not pattern-based) of meaningful per-source directional disagreement in NEWS and SOCIAL blocks; surfaces it to the AI in two reinforcing places: (1) data block flag line ("⚠ Source disagreement: <description>" or "⚠ Cross-source disagreement: <description>"), (2) QUESTION-block prepend asking the AI to reason about uncertainty explicitly, cite conflicting sources by name, avoid generic hedging language, and lean toward WATCH over BUY when the picture is genuinely mixed. NEWS detection criteria (all required): ≥10 articles total, ≥2 sources lean bullish AND ≥2 lean bearish using ±0.2 lean threshold, sentiment-range across per-source means ≥0.4. SOCIAL detection criteria: ≥5 messages, both Reddit and StockTwits represented, opposite per-source leans (one 'bullish' lean tag, the other 'bearish'). Per-source aggregation in detect_news_disagreement avoids the case where a high-volume source overwhelms the signal from a low-volume source. get_news_features now surfaces 'articles' field (per-article (source, sentiment_score) records over a 7-day window normalized to [-1, +1]) so detection can group by source. cache.social() already surfaces source_breakdown.reddit_lean / stocktwits_lean from stage 5's _fetch_social merge; detect_social_disagreement reads those tags. Module-level thresholds in tm_context_builder.py: NEWS_DISAGREEMENT_MIN_ARTICLES=10, NEWS_DISAGREEMENT_MIN_SOURCES_PER_SIDE=2, NEWS_DISAGREEMENT_MIN_SENTIMENT_RANGE=0.4, SOCIAL_DISAGREEMENT_MIN_MESSAGES=5, SOCIAL_DISAGREEMENT_MIN_SOURCES_PER_SIDE=2, SOCIAL_DISAGREEMENT_MIN_SENTIMENT_RANGE=0.4, SOURCE_LEAN_THRESHOLD=0.2 (per-source mean must clear ±0.2 to count toward either side). New function get_disagreement_context(blocks) scans rendered context for the flag markers ("Source disagreement:" / "Cross-source disagreement:") and returns the EPISTEMIC_HUMILITY_PREPEND string when present, None otherwise. Three QUESTION-block injection sites updated in tm_holdings.py: build_holding_analysis (tradable), _build_locked_analysis (locked), _build_candidate_prompt (Look Up + Discover). tm_consensus.fresh-buy path inherits the prepend automatically because it slices on '\nQUESTION:\n' and humility prepends BEFORE that marker. Backward compatibility: when no disagreement is detected, ALL existing prompts render byte-identically to stage 6. Stage 6's source weighting infrastructure NOT consulted in stage 7 — all sources weighted equally for disagreement detection; weight integration is a future stage once accuracy data exists. Stage 7 explicitly does NOT include: pattern-based detection (bimodal distributions etc.), TECHNICAL/EARNINGS/MACRO disagreement (different design problem — single-source-but-mixed-internal-signals), user-tunable Settings thresholds, cross-source framing variance over time. No new dependencies, no new database tables — pure prompt logic. — source weighting schema + storage infrastructure (NOT measurement; that ships post-paper-trade). Two-dimensional weighting locked in: category tier (A=SEC filings, B=News, C=Social, D=reserved) × within-tier score (1-15 scale). State boundaries hardcoded: 1-8 active / 9-13 watched / 14-15 removed. Per-(source × context × ticker) scoring with three-step specificity fallback. Initial state: every registered source seeded at within_tier=5, state='active'. Cross-tier movement is hardcoded; only within-tier numbers are eventually data-driven. New SQLite table source_weights in tired_market.db (PK source_id+context_id+ticker; idx_sw_state index for state lookups). New module tm_source_weights.py: SOURCE_TIERS registry (sec_edgar=A; yahoo_news/finnhub_news/rss_news/google_news=B; reddit/stocktwits=C), LANE_SOURCES mapping (filings/news/social), state boundary helpers, initialize_source_weights migration (idempotent INSERT OR IGNORE — re-running never duplicates rows or resets existing scores), get_source_weight read API with 3-step specificity fallback (ticker-specific → context-default → global-default), list_active_sources_for_lane (filters out watched/removed; sorted by tier then within-tier desc), weights_are_uniform helper, render_source_quality_line (returns None when uniform — stage 6 ships with all weights at 5 so renders nothing today; future stages light up automatically once scores differentiate). Database._init creates the table + idx; Database._init_source_weights seeds defaults on app startup. Additive prompt integration in tm_context_builder._maybe_append_source_quality wired into _news_block, _social_block, _filings_block — defensive getattr(cache, 'source_weights_for_lace', None) check; cache doesn't expose that method today so it's a guaranteed no-op. Existing prompts byte-identically unchanged. Saved for future stages: actual accuracy measurement vs prediction outcomes, state transitions firing, cross-source framing variance detection, per-ticker context history with timeline tracking, decay logic on old prediction data, settings UI surface. — social lane (NEW): Reddit (FWK with embedded credentials default; built on raw urllib + OAuth client_credentials, no PRAW dependency) + StockTwits (keyless public stream, no auth). cache.social(ticker) merges both per-ticker into a normalized snapshot (total_mentions + sentiment_breakdown + top_topics + cross-source agreement). New _social_block (7th built-in) renders compact signal-dense [SOCIAL CONTEXT] in prompts. Path-aware inclusion via _PATH_BLOCK_OVERRIDES — catalyst plays / lottery / aggressive INCLUDE social (primary use case); slow_safe / conservative_income SKIP social (wrong tool); moderate / balanced inherit prompt-kind defaults (which include SOCIAL). TTL_SOCIAL=30min, MAX_DISK_AGE_SOCIAL=24h, persisted disk SWR. Reddit cheat-sheet entry appended to data/internal/provider_signup_specs.json. data/data_providers.json migrated to add 'social' priority entries to all 9 existing profiles + Reddit (priority 1) and StockTwits (priority 2) profiles appended (now 11 total). Reddit credentials shipped blank in _EMBEDDED_CREDS — adapter returns None cleanly until the user provisions shared developer credentials, system falls back to StockTwits-only meanwhile. Macro lane: 'macro' added to DATA_TYPES; FRED profile added (FWK, free 32-char key from fredaccount.stlouisfed.org, priority 1 when configured); Yahoo serves keyless macro at priority 2 via ^TNX/^FVX/^IRX/^TYX/^VIX index tickers. New tm_data_adapter_fred.py for the JSON API. cache.macro() global lookup (no ticker, market_status precedent) with TTL_MACRO=12h, MAX_DISK_AGE_MACRO=7d, persisted disk SWR. _fetch_macro merges Yahoo + FRED into a unified shape. _macro_block (6th built-in) renders [MACRO CONTEXT]. Path-aware block inclusion: _PROMPT_KIND_BLOCK_CONFIG populated, new _PATH_BLOCK_OVERRIDES table; aggressive/lottery paths skip MACRO + FILINGS for speed; build_context grows prompt_kind= parameter. Candidate vocabulary fix: HOLD replaced with WATCH for non-owned tickers (BUY/WATCH/AVOID); HOLD remains valid for owned-position prompts. Touches _build_candidate_prompt question framing, format_prediction_request_block split into _owned/_candidate variants, _PATTERN_DIRECTION regex, _FRESH_BUY_DIRECTION_TOKENS + normalizer (HOLD-as-candidate normalizes to WATCH), prefilter scorer's n_watch bucket, tm_portfolio_panel _direction_color. tm_recommend filter and the closer naturally treat WATCH as non-buy / unresolved (no code change needed there). First cheat-sheet artifact: data/internal/provider_signup_specs.json with the FRED entry; data/internal/ has Windows hidden+system attribute; Settings UI Data Providers row shows the cheat-sheet tier_unlocks blurb upfront and falls back to the cheat sheet for the "Get a free key →" button when tm_provider_discovery doesn't have the provider. data/data_providers.json one-shot migration adds 'macro' priority entries to all 8 existing profiles + appends FRED. User-Agent string in tm_api_providers/tm_provider_discovery stays frozen at 4.13.42.
+APP_VERSION = "4.14.6.112"  # v4.14.5.19-accuracy-weighted-consensus (2026-05-28) Wires per-model Wilson-lower-bound accuracy into the consensus verdict math. Pre-patch: tier-M scores were measured (tm_source_accuracy v4.14.3, Wilson 95% CI from closed BUY predictions) and DISPLAYED in Track Record but never consumed in the verdict — every model's vote counted equally, regardless of track record. Now each vote is weighted by its model's Wilson lower bound (confidence_band_low, 0-100), normalized to 0-10, clamped to [1.0, 9.0]: proven model rises toward 9 (loud, never sole — ceiling 9 < two neutrals' 10, so one accurate model can't unilaterally override), poor model floors at 1 (quiet, never silenced — protects perspective-diversity votes), no/thin data (n<10) sits at neutral 5 (cold-start safe — new install with every model n=0 sees weighted tally == flat tally exactly until predictions resolve). Missing/error -> 5.0 neutral, never raises, never 0. Strictly positive multipliers — low accuracy means "trust less," NEVER "trust the opposite" (no inverse/contrarian weighting; separate someday-maybe). All three consensus paths weighted: owned-position (refresh-triggers ConsensusRunner), fresh-BUY scan (Layer 1 prefilter_history scoring), recommend/lookup. Architecture: ConsensusRunner stays DB-free — App._consensus_weight_kwargs(models) pre-fetches {model: weight} via tm_source_accuracy.build_weight_map() under self.db.lock and splats it into the runner constructor; _finalize calls tm_source_accuracy.weighted_tally() to compute BOTH raw and weighted summaries and attaches them to the result envelope so display sites show both lines (raw tally honest about vote counts; weighted line honest about data maturity with "limited data — N/M models" caveat). cfg['use_accuracy_weighted_consensus']=True (default); False+restart = byte-identical flat-tally rollback. Change 6 bundled: Track Record per-model matrix filters out Ollama/local rows (cloud-only post-v4.14.5.14-ollama-purge); display-only filter, predictions.jsonl rows preserved as historical record (rule: colon in model name = Ollama-shape). Verify-before-build discipline applied: resolver health spot-checked (zero stale-open BUYs, max open age 26d well within timeframes, 215 target_hit+stop_hit predictions feeding Wilson CI), Wilson conservatism confirmed (n<10 returns DEFAULT_WITHIN_TIER=5; thin 2/2 doesn't spike). Lessons: (1) measurement and consumption were disconnected for months (tier-M built v4.14.3, consumed v4.14.5.19) — building the measure-er and never wiring the consumer is a real failure mode; this closes it; (2) ConsensusRunner stayed pure — accuracy weights pre-fetched and passed in, not queried inside the consensus thread; (3) foundation verified before building (resolver, Wilson, cold-start) — same investigation-first discipline that caught EDGAR registry today, applied to a new feature instead of a bug. APP_VERSION_LEGACY=4.14.5.18-priority-promotion-overlay"  # v4.14.5.18-priority-promotion-overlay (2026-05-28) Permanent fix for the EDGAR-fundamentals-stripped-at-boot bug: tm_data_providers.Registry.load() previously did `existing.priorities = prof.priorities` at the persisted-state overlay step (~line 567), wholesale-replacing the code-seeded priorities dict with whatever the saved JSON held. The v4.14.5.15 EDGAR promotion set fundamentals=1 in default_profiles() (correct) but data/data_providers.json still carried the pre-promotion `null` (predated the patch), so every boot silently stripped the promotion — EDGAR never appeared in Registry.serving('fundamentals'), and the daemon went dark whenever Yahoo+Finnhub throttled (NTAP at 10:32 on 2026-05-28 the live proof; static call-graph investigation missed it because the bug lived in load-time STATE, not call-graph code). Manual verify edit (flip null->1 on disk, restart, observe one cycle) confirmed the diagnosis: ~30 consecutive `[edgar] fundamentals fetched` lines through a Yahoo cooldown at 11:30, including NTAP and MRVL. This patch codifies the rule structurally: per-(provider, data_type) merge — persisted non-null OVERRIDES (user reorders are preserved), persisted None KEEPS the seeded value (no demote), both None stays None. Per-key not per-provider — fixes the class of bug for every future priority promotion, not just EDGAR. Self-heals on next save() because the corrected in-memory value is what gets persisted. the user's machine (manual verify edit already applied) sees a no-op merge (persisted=1, seeded=1 -> 1); the patch's value is for fresh installs / any stale-null config / any future promotion. Lessons codified: (1) for any feature whose behavior depends on persisted state, verify on-disk values match code defaults — a call-graph trace alone can prove the code is wired right and miss that disk de-energizes it at load; (2) when a fix's mechanism isn't 100% certain, the cheap manual verify edit (flip one value, watch one live cycle) converts an assumption to a fact before the patch ships. APP_VERSION_LEGACY=4.14.5.17-empty-content-retry"  # v4.14.5.17-empty-content-retry (2026-05-28) Fix Zhipu (and any provider) being permanently dropped from consensus when it returns HTTP 200 with an empty `content` body. Static investigation proved the observed FISV symptom was NOT a timeout — Zhipu replied in well under 180s with an empty JSON envelope, got classified OUTCOME_FATAL by classify_failure(), the existing retry loop skipped it, and the vote was dropped (one minute later, an identical call returned a full 69s response — provider-side flake, not a code-side timeout). Change 1: classify_failure() in tm_ai_router.py now returns OUTCOME_TRANSIENT for error_text matching 'empty content' / 'empty choices' substrings (the exact ProviderError strings raised at tm_api_providers.py:748,752), so the existing transient retry loop (cap=2 retries, backoffs (1s, 3s) — _TRANSIENT_BUDGET in tm_consensus.py:1078-1079 and tm_api_providers.py) re-asks before giving up. After cap exhaustion, vote-as-error is recorded exactly as the pre-patch FATAL path did — graceful degrade preserved. Substring-specific so genuine 4xx (auth/404/malformed) still classify FATAL unchanged. Genuine TimeoutError and 5xx still TRANSIENT unchanged. Applies to all providers (empty body is provider-agnostic). Change 3 (plumbing-only, ships zero behavioral change): tm_consensus.py:1604 now reads provider.get('timeout_seconds', PER_MODEL_TIMEOUT_SEC) at dispatch; no provider sets a custom value today — every existing provider still on 180s. Future-proofing for a genuinely-slow provider. No UI 'slow provider' note shipped: investigation showed Zhipu isn't slow, it occasionally returns empty, so that label would be inaccurate. Lesson: investigate the mechanism before patching the symptom — geography (China-hosted endpoint) made 'slow' plausible but it was wrong; the fix was one branch in the classifier, not a timeout knob. APP_VERSION_LEGACY=4.14.5.16-sec-contact-prompt"  # v4.14.5.16-sec-contact-prompt (2026-05-28) Close-out of the EDGAR primary arc: 4.14.5.15 built the SEC contact READER (env var → generic fallback) but left the local-config slot as a comment stub. This patch wires the reader's (2) slot to read data/config.json['sec_contact_email'] (lenient: must contain '@'; falls through to generic fallback on garbage), and adds a one-time, disclaimer-gated, themed-Toplevel first-run prompt that writes that field — mirroring the existing _v415_check_first_launch_picker self-rescheduling after-loop. the user's machine (TIREDMARKET_SEC_CONTACT env set) silently flips the completed flag and never sees the dialog; only fresh public installs prompt. Blank/Skip is a respected choice (sets completed, falls to generic fallback). Resolution order is now env var → cfg['sec_contact_email'] → generic fallback. Privacy ledger updated: sec_contact_email is local-only; only ever leaves the machine in the SEC User-Agent header on EDGAR requests. Lesson: when an external API requires operator identity, ask each operator for their own — don't ship the developer's. Reader and writer are separate concerns and can land in separate patches. APP_VERSION_LEGACY=4.14.5.15-edgar-fundamentals-primary"  # v4.14.5.15-edgar-fundamentals-primary (2026-05-28) Promoted SEC EDGAR XBRL CompanyFacts to keyless PRIMARY for the router's fundamentals chain (was a side path the router couldn't call). New tm_data_adapter_edgar.adapter() 'fundamentals' branch reuses the existing fetch_fundamentals() (bulk companyfacts, ~99.5% universe coverage, 2/sec self-throttle) + CIK map for company_name; returns Yahoo's exact snapshot key-set with statement-derived fields populated and the four market-derived fields (market_cap/pe_ratio/beta/dividend_yield) + sector/industry left None so the existing _v415_overlay_derived_fundamentals fills them from Yahoo only when actually needed. Router priorities: EDGAR None→1, Yahoo 1→2, Finnhub 2→3. PLUS: replaced the placeholder UA 'research@example.com' (SEC soft-block risk at the new ~50x call volume) with a resolver: env var TIREDMARKET_SEC_CONTACT → generic fallback ('open-source-research-tool (no contact configured)', no email/personal data). the user's machine sets the env var via setx so SEC sees a real warn-before-block contact. Audit _audit_edgar_fundamentals_promotion.py. // v4.14.5.14-yahoo-ratelimit-fix (2026-05-28) URGENT — fixed the false-empty cache pollution from Yahoo IP rate-limits. Cascade Fix 1 (Yahoo's fundamentals/earnings branches swallow ALL exceptions to None) + yesterday's empty-cache (7-day skip on status='empty') interacted: a yfinance YFRateLimitError (Yahoo throttling the IP) was silently converted to None → router status 'empty' → cached as confirmed-empty for 7 days. 104 false-empties already written this morning (incl. MRVL/NTAP/NTNX/NCNO — all real companies with rich historical fundamentals on disk). Fix: new _is_yfinance_rate_limit(e) helper (exact YFRateLimitError class check + string sniff for yfinance renames) in tm_data_adapter_yahoo; both fundamentals and earnings branches now RAISE RateLimitError (the router's own class, which Cascade Fix 3's classify_429/cooldown already handles) on rate-limit, so the router records status='failed' (NOT 'empty') and the empty-cache correctly skips it. Non-rate-limit yfinance exceptions still degrade to None, preserving Cascade Fix 1's no-red-demotion intent. Plus a one-shot backfill of fundamentals_status (date-scoped DELETE) removed all 104 false-empties — next cycle will recheck them. Audit _audit_yahoo_ratelimit_classification.py. // v4.14.5.14-db-concurrency (2026-05-28) ROOT-CAUSE FIX for the 'Source-weight bridge error: bad parameter or other API misuse' (SQLITE_MISUSE) race. app.db.conn was opened check_same_thread=False (suppressing Python's same-thread guard) but SQLite itself still requires serialization — Database.lock existed but was DEAD CODE (the _exec/_query/_query_one helpers that took it had zero callers). 15 background-thread call sites (8 in tm_queue_runner, 7 in tm_event_triggers) plus the bridge all reached app.db.conn directly without locking, racing on the same Connection. Fix: (1) Database.lock is now an RLock (reentrant, belt-and-suspenders against any nested helper). (2) New _db_lock(app) context manager in tm_queue_runner + tm_event_triggers; every _conn(app) caller wraps its SQL block in `with _db_lock(app):` (AST-guided bulk-wrap, all 15 verified). (3) Both bridge call sites wrap in `with self.db.lock:`. (4) tm_source_accuracy._stamp_run() moved from the END of the bridge to right after the cooldown check passes — closes a TOCTOU window where a second concurrent caller (auto-refresh tick during the startup closer's run) could race in. AI router untouched; tm_cache.py untouched (its per-call connection pattern is independent and safe). Audit _audit_db_concurrency_fix.py. No backfill needed (the next successful bridge run self-heals any drift within 5-10 min). // v4.14.5.14-fundamentals-empty-cache (2026-05-27) Applied the earnings empty-cache pattern to fundamentals: when every source confirms 'no fundamentals for this ticker' (router status 'empty'), tm_fundfile_fetcher caches it in a new tm_cache `fundamentals_status` table (ticker/status/as_of, mirrors `earnings`) and the staleness rotation SKIPS that ticker for FUND_EMPTY_TTL_DAYS=7d — killing the per-cycle 'No fundamentals data for X' spam (COFS/CPF/CRML…). Skip happens in the stale-build (before the budget, so the 50/cycle goes to tickers that might have data); earnings-TRIGGERED tickers bypass the cache (new quarter may add data); an 'ok' result clears the marker; 'failed'/'no_source' are NOT cached (retry). Summary gains cached_empty_skipped (one line replaces 40+). Files: tm_cache.py (table + get/upsert/get_all_fundamentals_status), tm_fundfile_fetcher.py (TTL + _load_fresh_empty_fundamentals + _mark_fundamentals_status + loop skip + status writes + summary). Audit _audit_fundamentals_empty_cache.py 13/13. // v4.14.5.14-classify429-data-side (2026-05-27) Cascade Fix 3: wired classify_429 (the AI-side per-minute/daily 429 classifier) into the DATA router so transient rate-limits self-recover. tm_data_providers.Registry.record_failure no longer mis-learns a daily cap from any 429 (the old observed_limits['calls_per_day']=calls_today*0.95 that treated a per-MINUTE 429 as a permanent daily wall is REMOVED); instead it classifies the 429 and applies a TIME-BASED cooldown (per-minute/unknown → 60s/5m/30m escalating, auto-clearing; daily → until midnight or honored Retry-After) held in an in-memory Registry._cooldown. Generic non-429 failures only cool down after 3-in-a-row (preserving 1-2 blip tolerance), then escalate. _is_eligible now gates on cooldown expiry + declared daily cap, NOT health=='red' (the stuck-red bug — red only cleared on a success the provider was never allowed to attempt); health is now display-only. record_success clears the cooldown (trial succeeded → recovered). record_failure returns cooldown info; the router logs it amber ('<provider> per-minute — cooldown 60s, retry at HH:MM:SS'). AI-side classify_429 usage untouched. Audit _audit_cascade_fix_3_classify429.py. // v4.14.5.14-gui-cleanup-h (2026-05-27) Watchlist moved from the left column to a dedicated Watch window (new 'Watch' toolbar button between Look Up and Stop), mirroring Track Record -> Performance. Removed the left-column WATCHLIST panel (left column is back to just the Portfolio panel; the 4 Phase D/F panel methods replaced). New window (_make_styled_toplevel, single-instance lift): add-ticker input row + scrollable list of COLLAPSIBLE cards (default collapsed, Portfolio-card style). Collapsed header: chevron + verdict dot + ticker + TRADABLE + price + change% + age + 'AI: <verdict>' + Remove. Expanded body: aggregate consensus (gui_watch_consensus — one vote per canonical model: 'N BUY · N WATCH · N AVOID (M models, last analyzed …)'; NOT per-model — that's in the Performance matrix) + plan target/stop + 'Look Up fresh' (prefills the Look Up window) + 'Add to Holdings' (prefills the Portfolio add-form via its existing _form_ticker StringVar). Ticker-strip WATCHED section + backend Watchlist unchanged; refresh wiring repointed to the window (no-op when closed). Audit _audit_gui_cleanup_phase_h.py. // v4.14.5.14-indicator-honesty (2026-05-27) Persistent activity indicator now binds to REAL state, not a stale log echo. gui_activity_label gained (in_flight, msg_age, stale_after=10): a genuine in-flight AI call (holdings_window _consensus_running/_discover_running) always shows 'Analyzing'; the most-recent log line is mapped only while fresh (<10s) — an older line is a finished echo so the indicator falls back to Idle/Paused/Loading; and the generic 'consensus'/'analyz' substring fallback (which falsely showed 'Analyzing' on completion echoes like 'analyzed 1 via Groq' at idle) was REMOVED. _log now stamps _last_activity_at; the _set_status_mode indicator branch passes in_flight + msg_age. Phase C audit expanded 42->50 (8 honesty cases). // v4.14.5.14-gui-cleanup-f (2026-05-27) Watchlist panel REBUILT as a visual peer of the Portfolio panel (Phase D shipped a thin row; original design said 'a list similar to portfolio'). _build_watchlist_row now renders a bordered CARD mirroring tm_portfolio_panel._build_tradable_card styling (built in-style, NOT copied — that module stays Do-Not-Touch): line 1 = verdict-colored dot + ticker (accent 10b) + green TRADABLE pill + price + change% + right-packed age + Remove; line 2 = 'AI: <verdict>' (or 'AI: not yet analyzed' when no prediction on record). Header now matches PORTFOLIO typography (accent 10 bold); empty state is a bordered card-height block. Method names / data sources (get_recent_for_ticker, cache.quote, gui_watchlist_dot, gui_short_age) / refresh wiring (_schedule_ticker_refresh tick + add/remove) / ticker-strip WATCHED section all unchanged. Audit _audit_gui_cleanup_phase_f.py. // v4.14.5.14-watch-cerebras (2026-05-27) Watch-button regression fix + Cerebras model fix: (1) the Phase D "Add to watchlist" button lived in _render_quick_result, which is NEVER called — so the watchlist had no working populate path. Added a persistent "Add to watchlist" button to the LIVE Look Up input row (_on_watch_click; disabled until a ticker is typed; calls Watchlist.add → record_user_signal, refreshes the WATCHLIST panel + ticker strip immediately). (2) Deleted the dead _render_quick_result (+ nested _add_to_watchlist), breadcrumb left. (3) data/api_providers.json Cerebras llama3.1-8b → gpt-oss-120b (stale Llama id 404'd; live /models showed only gpt-oss-120b + zai-glm-4.7 remain, so the llama-3.3-70b fallback would also 404 — picked gpt-oss-120b: live, strong, distinct canonical model). Audit _audit_watch_button_and_cerebras_fix.py. // v4.14.5.14-cascade-fixes (2026-05-27) Earnings+fundamentals cascade fixes (1/2/4 from the investigation): (1) tm_data_adapter_yahoo fundamentals branch returns None on a yfinance hiccup instead of raising (mirrors the earnings-branch hardening) so a transient hiccup no longer demotes Yahoo to health=red session-wide; (2) tm_fundfile_fetcher paces the fundamentals + earnings seed loops at <=55/min (FUNDFILE_RATE_LIMIT_PER_MIN, news-fetcher parity) and breaks the cycle after FUNDFILE_EXHAUSTION_BREAK=3 consecutive no-source/failed results (per-cycle only; next 30-min tick retries) — kills the 40+ "no eligible source" burst; (4) tm_data_router reserves the red "All sources failed" log for status=='failed' (real fault) and logs honest 'empty' (every source reached, no data — e.g. no upcoming earnings) as a quiet muted "No <type> data ... from any source" line. Fixes 3 (classify_429 on data side) + 5 (per-data-type health) deferred. Audit _audit_earnings_fundamentals_cascade_fix.py 17/17. // v4.14.5.14-gui-cleanup-e (2026-05-27) Hamburger removal + Settings consolidation: the ≡ utility menu (Help/Settings/AI Providers/Data Providers/Exit) is gone, replaced by a direct ⚙ Settings button in the same rightmost toolbar slot (single click → _show_settings, no menu); _show_utility_menu removed; AI Providers + Data Providers became link-out sections INSIDE the Settings dialog (Open AI Providers... / Open Data Providers... buttons calling the unchanged standalone Toplevels); Help dropped from the UI (Teacher AI will own it — _show_help kept as dead code per Phase A precedent); Exit dropped (the window X already runs the same graceful _on_close). NO "API button" existed to remove — the top-bar "API" is the static _ai_mode_pill cloud-only mode tag (kept, on the Do-Not-Touch badge cluster). Look Up no-providers hint repointed "☰ menu → API Providers" → "⚙ Settings → Open AI Providers". Audit _audit_gui_cleanup_phase_e.py. // v4.14.5.14-gui-cleanup-d (2026-05-27) Watchlist UI: new WATCHLIST panel pinned at the bottom of the left column (its own holder frame below the whole Portfolio panel — tm_portfolio_panel.py untouched), compact one-line rows (verdict dot via gui_watchlist_dot / ticker / price / change% / verdict age via gui_short_age / Remove button), empty-state pointing to Look Up; top ticker strip restructured into PORTFOLIO (always) + WATCHED (only when non-empty) sections via gui_ticker_strip_sections, cell-build extracted to _build_ticker_cell (no scroll added — clip behaviour preserved); watchlist panel + strip refresh on the ~15s tick and on add (Look Up button — already existed, Part 2 skipped) / remove. Backend tm_discover.Watchlist (data/watchlist.json, shipped v4.14.4.3) reused as-is: .tickers / .add() [fires record_user_signal itself — not called twice] / .remove(). Audit _audit_gui_cleanup_phase_d.py. // v4.14.5.14-stale-cleanup (2026-05-27) Stale teacher-AI cleanup + universe reconcile: removed the dead path_universe_mismatch intercept chain (_V415_MISMATCH_RULES, both checkers, the emitted flag) and the orphaned open_universe_picker intent; reconciled cache-fill universe to Russell 3000 (cfg v415_universe russell3000 -> ETF iwv ~3,000 tickers; _V415_DEFAULT_UNIVERSE too); banner path label now uses _RECO_STYLE_LABELS (Speculative) and PATHS['lottery'].name -> 'Speculative'; de-staled ~9 playbook entries (freshness indicator -> phase-progress row, dropped Ollama/AI Chat/Choices-summary/Slow & Safe/Penny Lottery refs -> cloud-only + current labels) and stale related_feature_ids (freshness_indicator/freshness_states_concept/choices_modal/ai_chat/setting_storage_cleanup), KEEPING live ai_mode_pill/ai_badge/setting_data_backups. Audit: _audit_stale_content_cleanup.py 35/35. // v4.14.5.14-gui-cleanup-c (2026-05-27) Top-bar status: startup phase-progress row [Startup/Conservative/Moderate/Aggressive] dots that turn green as each path's initial fill completes (Speculative omitted — event-driven, no completion state), a brief "All set" completion announcement, then collapse to an enriched persistent activity indicator (reuses _state_icon_lbl; adds Checking news / Analyzing / Filling X states). Logic in pure gui_* helpers (testable); a ~2.5s _tick_status_bar poll drives the widgets; completion detected read-only (recommend_cache counts vs target OR fill-mode 'nothing to analyze' log line) — no fill-loop edit. New data/teacher_knowledge/paths_and_recommendations.md (foundation for future Teacher AI; not yet consumed). Audit _audit_gui_cleanup_phase_c. # v4.14.5.14-gui-cleanup-b (2026-05-27) Merged Track Record + Accuracy Matrix into one "Performance" window: the Track Record toolbar button now opens a ttk.Notebook (first Notebook use) with "Summary" (Track Record content) + "Per-Model Matrix" (former Accuracy Matrix) tabs; the Accuracy Matrix hamburger item is removed (menu → 5: Help/Settings/AI Providers/Data Providers/Exit). tm_holdings._show_track_record gained a container/tab mode (win+_track_record_win point at the Performance Toplevel so async chunked-render + winfo_exists guards + the consensus-view dropdown all keep working; standalone path preserved as fallback). The matrix now counts HOLD/TRIM/BUY MORE outcomes (decided + hits), consistent with the Track Record headline. Audit _audit_gui_cleanup_phase_b; phase_a/phase_a2 updated (Accuracy Matrix menu gone, hamburger=5). # v4.14.5.14-gui-cleanup-a2 (2026-05-27) GUI removals round 2 (no behavior change): hamburger trimmed to 6 items (removed Restore from Backup / Scan Settings / Show Prompt Template); Settings dialog reduced to UPS + DISPLAY (removed the Show-advanced toggle + AI BEHAVIOR + AUTO-REFRESH + DATA & BACKUPS + STORAGE & CLEANUP sections + the _save references to their vars); the underlying daemons/hooks (auto-backup-on-exit, background scheduler, auto-refresh loop, startup cleanup) keep running on their cfg defaults. _open_fill_mode_picker KEPT (Teacher AI onboarding _step3 still calls it). Backing handlers left as dead code. Audit _audit_gui_cleanup_phase_a2; _audit_hamburger + _audit_settings_dialog_cleanup updated. # v4.14.5.14-gui-cleanup-a (2026-05-27) GUI removals (no behavior change): removed the Scan + Scan All toolbar buttons, the Refresh All Holdings / Stock selection / Data Mode hamburger items, the first-run "Set up your data" picker auto-open, and the "data: Xm old" freshness label (_freshness_lbl). The Idle/state indicator (_state_icon_lbl) stays. Backing methods (_consensus_quick_scan/_scan_all_paths/_refresh_all_holdings/_show_data_mode) + _open_fill_mode_picker (Settings still uses it) remain defined; only UI entry points removed. Audit _audit_gui_cleanup_phase_a; _audit_hamburger_universe_shortcut inverted. # v4.14.5.14-trim-buy-more-grading (2026-05-27) Closes the parked HOLD-grading follow-up: TRIM and BUY MORE owned-position verdicts (written verbatim by _write_refresh_prediction since 2026-05-26) were expiring ungraded. tm_discover.check_outcomes now grades them on their own verdict tracks — TRIM correct on decline/in-band-plateau, wrong on surge past target; BUY MORE graded like BUY (target=correct, stop=incorrect, in-band expiry=inconclusive/expired). _compute_stats_dict gains trim_/buy_more_ correct/incorrect/decided/accuracy_pct (accuracy None until decided, isolated from BUY n_decided like HOLD). tm_holdings Track Record shows TRIM/BUY MORE lines only when decided>0. Forward-looking: 0 such predictions exist yet (writer is 1 day old). Audit _audit_track_record_trim_buy_more_grading. # v4.14.5.14-keep-awake (2026-05-27) New module tm_keepawake.py prevents Windows SYSTEM hibernation ONLY during active queue-runner work (a fill pass or an event-driven dispatch) via SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED); monitor sleep is still allowed (ES_DISPLAY_REQUIRED deliberately omitted, so the screen can still turn off). request_keep_awake is called at the two dispatch points in tm_queue_runner; _manage_keepawake releases the hold after 2 consecutive idle cycles; _on_close releases it on graceful shutdown. No-op on non-Windows. Audit _audit_keep_awake.  # v4.14.5.14-queue-runner-log-honesty (2026-05-26) The queue-runner pass summary now counts REAL AI calls separately from gated/skipped candidates. Old line called (candidate_count - skipped) 'analyzed', so a pass where everything was gated (dropped before any AI call via drop_reasons) read identically to one that did N real analyses. New: _emit_summary_log takes a gated count (= sum(drop_reasons.values()), passed from both success-path emits); analyzed = checked - gated - skipped. Formats: all-gated -> 'N candidates checked, all gated; 0 AI calls, 0 new picks'; mixed -> 'N checked, G gated, A analyzed via X, I new picks queued'; zero -> 'nothing to check this cycle'. Per-provider counts kept (v4.14.3.11 load-distribution; more honest in silent-fail cases). Pure reporting change — dispatch/gating logic untouched. Audit _audit_queue_runner_log_honesty 10/10; _audit_provider_exhaustion updated to new wording (38/0).  # v4.14.5.14-ai-verdict-indicator (2026-05-26) Portfolio card headers now show a quiet 'AI no longer recommends BUY' hint: when the AI's CURRENT predominant consensus verdict for a held ticker is not BUY, the header shows AI: HOLD (amber) / AI: SELL|AVOID|TRIM (red). BUY/BUY MORE or no-consensus -> no indicator. Current-price-relative by design (what the analysis says now, independent of cost basis). New module helpers _predominant_verdict + _ai_verdict_indicator (reuse the consensus tally) and method _compute_ai_current_verdict; rendered on the always-visible header (line 2 for tradable cards, header row for written-off) so it shows collapsed AND expanded. State badges + Sell Triggers untouched. Audit _audit_position_header_verdict 18/18.  # v4.14.5.14-manual-sell-tracking (2026-05-26) Investigation found the manual-sell Track Record gap was MOSTLY already closed: the portfolio Sell handler already records every sale in the holdings Trade History (closed list / realized stats) via sell_holding AND grades any open AI prediction at the sell price via mark_position_sold (the RIG fix). Residual gap: a manual buy/sell with NO AI prediction was invisible in the Track Record CARD (it lived only in the Trade History view). Closed by surfacing the holdings managers full realized record (get_realized_stats) on the Track Record headline as a 'Your actual trades (incl. ones the AI never predicted)' line. Deliberately did NOT inject synthetic manual_sell records into predictions.jsonl (would duplicate Trade History + pollute AI per-model/accuracy stats). Display-only in the AI card; no prediction-store or BUY/SELL grading changes. Audit _audit_manual_sell_track_record 9/9.  # v4.14.5.14-hold-grading (2026-05-26) Track Record now grades HOLD predictions (written by Refresh-Triggers) on their OWN verdict track. Before, HOLD could only reach OUTCOME_EXPIRED -> excluded from accuracy, so HOLD calls were silently uncounted. tm_discover.check_outcomes gains a DIRECTION_HOLD branch: a target/stop breach -> hold_broken (BUY/SELL would have won); surviving the timeframe in-band -> hold_held (correct); no band -> expired (ungradable, skipped). New OUTCOME_HOLD_HELD/BROKEN; _compute_stats_dict adds hold_held/hold_broken/hold_decided/hold_accuracy_pct, kept SEPARATE from the BUY target/stop denominator (n_decided unchanged -> no BUY/SELL regression). Track Record shows a HOLD-accuracy line. Audit _audit_track_record_hold_grading 12/12.  # v4.14.5.14-macro-keyless (2026-05-26) Eliminated the LAST keyed-only data capability. FRED macro is now keyless-first: tm_data_adapter_fred uses FRED's own public CSV endpoint (fredgraph.csv, date-limited <1KB) for all 8 series when no key is set, with keyless fallbacks (Treasury par-yield XML for 2Y/10Y, BLS v1 API for CPI/unemployment; Yahoo VIX/10Y merged upstream). A FRED JSON key is now OPTIONAL (higher rate ceiling). fred needs_key=False in tm_data_providers.py + data/data_providers.json; FRED removed from provider_signup_specs.json (now zero data-provider entries). Every data type has a keyless primary -> teacher AI recommends zero data keys, only cloud-AI-inference keys. Audit _audit_macro_keyless 12/12; _audit_honest_key_recommendations updated. macro consumer + cache schema unchanged.  # v4.14.5.14-honest-key-recommendations (2026-05-26) Compliance fix for the Honest key recommendations principle (DECISIONS.md): removed the teacher-AI playbook nudge to 'add a Finnhub key' / 'configure a keyed quote source' for Yahoo price rate-limits (prices are keyless via Yahoo+Stooq, and Finnhub price=None so the nudge was also ineffective); reworded the provider-exhausted entry to a generic example instead of singling out Finnhub; removed the orphaned Reddit entry from provider_signup_specs.json (Reddit was dropped). Only FRED (legit keyed-only macro) remains in the cheat-sheet. Audit _audit_honest_key_recommendations 6/6. data files only; no code logic changed.  # v4.14.5.14-daemon-keyless-first (2026-05-26) Daemon snapshot fundamentals path is now keyless-first: Yahoo (keyless) primary at priority 1, Finnhub (keyed) demoted to bonus at priority 2, in both tm_data_providers.py defaults AND data/data_providers.json (4th touchpoint). Runtime serving('fundamentals') == [yahoo, finnhub]. No behavior change for keyless users (already got Yahoo via fallthrough); keyed users get field-equivalent Yahoo snapshot first. EDGAR analysis path untouched. Audit _audit_fundamentals_keyless_first 6/6.  # v4.14.5.14-derived-overlay (2026-05-26) AI prompt FACTS block now gets BOTH statements AND derived/market fields (company_name, sector, industry, market_cap, pe_ratio, beta, dividend_yield) for keyless users. The fundamentals cache table is statement-only (no columns for derived fields), so a cache-reader overlay was structurally impossible; instead module-level _v415_overlay_derived_fundamentals overlays the live router snapshot onto each deep-statement dict at return time in _fetch_fundamentals (fills only Nones, deep statement values win, best-effort, memoized 6h by DataCacheLayer._get so ~1 Yahoo call per ticker per 6h).  # v4.14.5.14-portfolio-collapsed-default (2026-05-26) Portfolio holding cards now default to COLLAPSED on startup (was a size-based smart default that started small portfolios expanded). One-line flip in _get_card_expanded (default=False); the compact two-line collapsed view (header + state badge) is the at-a-glance scan surface. Badge already renders collapsed (it lives in header_section, always packed; only the body toggles), so no badge change needed. Tradable AND written-off cards share _get_card_expanded -> uniform. State is session-only (plain instance dict, no persistence) -> every restart resets to collapsed; within a session a card stays as last toggled. Chevron toggle unchanged (expands body, ▼/▶ glyph). Audit _audit_portfolio_collapsed_default.py 9/9; all 7 audits green. --- prior: v4.14.5.14-edgar-fundamentals (2026-05-26) Added EDGAR XBRL CompanyFacts as the keyless PRIMARY deep-statement fundamentals source. New tm_data_adapter_edgar.fetch_fundamentals(ticker): reuses the existing CIK lookup + UA + politeness, fetches data.sec.gov/api/xbrl/companyfacts, extracts the most-recent ANNUAL (fp=FY/10-K) revenue, net_income, EPS, gross/operating margin, total_assets/liabilities, shares (selecting most-recent end across alternate tags so Apple-style frozen-tag traps are avoided — e.g. us-gaap:Revenues froze 2018). Wired as the FIRST deep fetcher in _fetch_fundamentals (before Finnhub-deep/yfinance-deep); writes an "edgar" deep row, then re-read. _v415_cache_read_fundamentals now FIELD-MERGES across deep sources in priority order edgar>finnhub_deep>yahoo_deep (a field EDGAR lacks falls back to the next source). Architecture note: EDGAR is a DEEP fetcher, NOT a router fundamentals profile entry (the router path is only the derived-field snapshot last-resort, and is single-source — adding EDGAR there would drop Yahoo derived fields). Derived fields (beta/pe/market_cap/sector) stay None in the cache reader, unchanged — a statements+derived live-snapshot overlay is a parked follow-up. Verified live (AAPL FY2025 revenue $416B/net_income $112B; FISV FY2025). Audit _audit_edgar_fundamentals_provider.py 23/23; all 6 audits green. --- prior: v4.14.5.14-nasdaq-observability (2026-05-26) Nasdaq earnings adapter now logs its bulk sweep to the activity log (was DB-only): a start line ("[nasdaq] startup sweep: fetching ~N business days"), a "[nasdaq] sweep complete: N dates, M events, K unique tickers cached" line, and an amber "[nasdaq] sweep partial: X of N dates fetched" when some dates fail. Routed via the router note-logger captured at register_with(); adapter behavior (caching/refresh/response shape) unchanged. Also recorded the decision to KEEP Finnhub at earnings priority 3 as a resilience layer (no unique fields, but real redundancy — see DECISIONS 2026-05-26). Audit _audit_nasdaq_earnings_provider.py 23/23 (+3 observability checks); all 5 audits green. --- prior: v4.14.5.14-nasdaq-earnings (2026-05-26) Added Nasdaq earnings calendar as the keyless PRIMARY earnings source (new tm_data_adapter_nasdaq.py). Endpoint api.nasdaq.com/api/calendar/earnings (keyless, browser-UA required, bulk-by-date) verified live. Adapter sweeps a bounded ~45-day near-term window once/24h into an internal {ticker->next_event} cache and answers the router per-ticker from it (router days_ahead ignored; Nasdaq is bulk-by-date). Earnings priority is now keyless-first: nasdaq(1) > yahoo(2) > finnhub(3, keyed bonus, demoted from 1). finnhub demotion + the nasdaq profile applied to BOTH tm_data_providers.py defaults AND data/data_providers.json (JSON priorities override defaults at load — same 4th-touchpoint lesson as the social removal). Nasdaq is dense near-term / sparse far-term, so distant dates (e.g. FISV July) stay Yahoo-sourced until they enter the window. Failures return None -> Yahoo fallback (never raises). News/fundamentals/etc priorities unchanged. Audit _audit_nasdaq_earnings_provider.py 20/20 (+live 49-row fetch); all 5 audits green. --- prior: v4.14.5.14-social-dropped (2026-05-26) Social (Reddit + StockTwits) removed as a supported data type per DECISIONS.md (Reddit keyless path is gatekept-impossible; StockTwits alone not worth maintaining). Removed: reddit/stocktwits ProviderProfiles + the social DATA_TYPE from tm_data_providers.py; the two register_with() calls (commented w/ DECISIONS ref); and the reddit/stocktwits entries from data/data_providers.json (the registry re-injected them via load()s user-added branch, so the JSON had to be cleaned too — verified serving('social')==[] after load). Adapter files + imports + _fetch_social/_social_block scaffolding left on disk (degrade to None/empty gracefully); social_signals cache table preserved (no new writes). Audits 4/4. --- prior: v4.14.5.14-recommend-density-v1 (2026-05-26) Recommend dialog (basket columns) conservative density pass: column header 12->10, Consolas number rows (shares/cost/target) 9->8, and a scoped _rs spacing dict (md 12->9, sm 8->6, xs 4->3) inside _render_recommendations ONLY. Ticker stays Consolas 10; already-8pt body text + consensus pill + Layer2 badge left as-is (Recommend baseline was already ~8pt; 7pt body is a future v2). Shared self.fonts/self.space untouched; layout-only, no logic change. Also de-brittled the live-FISV smoke checks in _audit_compact_holding_row.py + _audit_sell_trigger_dated_rule.py to assert against current data instead of a frozen verdict (they went stale once refresh-triggers wrote FISV fresh HOLD — not a regression). Audits 4/4 green. --- prior: v4.14.5.14-refresh-triggers-writes-prediction (2026-05-26) Refresh-Triggers (and Re-run consensus) now WRITE a prediction record when the owned-position consensus completes, closing the loop: the SELL TRIGGERS block re-renders from the fresh verdict and the OUTDATED warning clears. New PortfolioPanel._write_refresh_prediction re-parses a representative WINNING-direction vote's response via tm_discover.parse_prediction (the consensus rollup has no aggregated numeric target/stop — only free-text per-vote strings) -> one prediction with direction=winner, source='refresh_triggers', numeric target/stop/timeframe_days; writes nothing if no winning vote has a usable target+stop or the winner is SELL/AVOID. Mirrors the Look Up writer. is_consensus_outdated unchanged. Audit _audit_refresh_triggers_writes_prediction.py 13/13. --- prior: v4.14.5.14-target-stop-override-recency (2026-05-26) target_stop event-driven fires now BYPASS the verdict-recency gate (a price crossing its target/stop is the high-signal event the verdict was waiting for, so re-analyse even if the verdict is recent); price_drift/news/earnings/staleness stay gated as before. Threaded a recency_bypass set (built in _run_event_driven_sweep from fires where kind=='target_stop') through run_one_pass_for_triggers -> _unified_dispatch_ticker -> _eligible_paths_for, where it skips ONLY the verdict-recency check (pool + price-band gates still apply, 5-min target_stop dedup still applies). Optional param defaults None so cadence/fill callers are unchanged. Audit _audit_target_stop_recency_override.py 11/11. Cost: more Groq calls on real target/stop crossings (intentional; revert = flip the bypass off). --- prior: v4.14.5.14-writeoff-density (2026-05-26) Written-off (and shared locked) cards in _build_locked_card brought to match/beat the tradable card density so they read as a quiet record, not dominant content: ticker 11→10, chevron 10→8, position sub-line 8→7 (via _card_fonts), italic explanation 8→7; spacing now reuses _card_space (md 12→7, sm 8→4, xs→2). WRITTEN OFF/LOCKED pill stays 7, Remove button stays 8pt (click target preserved). Scoped reuse of existing _card_fonts/_card_space — shared app.fonts/app.space untouched; layout-only, no logic change (audits 12/12 + 7/7). --- prior: v4.14.5.14-portfolio-header-density (2026-05-26) PORTFOLIO header (summary card) brought into proportion with the v1-v3 compacted holding cards: "$ total" 18→14 bold (still the headline, no longer dominant), PORTFOLIO label 12→10 bold, breakdown + "N tradable" lines 9→8, Active-watching ON/OFF + written-off lines 8→7; card pad 12→8, header→first-card gap 8→6, element pady ~30-40% tighter. "Set cash" button left at 8pt (already small, preserved as click target). Scoped to _build_summary_card via explicit literals — shared app.fonts/app.space (used by window titles/big numbers elsewhere) untouched; layout-only, no logic change (audits 12/12 + 7/7). --- prior: v4.14.5.14-density-pass-v3 (2026-05-26) Portfolio tradable-card density pass v3 (final tightening): font floor stays 7pt, main lever is SPACING — self._card_space md 9→7 / sm 6→4 / xs 3→2. Selective font trims: ticker 11→10, dot 9→8, SELL TRIGGERS values 8→7. Chevron AND the line-2 state badge stay 8pt (badge now pops even more above 7pt neighbours). Shared app.fonts/app.space untouched; layout-only, no logic change (audits 12/12 + 7/7). If too cramped the easy revert is _card_space['sm'] back to 5-6. --- prior: v4.14.5.14-density-pass-v2 (2026-05-26) Portfolio tradable-card density pass v2: design target moved to a 1366x768 laptop at 125% Windows scaling, so the font floor dropped 8pt→7pt. self._card_fonts now 7pt (body/mono/body_bold/caption), self._card_space md 11→9 / sm 7→6 / xs 4→3, and in-card font literals dropped one more point (ticker 12→11, dot 10→9, chevron 9→8, SELL TRIGGERS values 9→8, labels/snippets/pills 8→7). EXCEPTION: the line-2 state badge stays 8pt so the OUTDATED/DATED/TARGET/STOP glance-signal pops above its 7pt neighbours. Shared app.fonts/app.space untouched; layout-only, no logic change (audits 12/12 + 7/7). --- prior: v4.14.5.14-density-pass-v1 (2026-05-26) Portfolio tradable-card density pass v1 (FIRST iteration, baseline to tune): ~10% smaller fonts + spacing INSIDE the tradable holding card only, via scoped self._card_fonts (body/mono/body_bold 9→8) + self._card_space (md 12→11, sm 8→7, xs 4) and in-method font-literal scaling (ticker 13→12, dot 11→10, chevron 10→9, SELL TRIGGERS values 10→9, labels 9→8); floor 8pt, nothing enlarged, pills/captions at 7-8 left as-is. Shared app.fonts/app.space (PORTFOLIO header, written-off cards, add-form, activity panel) untouched; no logic change (compute_holding_state/is_consensus_outdated/is_sell_trigger_dated unchanged; audits 12/12 + 7/7). --- prior: v4.14.5.14-compact-holding-row-fix-2line (2026-05-26) Collapsed holding row split from one line to TWO predictable lines, fixing the single-line clipping that hid the state badge AND the expand/collapse chevron on narrow windows. Line 1 = dot+ticker+TRADABLE+position/P&L (left), scan-age+chevron (right, chevron right-packed first so it never clips); Line 2 = state badge (left only), omitted when FRESH. compute_holding_state / is_consensus_outdated / is_sell_trigger_dated logic unchanged; audits _audit_compact_holding_row.py 12/12 + _audit_sell_trigger_dated_rule.py 7/7. --- prior: v4.14.5.14-compact-holding-row (2026-05-26) Portfolio collapsed holding row compacted to asingle ~one-line strip (dot+ticker+TRADABLE+position/P&L left; scan-age+state badge+chevron right) so 5+ holdings stay scannable; the old separate position row and redundant "consensus:" line removed (the breakdown still shows in the expanded CONSENSUS block). New at-a-glance state badge via tm_portfolio_panel.PortfolioPanel.compute_holding_state (priority: TARGET_HIT>STOP_HIT>OUTDATED>DATED>FRESH); the superseded consensus-disagreement check extracted to is_consensus_outdated and shared with the loud expanded OUTDATED warning. Expanded view + written-off cards unchanged. Audit _audit_compact_holding_row.py 12/12. --- prior: v4.14.5.14-sell-trigger-dated-rule (2026-05-26) SELL TRIGGERS dim tag is now thesis-based, not clock-based: shows "DATED — <reason>" only when the prediction's stated timeframe expired, a target/stop price was hit, or a new SEC filing arrived after the prediction (filings-only this version; news/earnings parked). New tm_portfolio_panel.PortfolioPanel.is_sell_trigger_dated; loud OUTDATED consensus-disagreement warning left untouched. Audit _audit_sell_trigger_dated_rule.py 7/7. --- prior: v4.14.5.14a.8 (2026-05-17) Recommendations filter-consistency bug fixes (post-a.7 live testing). Phase 0 trace = Scenario A: v4.13.58 made price/conviction filters SOFT (build_recommendations built columns from the full pool; _filter_passes only moved the survivor counter, never the columns — explicit code comment) AND _cache_key excluded price/conviction so changing the tier didn't even rebuild. BUG 1 fix: filter_eligible_predictions/build_recommendations gained an optional post_filter= (applied to fully-normalized picks) + prefilter_eligible_count; _render_recommendations builds _hard_filter (price tier/min-max + conviction + consensus gate), passes post_filter=_hard_filter, and _cache_key now includes the filter signature → columns == survivor counter (single source of truth). BUG 2 fix: _consensus_quality_ok — recent per-ticker direction tally from the same prediction pool the badges reflect; ≥2 votes & non-BUY plurality & BUY doesn't tie → excluded (no data / clear BUY / BUY-tie → kept, original tag stands); honest "X of Y survive" via prefilter count. BUG 3 fix: Min consensus slider removed (label+Scale+v4.13.60 auto-clamp deleted; consensus_var kept as fixed IntVar(1) no-op so 2 downstream refs stay valid). post_filter defaults None = legacy behaviour (other build_recommendations callers untouched, verified). Audit _audit_recommendations_filters.py 35/35; regression green. UI structural/AST-verified ONLY — the user must visually confirm filtered columns match the counter, bad-consensus picks no longer Top option, no Min-consensus slider. Files: tm_recommend.py, tired_market.py, _audit_recommendations_filters.py. --- prior: v4.14.5.14a.7 (2026-05-17) CHOICES DIALOG REMOVED + Recommendations inline filters. Phase 0 found the prompt's assumptions wrong: the Recommendations dialog ALREADY had cash + a path OptionMenu + a min/max price filter + conviction/min-consensus; the user approved the reduced split. (A) Choices modal retired: _open_choices_window → inert no-op (orig body kept as _open_choices_window_DEPRECATED_REMOVED dead code to avoid blind structural excision in this 19k-line unrunnable-here tkinter file), summary strip not built, onboarding step2 → informational (no Choices, no key creation), _v415_format_choices_for_prompt early-returns '' + prompt builder user_preferences_fn=lambda:'' (soft sentence was ~no-op per a.5), _selected_bands always returns all bands (drops the v415_price_ranges momentum-sort tiebreak), App.__init__ no longer seeds the keys, v415_price_ranges/v415_style deleted from config.json (v415_universe/v415_fill_mode KEPT — separate picker). Shared _v415_get_choices/_set_choices/_estimate_universe_size PRESERVED (universe/fill picker still uses them; they safe-default when keys absent). (B, additive only) Recommendations: "Path:"→"Trading style:" with friendly labels (Conservative/Moderate/Aggressive/Speculative/Penny Stocks → slow_safe/moderate/aggressive/lottery/penny_lottery), bound to GLOBAL cfg['analysis_path'] (Q2 — one intent place); new "Price tier:" OptionMenu in the FILTERS row that DRIVES the existing min/max (single source of truth; power users still type exact values), persisted as cfg['last_price_tier'], applied on open. New module-level _RECO_STYLE_LABELS/_RECO_PRICE_TIERS/_reco_tier_bounds (single source shared with audit). Deployment math untouched (C no-op; already correct). Audit _audit_recommendations_filters.py 24/24 (source/AST-based — tk not importable headless). UI is structural/AST-verified ONLY — the user must visually confirm the dialog. Files: tired_market.py, tm_recommend_cache.py, _audit_recommendations_filters.py. --- prior: v4.14.5.14a.6 (2026-05-17) PER-PATH CANDIDATE SOURCING (Option-3 hybrid). a.5 found Recommend won't fill because the momentum filter fed volatile small-caps to slow_safe, whose "established/dividend" lens correctly AVOIDs them all. Phase 0 data assessment: fundamentals has NO market_cap/dividend_yield (only 671/2490 have shares_outstanding; market_cap_tier all-NULL) — the prompt's dynamic-market-cap design unsupported. the user chose Option 3: slow_safe/moderate = curated SEED LISTS, aggressive/lottery/penny_lottery = DYNAMIC price/volatility pools. New tm_path_candidate_pools.py (get_path_universe, 1h cache, seed paths filtered to ≥min price-history, dynamic paths filter price/history/volatility + progressive-loosen to floor). _layered_candidate_batch + _build_candidate_shortlist (new restrict= param) + event-driven dispatch now operate WITHIN each path's pool. Ship-time live pools: slow_safe 76 (JNJ/PG/KO/MCD/COST… — was RCEL/MVST/CSGP), moderate 109, aggressive 300, lottery 300, penny_lottery 172 — all above floor. cfg['path_candidate_pools'] tunable; cfg['use_path_candidate_pools'] (default True) rollback. Component C: AI prompts already pass path semantics (a.5 evidence) → no prompt change. New audit _audit_path_pools.py 8/8; legacy _audit_layered_candidates pinned use_path_candidate_pools=False (tier-composition orthogonal to pooling; test-only) + _build_candidate_shortlist mock signatures updated for restrict=. FUTURE ARC (flagged, not this patch): when the fundamentals fetcher backfills market_cap+dividend_yield universe-wide, slow_safe/moderate migrate seed-list→fully-dynamic. Files: tm_path_candidate_pools.py(new), tm_queue_runner.py, tired_market.py, _audit_path_pools.py(new), _audit_layered_candidates.py, _audit_layer1_fill.py. --- prior: v4.14.5.14a.5 (2026-05-17) Gemini classify + GitHub sanity ceiling + popup dedup + verdict-rate investigation. (A) classify_429 now parses Google/Gemini's body format (RESOURCE_EXHAUSTED + error.details[].retryDelay "30s") — Gemini 429s are per-minute (15 RPM free tier), get a short retry not the 5-min legacy; unparsed Gemini 429 → 60s (was 300s 'unknown') — ends the Gemini cooldown loop. (B) Root cause of GitHub "(73/68) learned from 429": NOT per-minute false-learning (that was Cerebras/a.4). GitHub-via-Azure reports a bogus X-RateLimit-Limit-Requests-Day=60000 (real GitHub Models free ≈50/day); the learner trusted it then a real daily wall at ~72 looked like a crash. Added _SEED_SANITY_MULT=20 ceiling to note_success_headers: a header day-cap >> the URL seed is ignored (60000 vs seed 40 → ignored, keeps 40; Cerebras 2400 vs 1500 / Groq 14400 vs 14000 still learned fine). Cleared the bogus learned github=72 in provider_learning.json + the parallel provider_health observed_max=68 (single source of truth). (C) INVESTIGATION ONLY, no code: today's verdicts since 16:00 = AVOID 61% / WATCH 25% / NO_CALL 13% / BUY 0%; historical BUY was only 4.5%. Every pass is slow_safe (fill targets the most-starved path; moderate full, slow_safe stuck) and the momentum filter feeds volatile small-caps which the slow_safe "established/dividend" lens correctly AVOIDs → structural candidate↔path mismatch, the real Phase-A blocker, deferred to a design decision (v4.14.5.14a.6). (D) Per-session popup dedup: tm_teacher_intercept._popup_should_show keyed by entry_id::provider; same error pops once/session (still logged to activity.log), new types still pop, resets on restart; cfg['use_session_popup_dedupe'] default True. Audits: _audit_provider_exhaustion 37/37, new _audit_popup_dedup 6/6; 127 total checks green, no regressions. Files: tm_provider_learning.py, tm_ai_router.py, tm_teacher_intercept.py, tired_market.py, _audit_provider_exhaustion.py, _audit_popup_dedup.py(new). --- prior: v4.14.5.14a.4 (2026-05-17) DYNAMIC PROVIDER-LIMIT LEARNING + 429 classification. Phase 0 found: caps are NOT in api_providers.json — they're hardcoded URL-detection in tm_ai_router._resolve_provider_cap (so a.3's PRESETS['mistral']=5000 NEVER took effect; Mistral stayed 1000→300 scan); and EVERY 429 got a flat 5-min cooldown with NO per-minute-vs-daily distinction (Groq hits 30 RPM → 5-min penalty → never approaches real 14,400/day; Cerebras false-learned to 48/day from one burst 429 because the soft-floor guard used the preset default, which is None for preset:'custom' providers). (A) URL seeds raised to researched reality + extracted to _url_detected_cap(): Mistral 1000→15000, Groq 5000→14000 (Cerebras 1500/Gemini 1500/GitHub 40 already correct). (B) new tm_provider_learning.classify_429() distinguishes per_minute (Retry-After/X-RateLimit headers/body) → SHORT cooldown, NO daily-cap tighten — vs daily → escalating cooldown + tighten + learner; unknown → legacy 5-min. Headers captured at the HTTP chokepoint (tm_api_providers._capture_http_meta thread-local; no signature/return changes). Soft-floor guard now uses the URL seed (_floor_reference_cap) so preset:'custom' Cerebras/GitHub are protected. Cleared the live falsely-learned Cerebras observed_max_per_day=48. (B4) tm_rate_limiter RPM tuned to researched values (Mistral 50→30, Gemini rpd 800→1400, custom 30→25). (B5) tm_provider_learning: successful-response X-RateLimit-Limit-Requests-Day headers update the learned cap (reality wins; seeds defer); observed-90%-no-429 → +20%; daily-429-at-N → cap=N; persisted to data/provider_learning.json + .log audit trail; re-verified from first fresh header; learned cap overrides seed (B5f). No-signal case = no change (never drifts). (C) scan cap_factor 0.3→0.8 (Layer 2 not built until .14b). Audit _audit_provider_exhaustion.py 32/32; 116 total checks green, no regressions. Files: tm_api_providers.py, tm_provider_learning.py(new), tm_ai_router.py, tm_rate_limiter.py, tired_market.py, _audit_provider_exhaustion.py. --- prior: v4.14.5.14a.3 (2026-05-17) PROVIDER-EXHAUSTION FOLLOW-UPS. (A) Mistral "300/300" was NOT a real limit: it = declared cap (was 1000, an internal non-RPD guess per its own v4.13.58.1 comment — Mistral is token/RPS-capped, no published RPD; observed_max_per_day=null = never hit a real daily wall) × the 'scan' call_type cap_factor 0.3 (tm_ai_router reserves 70% for high-value consensus). Raised tm_api_providers PRESETS['mistral'].default_max_per_day 1000→5000 (Groq parity, same documented rationale; router observed-quota learning still auto-tightens on real 429s) → fill mode gets 5000×0.3=1500 scan calls/day vs 300. Other caps audited & all correctly derived (Groq 5000/Gemini 1500/Cerebras 1500 = generous-with-429-learning; GitHub 40 = real documented 50/day−margin; Cerebras 48 = correctly LEARNED from a real 429). Deeper lever (0.3 scan cap_factor reserving 70% for Layer 2 consensus not built until .14b) flagged for follow-up, NOT changed (affects all providers). (B) v4.14.5.14.2's circuit-breaker pre-check used tm_top_ai_picker.pick_top_ai, which evaluates GENERAL provider caps and does NOT apply the scan cap_factor — so it said "available" while the scan router rejected everything and fill dispatched into a wall (2:41pm-2026-05-17, no pause line). New tm_api_providers.scan_can_run() runs the EXACT scan-eligibility path the dispatch uses (load providers→resolve registry→select_provider_groups call_type='scan'); _scan_availability now decides on that (pick_top_ai used only to phrase the reason). Pre-check now actually engages. (C) Pass-stats: PROVIDER_UNAVAILABLE skips now increment a `skipped` counter (NOT analyzed, no provider credit); _emit_summary_log shows "analyzed N … skipped M (no providers available)…" when skips occur, legacy format unchanged when none. Audit _audit_provider_exhaustion.py 20/20 (legacy tests 3/4/7 re-pointed to the scan_can_run seam — test-only); 104 total checks green, no regressions. Files: tm_api_providers.py, tm_queue_runner.py, tired_market.py, _audit_provider_exhaustion.py. --- prior: v4.14.5.14a.2 (2026-05-17) PROVIDER-EXHAUSTION HONESTY. The 2026-05-17 afternoon log showed a 75-min loop: once all free-tier providers hit daily caps/cooldowns, fill mode kept dispatching the same ~20 tickers every cycle, each writing a fake NO_CALL (455 in 4h) that advanced the analysis cursor as if judged. (A) tm_api_providers.run_apis_for_scan_prediction: when no provider is selectable (Site 1 `not groups`) or every provider for a canonical model is exhausted (Site 2 `not succeeded`), it no longer writes a NO_CALL — it signals result_meta['provider_unavailable']; tm_queue_runner._run_cloud_one returns the new PROVIDER_UNAVAILABLE sentinel, _analyze_candidate propagates it, and BOTH pass loops skip it WITHOUT advancing the cursor (ticker stays 'needs analysis' for when providers recover). cfg['use_no_call_on_provider_exhaustion'] (default False; True=legacy fake-NO_CALL) via set_no_call_on_provider_exhaustion(). Genuine AI no-call (parsed verdict) path untouched. (B) tm_queue_runner._run_fill_mode: circuit breaker — after computing a deficit, _scan_availability(app) (uses tm_top_ai_picker as the oracle, fail-open) gates dispatch; all-exhausted → set app._fill_paused/_fill_pause_reason, log `[fill-mode] pause: <reason>` once then `still paused` ≤ every 5 min, return without dispatching; recovers → `[fill-mode] resumed`. Only fill mode pauses — _run_event_driven_sweep/run_one_pass_for_triggers never reference _fill_paused (B3, audited). cfg['use_fill_mode_pause_on_exhaustion'] (default True). (C) cursor self-corrects (no code — A stops the pollution). Audit _audit_provider_exhaustion.py 13/13; 97 total audit checks green, no regressions. Legacy pre-a2 NO_CALL loop rows remain in predictions.jsonl as historical evidence (Track Record cleanup item, flagged in STATUS). Files: tm_api_providers.py, tm_queue_runner.py, tired_market.py, _audit_provider_exhaustion.py. --- prior: v4.14.5.14a.1 (2026-05-17) LAYERED FILL-MODE CANDIDATE SELECTION. v4.14.5.14a's fill mode pulled straight from the universe cursor (oldest-analyzed-first → alphabetical at startup), biasing every batch to A/B/C tickers so newsworthy names rarely got proactively analyzed. tm_queue_runner: the 20-ticker fill batch is now composed from 3 priority tiers — (1) _tier1_news_active_candidates: tickers with news_signals in the last 24h NOT yet analyzed since that news for this path (ranked newest-news then volume; restricted to daily_bars-filled tickers), (2) _tier2_filter_ranked_candidates: top-100 momentum names from the demoted filter, (3) _build_candidate_shortlist (gained exclude/limit params; legacy run_one_pass caller unchanged) as last-resort coverage. _layered_candidate_batch composes them, no dupes (each tier excludes prior). cfg['use_layered_candidate_selection'] (default True; False = v4.14.5.14a cursor-only). Fixed a real tz bug in _iso_to_epoch (UTC 'Z' was parsed as local → 24h news window skewed by machine offset; caught by audit Test 5). [fill-mode] dispatch log now shows the N news / N momentum / N cursor breakdown. Audit _audit_layered_candidates.py 13/13; all prior audits green (84 total). Files: tm_queue_runner.py, tired_market.py, _audit_layered_candidates.py. --- prior: v4.14.5.14a (2026-05-17) FILL-VALIDATE-REPLACE Layer 1 + filter demotion. Recommend showed 2 picks while ~46 open AI BUYs sat hidden because the momentum filter gated population to top-30-per-band. (A) tm_recommend_filter: top-30-per-band truncation removed — filter is now a SORT KEY not a population gate; MIN_PRICE_COVERAGE coverage gate UNCHANGED; cfg['use_filter_as_sort_key'] (default True, False=legacy gate) via set_filter_as_sort_key(). (B) tm_recommend_cache.refresh_recommend_cache: when cfg['use_open_buys_as_recommend_source'] (default True), source = ALL current open BUYs per path (most-recent-wins via new _current_buy_tickers_for_path), sorted momentum DESC then FIFO (first_seen/_epoch_from_rec) then ticker; legacy filter-walk preserved behind the flag. (C) tm_queue_runner Layer 1 fill: _run_fill_mode() after each event-driven sweep tops up the most-starved fill_enabled path via _build_candidate_shortlist + run_one_pass_for_triggers (single-AI throughput, full reuse) then refreshes recommend_cache; per-path cfg['path_fill_targets'] (lottery/penny fill_enabled=False); bench_floor hysteresis; 50-cycle/session runaway cap → 30-min cooldown; cfg['use_layer1_fill_mode'] (default True). Audit _audit_layer1_fill.py 18/18; regression-pinned legacy audits _audit_recommend_cache (9/9) + _audit_recommend_filter (6/6) to their pre-default flags (test-only, flagged). Layer 2 (background consensus validation) = v4.14.5.14b, Layer 3 (consensus-flagged replace) = v4.14.5.14c. Files: tm_recommend_filter.py, tm_recommend_cache.py, tm_queue_runner.py, tired_market.py, _audit_layer1_fill.py, _audit_recommend_cache.py, _audit_recommend_filter.py. --- prior: v4.14.5.13 (2026-05-17) DEAD-LANE TAIL FIX. Investigation found neither filings nor fundamentals was dead (122K/84K rows, refreshed today) — the "All sources failed" spam was two stuck tails. (A) EDGAR symbol-format variant fallback: universe writes dual-class as BRKB, SEC uses BRK-B; tm_data_adapter_edgar._ticker_variants() tries original→hyphen-1→dot-1→hyphen-2, per-ticker session cache (_resolved_ticker_cache) resolves+logs each once, recovers ~20 real large-caps (Berkshire B, Brown-Forman, Lennar, Liberty Media, Under Armour, HEICO, U-Haul, Moog, Greif). Confirmed-miss returns the new tm_data_router.TICKER_UNRESOLVABLE sentinel so the router suppresses the per-pass red 'All sources failed for filings' line. cfg['use_edgar_variant_fallback']. (B) Yahoo fundamentals stamp-on-success: the Yahoo fallback returned data but never wrote cache.fundamentals / stamped cache_metadata, so the ~7 tickers Finnhub can't serve were re-fetched every 30-min tick forever; _v415_cache_write_fundamentals_yahoo() now mirrors the Finnhub path. cfg['use_yahoo_fundamentals_stamp']. (C) New _audit_fetcher_convergence.py (20 checks) closes the audit blind spot: v4.14.5.9/.10 audits tested fail-gracefully but never success+convergence. Also corrected pre-existing v4.14.5.11 drift in _audit_fundamentals_filings.py test 15 (gate widened to earnings/universe flags; test wasn't updated). Both flags default True, independent rollback. Files: tm_data_adapter_edgar.py, tm_data_router.py, tm_data_adapter_yahoo.py, tm_fundfile_fetcher.py, tired_market.py, _audit_fetcher_convergence.py, _audit_fundamentals_filings.py. --- prior: v4.14.5.12 (2026-05-17) DAEMON STARTUP WIRING — closes the Arc B integration gap found in the overnight investigation. The recommend_cache / news / fundfile daemons were code-complete in v4.14.5.4-.11 but ONLY launched by the toolbar Stop->Resume handler (_resume_auto_refresh, ~lines 17727-17740), never at app startup. On a normal launch all three stayed dormant; the visible 'healthy' behaviour came from the legacy slow-fill, not Arc B. NEW: _v45012_launch_arc_b_daemons() scheduled near the end of App.__init__ startup (mirrors the Resume wiring exactly, same flag guards, logs '[recommend_cache]/[news]/[fundfile] daemon started' lines, surfaces launch failures amber not silent) + a '[startup] Tired Market vX - APP_VERSION confirmed' banner at the top of the startup sequence. All three launchers made idempotent via a thread-alive guard (store ._recommend_cache_thread/._news_refresh_thread/._fundfile_thread; return early if alive) so pressing Resume after startup is a no-op for an already-running daemon. Files: tired_market.py, tm_news_fetcher.py, tm_fundfile_fetcher.py. Audit _audit_daemon_wiring.py. Arc B is now GENUINELY integrated at startup (was code-complete but dormant before .12). --- prior: Arc B CLOSEOUT — earnings daily refresh + universe maintenance (2026-05-16). Two small independent fixes hooked into the existing v4.14.5.10 30-min daemon (NO new threads). (1) Earnings: tm_discover._load_earnings_calendar gains force=False; the per-process freeze (finally: _EARNINGS_CALENDAR_LOADED=True) now also stamps _EARNINGS_CALENDAR_LOADED_AT; both the lock-free fast-path and the under-lock recheck gain `and not force`. Hot-path latency is UNCHANGED — arbitrary callers still get the zero-latency cached read; ONLY the new _maybe_refresh_earnings_calendar(app) tick passes force=True, and only once the calendar is >= EARNINGS_CALENDAR_MAX_AGE_HOURS(=24) old (so a long session no longer misses earnings reported mid-session). No-op before the initial lazy load; flag cfg['use_earnings_daily_refresh']. (2) Universe: tm_fundfile_fetcher.refresh_universe_list reuses tm_fill_executor._seed_universe_if_needed (already fetches the configured source via _v415_universe_source_for(cfg['v415_universe']) + UNION-upserts into cache.db.tickers, never removes, handles source-unreachable). _maybe_refresh_universe seeds its timestamp on first tick WITHOUT refetching (startup fill already covered it) then fires ~weekly (UNIVERSE_REFRESH_INTERVAL_HOURS=168) in long sessions; flag cfg['use_universe_maintenance']. Both maybe-helpers run at the top of the daemon _cycle (cheap no-ops unless past max-age); the launch gate widened so the daemon starts if ANY of fundamentals/filings/earnings/universe is enabled (independent flags). No-key safety inherited (earnings already degrades gracefully; ITOT/universe keyless). Adapter-hardening principle honored (fail-open: stale-but-served, never freeze/crash). Audit _audit_earnings_universe.py. **THIS CLOSES ARC B — the fetcher layer now matches the IDEAS.md spec for every data type; the three-surface arc is genuinely complete at all three layers (trigger+cache+fetcher).** Remaining future work is separate arcs: salience, server download, Phase B. Prior body: Arc B patch 3 — fundamentals + filings incremental (2026-05-16). New module tm_fundfile_fetcher: a PURE scheduling/scope layer (same shape as v4.14.5.8 news) over the existing per-ticker router chokepoint tm_data_router.get_router().fetch('fundamentals'|'filings',ticker=T). The finnhub/yahoo fundamentals adapters self-tap _v415_cache_write_fundamentals (fundamentals table + cache_metadata('fundamentals') stamp); the EDGAR filings adapter self-taps _v415_cache_write_filings (filings table, PK accession_number = idempotent dedup + cache_metadata('filings') stamp). NO reinvention of fetch/parse/cache; repeat calls produce zero dup rows. Fundamentals: earnings-triggered (tickers with an earnings date in [yesterday,today] from the bulk _load_earnings_calendar) + cold staleness rotation (cache_metadata('fundamentals') older than 90d, capped 50/cycle); graceful when the earnings calendar is empty (staleness-only). Filings: tiered (T1 holdings+Recommend-displayed, T2 bench+watchlist, T3 universe 1/55 slice) REUSING tm_news_fetcher's already-audited scope helpers (DRY), freshness-skip via cache_metadata('filings') last_refresh_at (6h/24h/72h by tier). NO-KEY SAFETY INHERITED (router fallthrough; EDGAR keyless; fundamentals finnhub→yahoo) — module never gates on a key. ADAPTER-HARDENING PRINCIPLE APPLIED: filings refresh checks the v4.14.5.9 EDGAR CIK-map backoff state and SKIPS the pass (logs once, resets when healthy) instead of hammering SEC / exception-storming — no new fail-closed-and-sticky path. Single 30-min daemon (fundamentals every tick + filings tier cadence {1:1,2:4,3:12}) + startup one-shot + pause-aware; independent flags cfg['use_fundamentals_incremental'] / cfg['use_filings_incremental'] (both default True). Deferred (justified, matches v4.14.5.6/.8): per-call window-narrowing (adapters' fixed windows + dedup + freshness-skip already make repeat calls correct/cheap). Prereq verified: v4.14.5.9 retry-safe EDGAR shipped; no EDGAR failures after the latest restart in activity.log; finnhub lane='direct', edgar lane='keyless'. Audit _audit_fundamentals_filings.py. Live network/daemon structural/AST-verified only — the user verifies on restart. Remaining Arc B: earnings calendar daily refresh, universe-list maintenance. Prior body: EDGAR CIK retry-safe + adapter-hardening principle (2026-05-16). Filings investigation root cause: tm_data_adapter_edgar._load_ticker_cik_map cached an EMPTY dict permanently on ANY first-call failure (network-not-ready-at-startup / transient SEC hiccup), so every subsequent per-ticker call resolved no CIK and the router reported 'edgar: returned no data' for all ~1888 tickers for the whole session (endpoint+UA verified working by direct calls — 10,353-ticker index 200, AAPL submissions 200). THIS PATCH (Patch 0, the prerequisite): the CIK map is now SUCCESS-ONLY cached — only a non-empty parse is stored; failures (and successful-but-empty responses) set a 5-min backoff and return None ('not loaded, retry later'), NOT a sticky empty dict; so a transient early-session failure self-recovers instead of freezing filings until restart. `_ticker_to_cik` now returns a distinct `_MAP_NOT_LOADED` sentinel vs None, and adapter() surfaces the REAL failing layer ONCE per session ('[edgar] ticker->CIK index not loaded this session ... auto-retry') instead of 1888 misleading 'no data' lines — the wrong-layer-message fix. Flag cfg['use_edgar_retry_safe'] (default True) restores exact legacy sticky-empty for rollback. Patch 1 (doc): IDEAS.md gains the 'Adapter-hardening principle' codifying the recurring fail-closed-and-sticky defect class (earnings/lane_config v4.14.5.7, Finnhub gate, EDGAR CIK) so future adapters don't repeat it. SCOPE SPLIT (measure-twice, session pattern; the prompt's own framing makes Patch 0 the prerequisite that must be verified before the dependent layer): the bundled fundamentals + filings INCREMENTAL fetchers (Patches 2-3) are SEQUENCED to v4.14.5.10 — two new tiered network fetchers built on top of this still-unverified EDGAR fix, untestable vs live network here; building them on an unverified prerequisite repeats exactly the anti-pattern v4.14.5.7→.8 correctly avoided. Audit _audit_edgar_retry_safe.py. EDGAR is keyless (no lane trap); no-key safety automatic. Prior body: Arc B patch 2 — universe-wide news incremental (2026-05-16). New module tm_news_fetcher: a PURE scheduling/scope layer over the existing per-ticker chokepoint tired_market.deep_news_scan(ticker,db) (tired_market.py:3223 — the same fn tm_scheduler's holdings scan uses; it already does multi-source RSS->Yahoo->Finnhub->GoogleNews fallback, (url,timestamp) dedup, news_signals/news_cache/news_scans writes, and cache_metadata('news_signals').last_refresh_at). NO reinvention of fetch/parse/dedup/cache. Tiers: T1 holdings+Recommend-displayed+recent-lookups every 5min; T2 Recommend-bench+watchlist every 30min; T3 universe alphabetical 1/50 slice every 60min (full sweep ~50h). Budget: per-ticker freshness skip (cache_metadata last_refresh_at within 4h/12h/36h by tier — the real saver) + a 55/min rate limiter (buffer under Finnhub free 60/min). NO-KEY SAFETY is INHERITED from deep_news_scan's existing fallback chain (no Finnhub key => Finnhub adapter returns None, Yahoo/RSS/GoogleNews still run) — not reimplemented. Daemon tick + startup tier-1 one-shot + pause-aware; flag cfg['use_news_incremental'] (default True). DEFERRED (justified, matches v4.14.5.6 gap-fetch deferral): narrowing each scan to from=last_refresh_at — deep_news_scan exposes no end-to-end lookback param; threading one through it + 4 source fetchers is a cross-module change untestable vs live network here AND not needed for correctness (dedup makes repeat 7-day calls produce zero duplicate rows; the freshness-skip removes the redundant calls). Prereq satisfied: v4.14.5.7 self-heal flipped lane_config.finnhub->'direct' (verified on disk) and direct /company-news returns 237 articles. Audit _audit_news_incremental.py. tkinter/daemon/live-network are structural/AST-verified only — the user verifies on restart. Remaining Arc B: fundamentals/filings incremental, earnings daily refresh, universe-list maintenance. Prior body: Lane bootstrap self-heal (2026-05-16). Root cause of the earnings/Finnhub outage: _v415_bootstrap_lane_config is idempotent-never-overwrite, so when the user added a Finnhub key AFTER first bootstrap (by editing data_providers.json directly, bypassing the _v415_sync_lane_config_after_key_change UI hook), lane_config.finnhub stayed 'skip' forever and the finnhub adapter returned None pre-network for ALL Finnhub data types (earnings/news/fundamentals). The endpoint/key/tier were always fine (verified by direct API calls). THIS PATCH: _v415_bootstrap_lane_config gains a narrow self-heal — a keyed lane whose row is the no-key-default 'skip' is promoted to 'direct' once the provider has a key (returns the promotions; App.__init__ logs '[lane] finnhub: promoted skip->direct'). Retroactive: fixes the user's install automatically on next launch, no manual re-save needed. Flag-gated cfg['use_lane_selfheal'] (default True). No-key users unaffected (no key => stays 'skip', untouched, no error/nag). DELIBERATELY OMITTED (justified, not oversight): the spec's proposed user_chosen column/cfg marker — there is no code path today that can create a deliberate skip-with-key state (only producers of 'skip' are the no-key default and key-removal; no UI opts a keyed provider out), so guarding it would be speculative complexity; the future Teacher-AI per-lane opt-out flow owns that marker (seam already noted in the sync-hook docstring). SCOPE SPLIT (measure-twice, consistent with this arc's pattern): the bundled Arc-B-patch-2 universe-wide news incremental is SEQUENCED to v4.14.5.8, NOT shipped here — it is large, network-dependent, un-runnable in the build env, and per the earnings investigation is dead-on-arrival until THIS lane fix lands and is verified live in the user's real environment. Building the news layer on an unverified prerequisite, bundled with a small retroactive correctness fix, would dilute both. Audit _audit_lane_heal.py. Prior body: daily_bars universe freshness — CORRECTNESS FIX for the three-surface arc (2026-05-16, Arc B patch 1). Phase-0 verified the load-bearing gap: cache_metadata.have_to_date was NEVER written for the daily_bars lane (edgar/finnhub/stocktwits write it for filings/fundamentals/social, but no daily_bars writer existed), and get_unfilled_tickers was presence-only — so once a ticker had any daily_bars rows the slow/bulk fill never refreshed it. The v4.14.5.0 filter scores momentum/relative-volume off daily_bars, so post-bootstrap Recommend was ranking on frozen prices. THIS PATCH: (1) get_unfilled_tickers honors max_age_days for lane=='daily_bars' — a ticker is fresh only if it has rows AND a cache_metadata.have_to_date >= today-DAILY_BARS_MAX_AGE_DAYS(=2); zero-rows / no-metadata / stale-metadata all return as unfilled (legacy presence-only preserved for other lanes / when max_age_days is None). (4) upsert_daily_bars — the single chokepoint for ALL daily_bars writes — now widens cache_metadata have_from/have_to_date per ticker (best-effort; never loses a bar write); this is the ADD the freshness check reads against. (3) slow + bulk fill pass max_age_days for daily_bars via _daily_bars_max_age(app,lane), flag-gated by cfg['use_freshness_fill'] (default True). DELIBERATELY DEFERRED with reason (NOT shipped): the gap-only incremental fetch (fetch just have_to_date+1→today instead of full history). The per-ticker fill calls fetcher(ticker) with NO date range — making it gap-aware is a cross-module signature change through a closure built in tired_market.py into the yahoo adapter, untestable against the live fill in the build env, and NOT required for correctness: upsert_daily_bars is INSERT OR REPLACE (idempotent) and Patch 4 freshness-tracking makes the refresh CONVERGE (a refreshed ticker is marked fresh and not re-selected next pass — no per-pass storm), it just refetches full history rather than a gap (heavier bandwidth, still free-tier-fine at daily cadence; Yahoo daily_bars is batchable). Gap-only is an Arc B fast-follow optimization. First slow-fill pass after upgrade does a one-time universe-wide catch-up (every ticker has no daily_bars cache_metadata yet → all come due once), then converges to ~once-per-2-days per ticker. Audit _audit_freshness_fill.py. STATUS.md/BUILT.md "arc complete" corrected: trigger+cache layers complete at v4.14.5.4, daily_bars fetcher freshness at v4.14.5.6; news/fundamentals/filings/earnings/universe freshness remain Arc B. Prior body: Small bug bundle (2026-05-16). Bug 1 (FIXED): Portfolio "Re-run consensus" (_on_run_consensus in tm_portfolio_panel.py) refused with a misleading "Install Ollama / set Consensus models" error whenever cfg['consensus_models'] was empty AND no Ollama model was installed — even with 6 cloud providers ready — because it never consulted the unified availability check. Its sibling "Refresh triggers" (_on_refresh_triggers) gates on tm_top_ai_picker.has_any_ai_available (cloud OR local) and worked. Fix: _on_run_consensus now uses the same has_any_ai_available gate (empty `models` is fine — the router fans out to configured cloud providers exactly as Refresh Triggers does); the refusal message is now accurate. Bug 2 (DIAGNOSED, not blind-fixed): the perennial "All sources failed for earnings (last: None)" is NOT a code crash or captured key error — `last_error` is None because every earnings candidate is skipped without raising (no registered adapter / no API key, or adapter returns cleanly empty). Phase-0 evidence: data/api_providers.json has NO finnhub entry (no key/provider configured) while data/data_providers.json lists finnhub only as a data-source priority — i.e. a provider-provisioning gap (the user needs a Finnhub key configured), not a code defect safely fixable blind. Per the patch's own rule ("if Bug 2 is a needs-the-key issue, surface and ship Bug 1"), NO speculative earnings functional fix shipped. Instead a safe, in-scope diagnostic-quality fix lands in tm_data_router.fetch: it now records per-source skip reasons (no adapter/key, returned no data) and the "All sources failed" message reports the actual reason instead of "last: None" — so the real cause is actionable on next launch. Audit _audit_bug_bundle_v4_14_5_5.py. No architecture touched; three-surface arc unchanged. Prior body: Step 2 — WIRE FILTER INTO RECOMMEND (recommend_cache), COMPLETES THE THREE-SURFACE ARC (2026-05-16). New recommend_cache table (tired_market.db; PK ticker,path; displayed[10]/bench[20] tiers) + new module tm_recommend_cache.refresh_recommend_cache: calls the v4.14.5.0 filter, intersects with current open BUYs per path, tiers top-30, preserves first_seen_at, drops fallen-off tickers, atomic per-path rebuild (bench→displayed promotion is implicit in the rank-ordered rebuild), respects the filter coverage gate ('cache_filling' does NOT overwrite a good snapshot). Recommend wiring: _get_recommendation_source gains a top branch (cfg['use_filter_recommend'], default True) → _read_recommend_cache_picks(path) hydrates displayed-tier tickers into their current BUY prediction records (the exact shape tm_recommend.build_recommendations already consumes — TOP PICK/ALL IN/A FEW/DIVERSIFY logic unchanged, only the candidate SOURCE changes); empty → 'no candidates' (no legacy fallthrough by design). Background daemon tick _launch_recommend_cache_refresh (5-min, startup one-shot skipped if cache <5min old, pause-aware) + synchronous _refresh_recommend_cache_now hooked into the Choices-strip save. Flag-gated by use_filter_recommend (False = legacy queue/recency source restored). Patch 0: fixed a v4.14.5.2 regression — Track Record per-path section raised NameError ('tm_holdings' not defined inside tm_holdings.py); changed the self-reference to the bare module-level compute_path_track_stats. Audit _audit_recommend_cache.py. tkinter rendering + basket visual correctness are AST-verified only (not runnable in build env — the user verifies on restart); the data flow (shape parity with the legacy source) is integration-audited. THE THREE-SURFACE ARC IS NOW COMPLETE: Step1 filter v4.14.5.0, Step3 stability v4.14.5.1/.2, Step4 suspicion-staleness v4.14.5.3, Step2 cache+wiring v4.14.5.4. Downstream future work (separate arcs): news architecture, salience. Prior body: Step 4 — SUSPICION-STALENESS, closes the trigger-layer of the three-surface arc (2026-05-16). Replaces the clock-driven "data is old, re-analyze" staleness with the spec semantics: a re-check fires only when an OPEN BUY has had ZERO real-world change events (significant price move from daily_bars, news arrival, consensus result, earnings) for >= the path's suspicion window (slow_safe 30d / moderate 14d / aggressive 7d / lottery 5d / penny_lottery 5d) AND is past the v4.14.5.1 maturity guard. Suspicion-staleness is a CHECK not a KILL — it schedules re-analysis; the result keeps or exits the BUY via the normal flow. tm_event_triggers: new _check_suspicion_staleness_triggers + get_last_change_event_at (a mere prior re-analysis is deliberately NOT a change event — would let the system reset its own clock); legacy clock fn renamed _check_legacy_staleness_triggers and kept behind cfg['use_suspicion_staleness']=False for rollback; check_staleness_triggers is now a thin dispatcher so evaluate_all_triggers/the runner are unchanged (identical return shape, kind still 'staleness' with subkind 'suspicion'). Per-kind dedup gains 'staleness'=24h so a quiet BUY fires at most once/day. Phase-0 surfaced (not blockers, handled by graceful degradation): earnings calendar currently fails to load (separate tracked gap) and cache.db news_signals covers only ~2 tickers — so the reliable universe-wide change signal is the daily_bars price-move (3% main / 5% speculative) plus per-ticker consensus ts from signals.jsonl (~36 tickers); no persisted per-ticker user-action timestamp exists so user activity is proxied via consensus signals. Audit _audit_suspicion_staleness.py. Spec event coverage now complete at the trigger layer: 4.1/4.2 (user/consensus, v4.14.5.1-2), 4.4 (target/stop, always), 4.5 (suspicion, this patch), 4.6 (manual, always); 4.3 (news as a true change event) is partial pending the news-architecture arc. Next: Step 2 = v4.14.5.4 (recommend_cache + bench/displayed). Prior body: Step 3 fast-follow — CLOSES STEP 3 OF THE THREE-SURFACE ARC (2026-05-16). Phase-0 check resolved Patch 4 (consensus user-gating) as MOOT: the queue runner's per-pass analysis writes only predictions.jsonl via run_apis_for_scan_prediction — it never produces signals.jsonl 'consensus_fresh_buy' rollups (only user-initiated ConsensusRunner does), so _consensus_says_buy's existing kind=='consensus_fresh_buy' filter is already user-scoped; Patch 4 dropped, not deferred. Shipped: (3) _run_housekeeping price-shift 'invalidated' is now maturity-gated (reuses tm_discover MIN_MATURITY_DAYS_FLOOR/RATIO; per-path timeframe-day defaults since recommend_queue.timeframe is unreliable TEXT/NULL) AND uses per-path thresholds (slow_safe 10% / moderate 12% / aggressive 15% / lottery 25% / penny_lottery 30%) instead of the global 5%; graduated_target/stop (legitimate market resolution) are NEVER maturity-gated; flag-gated by cfg['use_stable_recommend']. (5) Staleness windows widened (STALENESS_WINDOWS_SECONDS_STABLE: aggressive 72h / moderate 7d / slow_safe 21d / lottery 5d / penny_lottery 7d) selected when the flag is True, legacy windows restored when False — aligns wasted-work cadence with the v4.14.5.1 maturity guard; Step 4 reimplements staleness semantics. (6) Recommend speculative-path banner: dynamic honest numbers from predictions.jsonl via tm_holdings.compute_path_track_stats (single source of truth) — additive, defensive, rebuilt per render so the Path dropdown updates it. (7) Track Record honest-numbers overhaul: interim churn disclosure (with code TODO for removal criteria), post-stability-fix cutoff toggle (cfg['track_record_show_historical'] default False), per-path breakdown segmented main vs speculative — additive, self-contained in a guarded subframe, legacy aggregate stats untouched. compute_path_track_stats verified to match the independent accuracy investigation (slow_safe 60%/+8 EV, moderate 58%/+6.6, aggressive 40%/+1, lottery 21%/-3.5, penny_lottery 0%/-13.4). Audit _audit_recommend_stability_v2.py. UI rendering is AST-verified only (tkinter not runnable in build env — the user verifies visually on restart). Step 3 of the arc is now closed; Step 4 (suspicion-staleness) is v4.14.5.3. Prior body: Recommend stability fix — STEP 3 OF THE THREE-SURFACE ARC (2026-05-16): the load-bearing patch. Diagnosed cause of the 75%-of-BUYs-killed-before-verdict churn: PredictionsLog.check_supersessions Tier 1 was keyed (model,ticker) NOT path-scoped, so a HOLD/AVOID under one path superseded a BUY under another path (cross-path verdicts answer different questions by design) AND there was no minimum-age guard, so a 2-hour-old BUY with a 42-day timeframe was killed by the next clock-driven re-analysis. THIS PATCH (verifiable core): (1) Tier 1 supersession is now PATH-SCOPED — same model non-BUY only supersedes a prior BUY under the SAME path; legacy no-path records use '' sentinel that cannot collide with a real path. (2) MATURITY GUARD on BOTH tiers — a BUY younger than max(MIN_MATURITY_DAYS_FLOOR=3, timeframe_days*0.25) is skipped entirely; the legitimate market closer check_outcomes (target/stop) is untouched. (3) cfg['use_stable_recommend'] (default True) gates both changes for instant rollback; both check_supersessions callers (_startup_close_outcomes, _auto_refresh_tick) pass it. (4) tm_holdings.PATH_TRACK + get_path_track() classify lottery/penny_lottery as 'speculative', rest 'main' (unknown → speculative, fail-safe-toward-warning). (5) STABILITY_FIX_CUTOFF_TIMESTAMP marks the ship moment so accuracy surfaces can separate post-fix data. Audit _audit_recommend_stability.py incl. a historical simulation over the real 771 predictions (old-vs-new supersession counts). DELIBERATELY SEQUENCED to a fast-follow (NOT shipped here, surfaced with reasons in the implementation report): _run_housekeeping path-aware thresholds (Patch 3 — separate recommend_queue surface, needs schema verification), _consensus_says_buy user-initiation gating (Patch 4 — hinges on call_type vocabulary), staleness-window retune (Patch 5 — non-urgent: the maturity guard already protects BUYs ≥3d regardless of staleness firing; retuning live event-driven-runner constants without flag-gating would violate the rollback-safety principle this patch establishes), and the Recommend speculative banner + Track Record overhaul (Patches 7/8 — substantial tkinter UI that cannot be run-tested in the build environment; shipping unverified UI into a surface the user uses, bundled into the most consequential behavioral patch, is the exact risk this patch's own working rules say to surface and pause on). Prior body: Two-stage Recommend filter — STEP 1 OF THE THREE-SURFACE ARC (2026-05-16): ships new module tm_recommend_filter.py (pure-function, cache-reads-only: stage 1 price-band membership reusing tm_cache._price_matches_ranges/_get_ticker_latest_prices; stage 2 activity ranking = normalized 5-day momentum + capped relative-volume, with sparse social/news additive bonuses) plus _audit_recommend_filter.py (6 integration-boundary checks, all green). The filter is CALLABLE but NOT yet wired into Recommend population — that is Step 2, a separate patch — so the user sees NO behaviour change from this patch alone (expected). Load-bearing fix carried in the module: the coverage gate (MIN_PRICE_COVERAGE=0.80) returns status 'cache_filling' with a partial result instead of a silently-empty 'ok' list — this is the explicit guard against the failure mode that demoted the original candidate-selection price filter (price-filtering before daily_bars was filled collapsed scope to ~0). Locked design decisions (the user, filter-design Q1–Q5): path is NOT a filter dimension and no per-ticker path classifier exists or was added; band is the sole per-ticker filter dimension (Option A); v415_style stays an orthogonal prompt-flavor concern; stage-two ranking is price/volume primary with news/social as non-gating bonuses; top ~30 per band. IDEAS.md "Three-surface model" gained a clarifying note (band vs path vs style orthogonality) and BUILT.md's candidate-shortlist-demotion entry gained a forward-pointer to this module. No change to the event-driven runner, triggers, or any existing surface. Prior body: Default flip + soak completion — FINAL PATCH IN THE v4.14.4 EVENT-DRIVEN ARC (2026-05-15): completes the architectural transition started in v4.14.4.0. Five-patch arc: v4.14.4.0 skeleton + staleness; v4.14.4.1 price_drift + target_stop; v4.14.4.2 news; v4.14.4.3 earnings + user-signal; v4.14.4.4 (this patch) default flip. Fresh installs now default cfg['event_driven_refresh']=True — no soak, immediate event-driven behavior. Existing installs preserved: their cfg.json on disk drives behavior, and missing-key existing users still hit the v4.14.4.0 False default + 14-day auto-flip soak. Detection signal is CONFIG_PATH.exists() captured BEFORE the file read — "has cfg.json ever been written?" not "is the specific key present?" — because the user (an existing user upgrading from v4.14.3.x) has the key missing AND must keep his soak. (1) load_config gains is_fresh_install local at function top; the event_driven_refresh default in the defaults dict becomes True if is_fresh_install else False. Fresh-install branch also sets a transient cfg['_v4_14_4_4_fresh_install']=True marker on the returned dict. The transient marker is consumed exactly once (in App.__init__ after Discover init) by a muted activity-log line explaining the default and pointing users at config.json for opt-out; the marker is then popped and save_config(self.cfg) persists, so subsequent launches never re-log. (2) The existing v4.14.4.0 _v4_14_4_0_handle_installed_at_and_auto_flip in tm_queue_runner is untouched: it still stamps installed_at on first run if None, still auto-flips at 14 days when flag is False AND installed_at >= 14d. Fresh installs hit auto-flip never (flag already True so should_auto_flip returns False); existing installs continue to soak. (3) save_config writes the in-memory cfg back to disk; the transient marker is gone before this happens (popped earlier), so the marker never persists to disk. (4) Installer template change: v4.14.4.4 onward use PowerShell 'Get-Date -Format yyyyMMdd_HHmmss' for timestamps. v4.14.4.3's installer used wmic which is deprecated/removed on modern Windows 11 (and even where present, has substring-fallback complications). The PowerShell call works on every modern Windows including the user's. Documented in installer header so future patches inherit the fix. (5) No new module, no schema change, no cfg field beyond the transient marker (which never lands on disk). End-to-end: fresh install user launches → load_config sees no cfg.json → defaults['event_driven_refresh']=True + transient marker → App.__init__ logs once → marker popped, save_config writes cfg with event_driven_refresh:True and no marker → runner thread reads cfg → event_driven branch → immediate event-driven sweeps. the user's case: load_config sees existing cfg.json with neither event_driven_refresh nor installed_at → defaults['event_driven_refresh']=False merged in → no transient marker → no first-launch log → runner's v4.14.4.0 handler stamps installed_at=now + flag stays False → 14-day soak begins. Out-of-scope flagged (carried from prior arc patches and still deferred): UI toggle for the flag (cfg-only is fine for now), earnings calendar daily TTL refresh, background universe-wide news refresh, soak telemetry/observability, additional user-signal action types (manual mark-as-interesting, lookup-performed), persistent pending user-signal list, multi-path user-signal targeting, salience layer (v4.14.5.x), legacy cadence-mode deprecation. Prior body: Earnings + user-signal triggers (2026-05-15): fourth + fifth trigger kinds in the v4.14.4 event-driven arc. Earnings is a COMBINED kind with signal_context['subkind'] = 'upcoming' (event ahead) or 'recent' (event just passed) — one kind in TRIGGER_PRIORITY keeps the priority slot and dedup tuple clean; subkind distinguishes only in the prompt-framing context. Per-path earnings windows (upcoming_days, recent_days): slow_safe (3, 2) / moderate (5, 3) / aggressive (7, 5) / lottery (7, 5) / penny_lottery (14, 7). Per-kind dedup: 6 hours (PER_KIND_DEDUP_WINDOWS_SECONDS['earnings'] = 21600). User-signal is a PUSH-based trigger — UI calls tm_event_triggers.record_user_signal(ticker, action) at the moment of user action; the call appends to an in-memory pending list AND sets app._trigger_wake_event so the next sweep fires within ~1s instead of waiting for backoff. Two action types in v4.14.4.3: 'watchlist_add' (tm_discover.Watchlist.add) and 'position_open' (tm_holdings.HoldingsManager.add_holding when result['created']=True). Push-time dedup 60s on the in-memory list catches UI fumbles (add/remove/re-add within one second); cross-sweep dedup also 60s against trigger_fire_log via the per-kind window. (1) tm_event_triggers.py extensions: EARNINGS_TRIGGER_WINDOWS constant + PER_KIND_DEDUP_WINDOWS_SECONDS gains 'earnings' (21600) + 'user' (60), module-level _pending_user_signals list + _pending_user_signals_lock + _app_ref + set_app(app) helper. (2) check_earnings_triggers(app, path, now_ts) iterates queue_runner_analysis_log for the path, applies cascading + per-kind dedup, calls tm_discover.get_earnings_for_ticker (Stage 0 module-cached lock-free fast path), picks soonest upcoming OR most-recent past event in the path's windows. Signal context: {kind, subkind, earnings_date, days_delta, hour, eps_estimate, eps_actual, revenue_estimate, revenue_actual, quarter, year}. Numeric fields normalized to float via _num() helper; bad input falls to None rather than crash. Event dates parsed via fromisoformat with YYYY-MM-DD slice. (3) record_user_signal(ticker, action, app=None, path=None, context_str='') is the push API — defaults app to module-level _app_ref, defaults path to app.cfg['analysis_path'] then tm_holdings.DEFAULT_PATH. Push-time dedup walks _pending_user_signals; same (ticker, path, action) tuple within 60s returns False (suppressed). Wake-event setter best-effort. Returns True if queued, False if suppressed/failed. Thread-safe: lock guards pending list. (4) drain_user_signals(app, now_ts) pops the entire pending list under the lock, then applies cascading 5-min + per-kind 60s dedup against trigger_fire_log; suppressed entries DROPPED (cascade cooldown means ticker just got analyzed, user's intent has effectively been served). Returns fire-dict shapes ready for evaluate_all_triggers flat output. (5) evaluate_all_triggers calls drain_user_signals ONCE per sweep (NOT per path — each pending signal carries its target path) before the per-path loop; per-path then adds check_earnings_triggers wrapped in independent try/except so failures don't suppress staleness/price/news for the same path. (6) tm_queue_runner.py _format_fire_inline adds two new branches: 'earnings' → 'TICKER subkind Nd' (e.g., 'AAPL upcoming 3d'); 'user' → 'TICKER action' (e.g., 'TSLA watchlist_add'). (7) tm_discover.py Watchlist.add hooks record_user_signal AFTER save() returns True (actual new add, not duplicate). Uses notes[:80] as context_str for prompt framing. (8) tm_holdings.py HoldingsManager.add_holding hooks record_user_signal AFTER the with self._lock block exits, gated on result.get('created') — fires only on NEW positions, not updates of existing tickers. Passes the holding's path argument if set (the user chose path on the Add UI); else falls back to cfg['analysis_path'] inside record_user_signal. (9) App.__init__ calls tm_event_triggers.set_app(self) once during init so UI callers don't need to plumb the app reference through every layer (Watchlist class has no self._app; the module-level registry pattern avoids invasive constructor changes). Crash-loses-signal accepted: pending entries die with the process. Worst case the user adds a ticker, the app crashes within 60s, the trigger never fires — staleness picks it up on the next sweep after restart. Persisting these would add complexity without meaningful payoff. EARNINGS CACHE FRESHNESS RISK FLAGGED, NOT FIXED: _load_earnings_calendar is module-cached for process lifetime with no TTL — process restart is the only way to refresh. For the user's typical short app sessions this is fine; future patch will add a daily refresh trigger. Out-of-scope flagged: v4.14.4.4 default flip + soak completion (final patch in event-driven arc), background news refresh, salience layer (v4.14.5.x), additional user-signal action types (manual mark-as-interesting, lookup-performed), persistent pending list, multi-path user-signal targeting, earnings calendar daily refresh. Prior body: News trigger (2026-05-15): third trigger kind in the v4.14.4 event-driven arc. Fires when count(news_cache rows with timestamp > anchor) >= path_threshold, where anchor = max(last_analyzed_at, now - max_age_hours). The max_age_hours floor is LOAD-BEARING — prevents never-analyzed tickers from firing on weeks-old news. Per-path thresholds (article_count, max_age_hours): slow_safe (5, 72) / moderate (3, 48) / aggressive (2, 24) / lottery (1, 24) / penny_lottery (1, 24). Per-kind dedup window 60 min added to PER_KIND_DEDUP_WINDOWS_SECONDS. (1) NEWS_TRIGGER_THRESHOLDS constant added to tm_event_triggers.py. (2) New check_news_triggers(app, path) iterates queue_runner_analysis_log for the path, runs a direct SQL COUNT against news_cache (NOT cache.news_features() — avoids the SWR side effect during passive sweep AND only needs count + top headline, not the full features dict). idx_nc on (ticker, timestamp) makes this fast (~1ms per ticker). (3) Anchor computed as lexicographic max of last_analyzed_at ISO + max_age_cutoff_iso. ISO 8601 strings are lexicographically sortable; matches news_cache.timestamp's naive-ISO format (datetime.now().isoformat()) so no epoch conversion overhead. (4) Top headline fetched via secondary SELECT ... ORDER BY timestamp DESC LIMIT 1; goes into signal_context for prompt framing. Failure is best-effort (NULL top_headline doesn't suppress the fire). (5) cache failures amber-logged ONCE per sweep via local flag — same pattern as v4.14.4.1's cache.quote() failure handling. Individual tickers with no news data silently skip (the common case, not an error). (6) evaluate_all_triggers extended to call check_news_triggers per path, wrapped in independent try/except so news SQL failures don't suppress staleness/price fires for the same path. (7) _format_fire_inline in tm_queue_runner.py adds the 'news' kind branch: 'TICKER +N' format (count only, no headline text — keeps the activity log line scannable). (8) signal_context schema: {kind, new_article_count, since_ts, top_headline, threshold, max_age_hours}. SPARSITY REALITY at ship: the user's live news_scans table has only 8 rows; news_cache has 18,330 article rows but ONLY for those 8 tickers. The news trigger will fire for 0-8 tickers in the user's install today. Coverage grows organically as Discover/holdings analysis flows scan more tickers. Background news refresh (universe-wide periodic scans) is deferred to a future patch — that's the substantial infrastructure change. Out-of-scope flagged: v4.14.4.3 earnings + user-signal triggers, v4.14.4.4 default flip + soak completion, background news refresh, salience layer (v4.14.5.x). Prior body: Price-drift + target_stop triggers (2026-05-15): adds two new trigger kinds to the v4.14.4.0 event-driven skeleton. Price-drift fires when |current_price / baseline_price - 1| exceeds the path's threshold (slow_safe 8% / moderate 5% / aggressive 4% / lottery 6% / penny_lottery 10% — constants in tm_event_triggers.py). Target_stop fires when current_price crosses the prediction's target or stop level (independent of percentage drift). Both kinds can fire for the same ticker in one sweep and get collated at dispatch per F4 (one analysis per (ticker, path) with combined trigger context). (1) Constants PRICE_DRIFT_THRESHOLDS_PCT (per-path) + PER_KIND_DEDUP_WINDOWS_SECONDS (target_stop 5min, price_drift 30min) added to tm_event_triggers.py. The per-kind dedup is layered ON TOP of the v4.14.4.0 5-min cascading cooldown — both must pass for a fire to land. (2) New tm_discover.PredictionsLog.get_most_recent_for_ticker_and_path(ticker, path) — returns the most-recent prediction record for the pair regardless of direction (BUY/WATCH/AVOID/HOLD/NO_CALL). Iterates _cache in reverse (newest first) for early exit; insertion order is guaranteed by v4.14.3.13's merge logic. Used by price-trigger sweep to determine baseline. (3) New tm_event_triggers.check_price_triggers(app, path) returns fires for both kinds. Iterates queue_runner_analysis_log for the path, fetches baseline via PredictionsLog accessor, current via cache.quote() (the SWR-backed path; warm cache ~1-5us, stale-but-recent triggers background refresh). Defensive skips: None baseline (NO_CALL records), None target/stop (AVOID/WATCH predictions skip the target_stop check but drift check still applies), cache.quote() returning None (network blip). cache.quote() exceptions are amber-logged ONCE per sweep (deduped via local flag) rather than per failing ticker. (4) Two new internal helpers _within_kind_dedup() and _within_cascading_cooldown() that query trigger_fire_log and queue_runner_analysis_log respectively. Cascading cooldown is per-(ticker, path); per-kind dedup is per-(ticker, path, kind). (5) evaluate_all_triggers() extended to call check_price_triggers for each path, tagging fires via context['kind']. Wraps in try/except so a price-check failure doesn't suppress staleness fires for the same path. (6) Activity log shape rewritten as a hybrid: counts always; inline ticker+context details for any kind with <=5 fires. Format: "[event-driven] sweep: 3 price_drift (AAPL +5.2%, TSLA -6.1%, NVDA +4.8%), 2 staleness; processing top 5". Kinds rendered in TRIGGER_PRIORITY order (user > target_stop > earnings > news > price_drift > staleness) so the line reads top-down by importance. Storm-cap drop count appended when applicable. (7) Signal_context schemas: price_drift carries {kind, baseline, current, drift_pct (signed), threshold_pct, baseline_prediction_ts}; target_stop carries {kind, baseline, current, target, stop, crossed (target|stop), baseline_prediction_ts}. Both useful for prompt context (AI can see "your last analysis was at $X, now at $Y"). (8) Sign convention: drift_pct stored signed for debug-ability (positive = up); threshold check uses abs(drift_pct). (9) Symmetric target_stop crossing detection handles both long (target above baseline, stop below) and short/inverse predictions cleanly. Gates met for salience layer (v4.14.5.x): staleness + price gives "fresh because what?" distinction. News (v4.14.4.2) + earnings (v4.14.4.3) are nice-to-have richness, not strictly required. Prior body: Event-driven refresh skeleton + staleness trigger (2026-05-15): kickoff of the architectural arc from IDEAS.md "Event-driven refresh model." Pre-v4.14.4.0 the queue runner ran a 15-min cadence "re-analyze the same 20 tickers per pass" loop that burned provider budget on unchanged data. v4.14.4.0 ships the trigger-driven skeleton that future patches (v4.14.4.1 price, v4.14.4.2 news, v4.14.4.3 earnings + user-signal, v4.14.4.4 default flip) plug into. (1) New module tm_event_triggers.py with the trigger registry, per-path staleness windows (slow_safe 7d / moderate 48h / aggressive 12h / lottery 6h / penny_lottery 4h), 5-min cascading-trigger cooldown (F3), 20-fire storm cap (F1), priority order ('user' > 'target_stop' > 'earnings' > 'news' > 'price_drift' > 'staleness' — only staleness fires in v4.14.4.0; the rest are placeholders for subsequent patches), tiered backoff (60s -> 120s -> 5min -> 10min on consecutive empty sweeps), and the 14-day auto-flip soak window. (2) New SQLite table trigger_fire_log(ticker, path, trigger_kind, fired_at, signal_context) for trigger dedup + audit trail; PRIMARY KEY (ticker, path, trigger_kind, fired_at); idempotent CREATE TABLE IF NOT EXISTS in Database._init. (3) New cfg fields: event_driven_refresh (default False; the coexistence flag) and event_driven_refresh_installed_at (timestamp stamped at first v4.14.4.0+ launch; drives the auto-flip soak). (4) tm_queue_runner._runner_loop branches on cfg['event_driven_refresh']. False path: v4.14.3.x cadence behavior unchanged. True path: trigger sweep via tm_event_triggers.evaluate_all_triggers, fire list capped + prioritized, dispatched via new run_one_pass_for_triggers helper that reuses the existing v4.14.3.11 router-rotation / v4.14.3.9 outcome-recording / v4.14.3.13 delta-append infrastructure. (5) New threading.Event app._trigger_wake_event interrupts the loop's sleep when user actions arrive (Watchlist add etc. — wired in v4.14.4.3). (6) Tiered backoff sleeps in event-driven mode reduce CPU at idle: 60s default, doubling progression up to 10min after 9 consecutive empty sweeps; resets to 60s on any non-empty sweep. (7) Auto-flip at 14 days: if cfg['event_driven_refresh'] is False on launch AND it's been 14+ days since installed_at, flip to True automatically + log amber 'Event-driven refresh auto-enabled after 14-day soak window.' Manual override via cfg respected. (8) Cursor rotation (v4.14.3.10) remains intact for cadence mode; in event-driven mode the cursor is unused because event-driven sweeps process ALL paths per sweep instead of rotating. Cursor resumes if user flips flag back to False. Out-of-scope flagged for future: v4.14.4.1 price-drift trigger, v4.14.4.2 news trigger, v4.14.4.3 earnings + user-signal triggers, v4.14.4.4 default flip + soak completion, salience layer (next arc). Prior body: Activity log persistence - closes v4.14.3.9 destructive-Clear gap (2026-05-15): pre-v4.14.3.15 app._log() wrote ONLY to the Tk activity-log widget; data/activity.log on disk only caught cleanup summaries from _cleanup_disk_usage_summary. Result: pressing Clear (even with v4.14.3.9's confirmation dialog) wiped diagnostic history that nothing on disk would ever recover. v4.14.3.15 fixes this with a single change: Tee inside app._log persists every log line to data/activity.log matching the cleanup-events format ('[<iso8601>] <message>\n'). Single source covers queue runner / picker / router / holdings / Teacher AI / every UI surface because they all route through app._log. (1) Tee added inside _log right after the existing UI buffer write. UI write happens FIRST; disk write second. If the disk write raises (disk full, AV lock, permission), the failure is caught and printed to stderr — does NOT break the UI write that already succeeded. (2) Persistence fires even when self._activity_text is None (early-startup pre-_build_activity_log). Early-init errors are the diagnostics MOST worth capturing; previously they were silent because _log returned early at the None guard. (3) Existing 30-second AI-router dedup at the top of _log returns BEFORE both writes — correct, dedup is about both surfaces (UI noise AND disk record completeness; the FIRST instance of any deduped line still goes to both UI and disk). (4) _confirm_clear_activity dialog copy softened: 'Clear activity log VIEW?' / explains disk persistence exists, view-clear leaves on-disk record intact. Still mentions data/activity.log so v4.14.3.9 audit B7 (which checks for that literal) stays green. (5) Uses the existing LOG_PATH = DATA_DIR / 'activity.log' module constant at tired_market.py:232 — defined unused since the v4.10.x era, finally wired. (6) Synchronous open-append-close per call matches the cleanup-events writer pattern at line 20356 — ~10-100us per call on the user's SSD; invisible at human-scale log rates (~100 lines/min during heavy use = ~10ms/min cumulative). No buffering, no async queue: every line on disk immediately so a crash never loses recent diagnostics. (7) No rotation in v4.14.3.15. File at 75 KB today (cleanup-only); estimated 100 KB/day post-fix; stays under 1 MB for ~10 days. Revisit if user-visible. Out-of-scope flagged for future: provider_rate_limit_hit per-(entry, provider) dedup keying (STATUS.md's framing was stale - existing entry-keyed cooldown already exists; the real subtler issue is its own design patch), activity log rotation (date-based partitions when file size becomes user-visible), unifying tm_ai.py's _LOG_PATH with the activity.log path (two parallel log files exist today). Prior body: Chronic-429 persistence fix + three lateral cleanups (2026-05-15): two small unrelated patches bundled because each is tiny. Part A — chronic-429 escalation gap (STATUS.md open follow-up): tm_provider_health.record_rate_limit() was the only counter-mutating method that didn't call self.save(). consecutive_429s lived in memory only between 429s. If the user's app exited (clean shutdown that failed to save, crash, laptop sleep), the counter reset to 0 on disk and the next 429 started fresh at consec=1 with a fresh 5-min cooldown — trapping chronic-429 providers in 5-min loops forever despite the >=3-strike LONG_COOLDOWN_SEC (1-hour) escalation logic at tm_provider_health.py:540 being correct. STATUS.md's framing missed that the in-session logic was fine; the bug was persistence. Fix: added a debounced save block to record_rate_limit mirroring record_success's pattern exactly (30s debounce, same _last_persist_at field, same exception handling with print-amber). the user's 93 decided BUYs already correctly keyed in source_weights start informing rankings AND, via this fix, chronic-429 providers now reliably escalate to 1-hour cooldown across restart boundaries. Part B — three lateral cleanups: (1) _V415_MISMATCH_RULES at tired_market.py:2213 keyed the lottery rule on 'lottery_ticket' instead of the canonical 'lottery' path id. The lookup at _v415_path_universe_mismatch returned None for every lottery pass — the user-facing path/universe mismatch warning has never fired for the lottery path since the v4.13.x detection feature shipped. Real production bug, not just a typo cleanup. Fixed the rule key + the 4 audit literals in _audit_combined_fix_may13.py that exercised the broken code. (2) _PATH_BLOCK_OVERRIDES in tm_context_builder.py:437-439 had a 'conservative_income' entry that didn't exist in tm_holdings.PATHS — dead config with no consumer. Identical to 'slow_safe''s value (copy-paste vestige). Deleted. (3) Path default fallbacks across the codebase were inconsistent: 7 sites defaulted to 'lottery', 4 to 'moderate', 2 to tm_holdings.DEFAULT_PATH. The canonical default in load_config is 'moderate' so the 'lottery' sites were wrong by value, and the inconsistent style would have made a hypothetical "cfg missing analysis_path" case resolve differently across code paths. Aligned all 11 sites to use tm_holdings.DEFAULT_PATH (the constant; not a literal). Future-proofs against the "read-before-cfg-seed" silent-bug class. Out-of-scope flagged for future: provider_rate_limit_hit Teacher AI dedup (deferred to v4.14.3.15 / activity.log persistence patch), record_failure non-429 errors don't trigger cooldown (intentional, not a bug), legacy + canonical health records get separate counters (intentional separation), _V415_MISMATCH_RULES is incomplete (only 3 of 5 paths have rules; product decision). Prior body: predictions.jsonl delta-append + compaction (2026-05-15): closes the write-amplification problem flagged in v4.14.3.12's Part B investigation. STATUS.md framed this as "rotation" but the real bug was that PredictionsLog._persist_full() rewrites the entire 8.5MB file on EVERY status mutation. With 688 closures already in the user's history, that's ~5.8 GB of cumulative I/O for what should have been ~140 KB of mutations. Each startup-closer + auto-refresh-tick can re-resolve 50+ predictions in one call -> 50 x 8.5MB = 425 MB of I/O per tick. (1) New tm_discover.PredictionsLog._persist_delta(pred_id, patch_dict) appends a ~200-byte delta record to predictions.jsonl instead of rewriting the file. Delta envelope: {"_d": 1, "id": "...", "patch": {field: value, ...}, "ts": "..."}. Multi-field shape because status closures always touch 3-5 fields atomically (status + closed_at + close_price + notes + optionally eval_method or close_note). The _d=1 discriminator doesn't collide with any existing record field. ~10x smaller per mutation than the full rewrite. (2) PredictionsLog._load rewritten as merge: walks file line-by-line maintaining a dict keyed by pred_id; full records overwrite, deltas apply via dict.update(patch) to the existing record. Orphan deltas (delta referencing pred_id not yet seen) log amber via print() and skip rather than crash. Insertion order preserved via auxiliary list so get_recent_for_ticker's reverse-iteration semantics stay correct. Tracks delta_count seen during load -> used by startup compaction trigger. (3) New PredictionsLog.compact(): writes the in-memory _cache (which IS the merged state) to a temp file at self.path.with_suffix('.jsonl.compact_tmp'), fsyncs, then os.replace -> atomic rename on Windows same-volume per Python docs. Original file untouched until rename succeeds. On any failure: temp file unlinked, original intact, amber logged. (4) Compaction triggers: at __init__ after _load if delta_count/full_count > 0.5 (DELTA_RATIO_TRIGGER); in-session every 100 deltas (DELTA_COMPACT_THRESHOLD). Both constants are module-level in tm_discover.py - no cfg fields. (5) self._lock switched from threading.Lock to threading.RLock. Pre-existing dormant deadlock: mark_position_sold held self._lock while calling _persist_full which tried to acquire the same non-reentrant Lock. Never triggered in practice because mark_position_sold is a rare user action, but v4.14.3.13's per-delta writes would have surfaced it constantly. RLock fixes both the dormant bug and the new delta-writing call patterns without changing any other locking semantics. (6) Five _persist_full call sites converted to _persist_delta loops: update_outcome (one record, 4 fields), check_outcomes (N records, 5 fields each including eval_method), check_supersessions happy-path AND exception-fallback paths (N records, 4 fields with close_note + superseded_by_id OR contradicted_by_id), mark_position_sold (N records per ticker, 4 fields). Sites #1 (restore_from_backup) + #2 (clear_older_than) intentionally remain _persist_full - structural rewrites can't be expressed as deltas. (7) Accuracy Matrix dialog (tired_market.py:12367-12384 area) was reading predictions.jsonl DIRECTLY line-by-line - under delta-append it would interpret delta records as full predictions and silently produce wrong stats. Converted to call self._holdings_state['predictions_log'].get_all() so the merge happens before this code sees data. Comment block above the change explicitly says "do NOT revert to direct file reads - they will silently corrupt the matrix." (8) Installer pre-emptively snapshots data/predictions.jsonl to data/backups/predictions.jsonl.pre_v4.14.3.13_<TS> before the code swap. Gives clean rollback - if the user reverts to v4.14.3.12 (which can't parse delta records), restore that snapshot first. Estimated pass-time delta: a startup closer that resolves 50 predictions used to do ~425 MB of I/O (50 full rewrites of 8.5MB each); now does ~10 KB (50 deltas at ~200 bytes each) plus possibly one compaction if the count hits the threshold. ~42,500x reduction per mutation. Compaction at current file size: ~80-130ms; scales linearly. No schema changes, no cfg defaults, no new modules. Out-of-scope flagged for future: non-BUY smaller-schema (~50% file size reduction; ~100 LOC, deferred to v4.14.3.14+), compaction latency at file sizes >50MB (revisit if/when reached), pruning of predictions_backup_*.jsonl files in data/backups/. Prior body: Wilson CI reader fix - one-line picker correction (2026-05-15): closes a long-standing writer-vs-reader key mismatch in the accuracy bridge that meant the picker's Wilson CI ranking has been theatrical since v4.14.3 shipped. The bug: tm_source_accuracy.compute_model_accuracy keys source_weights rows by pred.get('model') - the provider's display label (e.g. 'Mistral', 'Cerebras', 'GitHub'). tm_source_weights.initialize_source_weights seeds rows by iterating MODEL_TIERS, also display-label keyed. But tm_top_ai_picker._rank_and_pick queried _query_wilson_ci_low with e['id'] - the preset name (e.g. 'mistral', 'custom'). Preset name and display label never match. _query_wilson_ci_low has been returning 0 for every provider since the bridge shipped, which meant the picker's with_data branch never fired and cold-start operational-fit ranking (v4.14.3.8) ran every pass. STATUS.md's framing of "three custom-preset providers share one accuracy row" was a partial description of one symptom; the deeper bug is that NO provider's row was ever found because of the format mismatch. Fix: tm_top_ai_picker.py:_rank_and_pick now passes e['display_name'].strip() to _query_wilson_ci_low (was: e['id']). Matches the writer's normalization at tm_source_accuracy.py:301 ((p.get('model') or '').strip()). the user's 93 decided BUYs (target_hit 39 + stop_hit 54) currently sitting correctly-keyed in source_weights start influencing picker rankings on first launch post-upgrade. registry_id (v4.14.3.7's dispatch identifier) stays separate - Wilson CI keying by display_name is a distinct concern from dispatch keying. One-line production change in tm_top_ai_picker.py plus a long comment block explaining the writer-reader alignment rationale. No schema change, no migration, no replay of predictions.jsonl. Out-of-scope flagged for future: MODEL_TIERS preserves the user's typos verbatim ('My Minstral', case variants of 'GitHub'), bridge's seen_unregistered should surface to activity log on unknown provider names, picker doesn't rank per-path (per-path data accumulating organically post-v4.14.3.10), non-BUY predictions carry full ~2.5KB records but contribute no accuracy (bundle with v4.14.3.13's delta-append work), predictions.jsonl write amplification fix (v4.14.3.13). Prior body: Load distribution across providers (2026-05-15): closes STATUS.md gap #5 - single-provider lock per pass. Pre-v4.14.3.11 the queue runner set scan_provider_filter=chosen.registry_id on every candidate call, narrowing the smart router to one provider for the entire pass. With Mistral as the user's cold-start winner, every 20-candidate pass concentrated load on one provider and a single 429 mid-pass cascaded into 13+ NO_CALLs because the single-provider group had no failover. The smart router has had multi-provider rotation since v4.14.1.1 (begin_scan_run / end_scan_run / next_scan_canonical_pick at tm_ai_router.py:958-1018) - the foreground Discover scan has used it since shipping. The queue runner just never opened that window. v4.14.3.11 turns it on. (1) tm_queue_runner._run_one_pass_body wraps the candidate loop in tm_ai_router.begin_scan_run() / end_scan_run() in a try/finally. The finally fires end_scan_run on every termination route - success, no-candidates, pick-failure, uncaught exception - so RouterRun state never leaks across passes. Mirrors v4.14.3.10's cursor-advance try/finally pattern. (2) _run_cloud_one drops scan_provider_filter (was: chosen.registry_id; now: None). With None passed, the router builds multi-provider groups per canonical model and uses its existing v4.14.1.1 round-robin to pick one canonical model per candidate. Within each model, sticky-pick + retry-on-transient + failover-on-quota are all already there. A 429 mid-pass on Mistral now fails over to Cerebras/GitHub/etc. on the next candidate instead of cascading to NO_CALL. (3) Inter-call throttle deleted from the queue runner. The v4.14.3.8 throttle was the right answer when the runner concentrated 20 calls on one provider; under distribution it solves a problem that no longer exists AND would falsely apply one provider's spacing between calls hitting different providers. Removed: _last_call_by_provider module-level dict, _prov_dict_for_spacing setup block in run_one_pass, the per-candidate throttle wait. The rate limiter's per-provider RPM/TPM/RPD gates (via tm_rate_limiter.acquire_for_provider inside tm_api_providers.call_provider) remain the canonical throttle - same-provider bursts still get rate-limited correctly. (4) Picker continues to run once per pass as a pre-pass health gate. It still produces the cooldown/identifier/operational-fit diagnostics from v4.14.3.5/3.6/3.7/3.8 and still surfaces all_cooldown / all_exhausted / all_disabled / none_configured system events. The picker's chosen.registry_id is now informational (used for the activity-log "preferred" label) rather than dispatch-controlling. (5) Per-pass provider mix tally maintained during the candidate loop. The _analyze_candidate / _run_cloud_one path already returns a pred dict carrying the 'model' field (= display label of the provider that actually served the call). For each successful pred, increment provider_calls[pred.get('model', '?')]. Passed into _emit_summary_log. (6) _emit_summary_log signature gains provider_calls dict. The success-path summary line reports per-provider counts: 'Queue runner pass (aggressive): 18 picks added - Mistral 8, Cerebras 6, Gemini 4'. The dedup tuple gains a frozenset of provider_calls.items() so two passes with same totals but different distributions both log; identical-distribution passes still dedup. (7) Once-per-pass muted log line announces distribution: 'Queue runner ({path}): rotating across N eligible providers'. Fires after begin_scan_run succeeds and the candidate shortlist is non-empty. Estimated pass-time delta: the user's current ~38s pass (20 Mistral calls @ ~1.9s each including v4.14.3.8 throttle) drops to ~15-20s under distribution because consecutive different-provider calls don't trigger the throttle. The rate limiter still throttles same-provider bursts. Migration: none. No schema changes, no cfg defaults. tm_queue_runner.py + tired_market.py only. Out-of-scope flagged for future: preset-keyed Wilson CI (becomes more visible under distribution but the fix is its own schema patch), router preference-order accuracy-awareness (a future tm_ai_router patch could sort within each canonical-model group by accuracy), activity.log disk persistence (carried from v4.14.3.9). Prior body: Path-aware allocation (2026-05-15): closes STATUS.md gap #2 — only cfg['analysis_path'] (currently 'moderate') was getting new predictions, leaving Aggressive/Lottery/Penny/Slow-safe Recommend windows empty because nothing had ever populated them. Pure pass-rotation across all five paths: each pass picks one path from tm_holdings.PATHS in declaration order (slow_safe -> moderate -> aggressive -> lottery -> penny_lottery), runs the v4.14.3.9 cursor pass for that path, advances. Five-pass cycle at the 15-min cadence covers every path every 75 minutes. (1) New cfg field queue_runner_path_cursor (integer, default 0) added to load_config defaults — small integer index into the rotation tuple; survives restarts via save_config. (2) tm_queue_runner gains module-level helper _get_path_rotation() that returns tuple(tm_holdings.PATHS.keys()) lazily — derives from the canonical PATHS dict rather than duplicating the list, so a future patch that adds/removes a path doesn't require a runner edit. Lazy import (inside the function) avoids circular import at module load. (3) _read_rotation_path(app) returns (cursor_idx, rotation_path) with defensive handling: non-int / out-of-range cursor values are clamped to 0 with a one-time amber log. (4) run_one_pass body wrapped in try/finally. The finally block ALWAYS advances the cursor and persists via save_config regardless of termination route — success / no-candidates / pick-failure / exception all advance. Without this, a path that hits all-cooldown for one cycle locks the rotation on itself forever. (5) cfg['queue_runner_last_pass'] stamp moved out of the manual-try block and into the same single save_config call as the cursor write — one filesystem write per pass instead of two. (6) _build_candidate_shortlist(app, path) signature change — path is now an explicit argument, no internal cfg['analysis_path'] read. Caller passes rotation_path. The rest of the call chain (_analyze_candidate, _run_cloud_one, _record_analysis_outcome, _build_candidate_prompt, _PATH_BLOCK_OVERRIDES) already accepted path as a parameter from v4.14.3.9 — no other signature changes needed. (7) Pre-pick failure (all_cooldown / all_exhausted / all_disabled / none_configured) does NOT call _record_analysis_outcome for any candidate. Picker state has nothing to do with ticker freshness; falsely demoting tickers for picker-state problems would poison the oldest-first sort when the path becomes runnable again. The cursor still advances via finally so rotation doesn't lock. (8) _emit_summary_log signature change — path is required argument now, included in the user-visible message ("Queue runner pass (aggressive): Mistral analyzed 20 candidates, 18 new picks queued.") AND added to the dedup tuple (chosen_id, inserted, outcome, path). Without the path-in-dedup, consecutive different-path passes with identical (chosen_id, inserted, outcome) would silently dedup against each other and the second path's summary would disappear from the activity log. (9) cfg['analysis_path'] is the USER's view selector and is NEVER written by the runner during a pass — confirmed across all rotation paths. The user looking at the Moderate Recommend window keeps seeing Moderate; the runner rotates through paths independently. Migration: idempotent. queue_runner_analysis_log table (path-keyed since v4.14.3.9) holds existing 'moderate' rows from yesterday's work — they stay valid for moderate's Recommend view, and the first rotation hits 'slow_safe' which has zero rows, surfacing fresh never-analyzed tickers. Aggressive / Lottery / Penny / Slow-safe Recommend views populate organically over the first ~75 minutes after launch (5 paths x 15-min cadence). Out-of-scope flagged for future: per-path enable toggle, per-path budget tuning, top-AI indicator path-awareness, fix for the three lateral inconsistencies ('lottery_ticket' typo in old audit, ghost 'conservative_income' in _PATH_BLOCK_OVERRIDES, split 'moderate'/'lottery' defaults). Prior body: Universe cursor + copy-activity-log (2026-05-15): closes the dominant 'queue runner re-analyzes the same alphabetical first 20 tickers every pass, leaving 2470 of 2490 ITOT tickers untouched' coverage gap, plus the 'can't copy activity log into chat' diagnostic friction. (1) New table queue_runner_analysis_log (ticker TEXT, path TEXT, last_analyzed_at INTEGER, last_outcome TEXT, PRIMARY KEY (ticker, path)) created idempotently in Database._init via CREATE TABLE IF NOT EXISTS — no migration step needed, fresh installs and upgrades both reach the same shape. Index idx_qral_path_time on (path, last_analyzed_at) keeps the "oldest N for this path" query cheap as the universe grows. Storage cost on ITOT: ~700 KB for 2490 tickers x 5 paths. (2) tm_queue_runner._build_candidate_shortlist rewritten — still pulls from tm_cache for universe membership and still excludes active recommend_queue rows + 24h AVOID cooldown, but now orders the candidate pool by staleness instead of alphabetically. Never-analyzed tickers (NULL last_analyzed_at) float to the top; among analyzed tickers, the oldest analysis comes first. Alphabetical ticker is the deterministic tiebreak. With a 20-cap and 15-min cadence, the full ITOT universe cycles in ~125 passes (~31 hours). (3) New helper _record_analysis_outcome UPSERTs the (ticker, path, now, outcome) row after every candidate processed in run_one_pass, regardless of direction. BUY / WATCH / AVOID / NO_CALL all record their outcome; silent-drops and exceptions record 'failed'. The point is "we looked at this ticker, move on" — not "we successfully predicted it" — so failed tickers don't cycle back to the top of the queue every pass and re-burn budget. UPSERT failure logs amber and continues; a bad write never blocks the rest of the pass. (4) Storage shape is path-aware from day one (PRIMARY KEY (ticker, path)) so v4.14.3.10's path-aware allocation work inherits the schema without migration. Runtime in v4.14.3.9 still operates only on cfg['analysis_path'] — that's intentional, allocation policy is a separate design call. (5) Activity log header gains a "Copy All" button peer to the existing Clear button. Same styling, packed to the right so the order reads "Copy All | Clear". (6) New App method _attach_copy_context_menu builds a Tkinter context menu (tk.Menu, tearoff=0) on a Text widget with Copy (selection only), Copy All (entire buffer), and optionally Clear (if on_clear callable is supplied). Bound to <Button-3> for right-click; the Activity Text widget also gets <Control-c> bound to the Copy-selection handler. Works on state='disabled' widgets — selection happens via the standard Tk mechanism, the Copy action reads via widget.get() without state-flipping. Clipboard write uses clipboard_clear + clipboard_append + update() — the trailing update() is critical or contents disappear when the Tk loop yields. (7) Clear button now wrapped in _confirm_clear_activity which fires askyesno with copy that names what's lost: "Most queue runner and AI dispatch events are not written to data/activity.log, so they cannot be recovered after clearing." Default No. Existing _clear_activity logic untouched — the wrapper just gates the call. Out-of-scope flagged for follow-up: persisting runner/AI events to data/activity.log on disk (would remove Clear's destructiveness entirely; deserves its own design pass for rotation policy + write batching). "Copy last N lines" / "Copy since timestamp" stay out. Path-aware allocation stays gap #2 for v4.14.3.10. Prior body: Burst-tolerant queue runner foundation (2026-05-14): closes the dominant 'queue runner produces 1-7 predictions then burns NO_CALLs' pattern caused by TPM (tokens-per-minute), not RPM, blowouts on Groq/Cerebras free tiers. (1) tm_rate_limiter.py PRESET_DEFAULTS now carries tpm and burst_category per preset (groq/cerebras='tight'@6000 TPM, gemini='moderate'@32000, mistral/anthropic/openai='generous', ollama='generous'/None). New get_burst_category helper resolves a provider's category honoring optional rate_limit_tpm and burst_category overrides on the provider entry. (2) ProviderRateLimiter gains a token-time deque and acquire_with_tokens method that enforces TPM in addition to RPM; raises QuotaExhausted when a single call's tokens exceed the TPM cap. acquire_for_provider gains estimated_tokens kwarg and dispatches to acquire_with_tokens when TPM is configured. (3) call_provider in tm_api_providers.py computes len(prompt)/4 as the token estimate and passes it through. (4) tm_queue_runner.py gains a per-provider _last_call_by_provider dict and inter-call throttle: spacing = (est_tokens / (tpm/60)) when TPM is set; else 60/rpm; else 1.5s; +15% safety margin. Stop-event-aware via _queue_runner_stop. Surfaces a muted '[runner] Throttling X: Ns between calls' log when spacing waits >= 1s. (5) tm_top_ai_picker cold-start strategy rewritten — groups by burst_category, prefers generous > moderate > tight, within-category sorts by display name. Eliminates the hard-coded 'Groq if present' fallback so users without Groq get a sensible default (Mistral for the user's lineup). (6) New _maybe_warn_tight_burst hook fires a one-time-per-session log line when a tight-burst provider gets picked for a multi-candidate pass; warn_pinned_tight_burst_once fires at App init for legacy pins. (7) provider entries accept optional rate_limit_tpm and burst_category overrides with the same fall-through-to-preset-defaults semantics as the existing rpm/rpd overrides. Mid-pass rotation deferred to v4.14.3.9. Prior body: Picker/router identifier consistency (2026-05-14): closes the picker-vs-router identifier mismatch that silently 20/20-failed every queue runner pass for users whose top-ranked provider had preset='custom' (Cerebras, GitHub, SambaNova in the user's lineup). Picker entries now carry both 'id' (preset, kept for Wilson-CI continuity) AND 'registry_id' (per-install UUID). Queue runner passes registry_id as scan_provider_filter. Router (tm_api_providers.run_apis_for_scan_prediction) matches the filter against provider 'id' (UUID) primarily, falls back to display-name match with a soft-warn log for legacy callers. Override path uses a three-step resolver: registry_id (canonical) -> display_name (legacy) -> preset (very-legacy). App.__init__ runs an idempotent migration that translates legacy cfg['top_ai_override'] values to registry IDs on first launch and writes back. AI Providers dialog now shows the registry id under each provider's display name (muted small text) so users can identify which provider any dispatch log line refers to. Closes today's diagnosis that the v4.14.3.5 cooldown fix only worked because the user's first-tried provider (Groq) happened to have a name-matches-preset coincidence — every preset='custom' provider was unreachable through the dispatch chain. Prior body: Silent-drop diagnostics + log_fn wiring + HoldingsWindow auto-build + installer fix (2026-05-14): (1) _analyze_candidate's three None-return paths (hw is None, prompt-build exception, empty prompt) now record into a drop_reasons dict the caller threads through; run_one_pass emits one amber 'N/total candidates dropped before AI call — Nx <reason>, Mx <reason>' summary per pass listing each reason with count. (2) Queue runner's run_apis_for_scan_prediction call wires log_fn=_safe_log instead of None — the smart router's existing diagnostic surface (cooldown skips, transient retries, [degradation] tags, all-exhausted breadcrumbs) now reaches the activity log. (3) New _ensure_holdings_window App helper builds _holdings_state + _holdings_window idempotently from any thread (per-App lock); queue runner calls it at start of run_one_pass so fresh-launch passes can proceed without waiting for a user click. (4) Amber summary copy rewritten — 'Common cause: provider cooldown after a 429' replaced with 'See preceding log lines for per-candidate reason' since v4.14.3.5 fixed the cooldown case and the hint is misleading post-fix. (5) run_apis_for_scan_prediction's empty-groups silent return at line 1336 now logs + writes a NO_CALL prediction matching the all-exhausted path's shape. (6) Installer process-detection tightened from substring 'tired_market' to (python.exe|pythonw.exe AND command-line regex 'tired_market\\.py') so text-editor false positives stop refusing installs. Closes today's investigation of why predictions.jsonl was stuck at 7,950,276 bytes for 16+ hours despite multiple queue runner passes. Prior body: Picker cooldown awareness — Fix A bundle (2026-05-14): (1) tm_top_ai_picker.pick_top_ai now reads tm_provider_health and excludes providers in active cooldown from the eligible set before ranking; new failure reason 'all_cooldown' carries cooldown_remaining_sec for the surface; cold-start fallback chain (Groq -> first cloud -> first local) skips cooled providers naturally because they're excluded upstream; override path falls through with fallback_from when the pinned provider is cooled; per-exclusion picker_log line for upstream visibility into why a less-preferred provider was chosen. (2) has_any_ai_available shares the awareness automatically because it already delegates to pick_top_ai. (3) New playbook entry recommend_all_providers_cooldown (event=all_ais_in_cooldown, severity=soft_warn, no offered_action) — distinct from per-provider provider_rate_limit_hit. (4) tm_queue_runner gains the 'all_cooldown' branch in run_one_pass that emits the new system_event with cooldown_remaining_sec context for token substitution. Closes the picker-vs-cooldown bug surfaced by today's v4.14.3.1 amber summary line. Fix B (mid-pass rotation) and chronic-429 escalation deferred per investigation. Prior body: Lane ordering + chunked daily_bars + UX honesty bundle (2026-05-14): (1) BULK_FILLABLE_LANES is now a tuple in deterministic order (daily_bars first, fundamentals second, filings third) — was a frozenset, iteration order depended on PYTHONHASHSEED, both bulk and slow fill could randomly fill the wrong lane first and leave the queue runner starving for new daily_bars; (2) new chunked phase-1 helper _run_chunked_phase in tm_fill_executor.py plus per-lane chunked_fetchers parameter on start_bulk_fill / start_slow_fill — daily_bars lane front-loads a yf.download() batch fetch (~100 tickers per HTTP call) before falling through to per-ticker iteration, restoring the original 'usable in 30 seconds' speed for the daily_bars lane; (3) ITOT universe label fixed to ~2,500 (was ~3,500+; the real iShares ITOT holds ~2,490); (4) From-server picker radio is now state='disabled' with label 'coming soon — donor token required' and estimate copy 'not available in this build' — UX honesty fix since start_server_pull is still a stub. tm_fill_executor stop() signature unchanged from v4.14.3.3. Prior body: Bulk fill end-to-end fix (2026-05-14): (A) picker radio restores from cfg['v415_fill_mode'] → lane_config → INCREMENTAL fallback chain instead of hard-coding to INCREMENTAL on every open; (B) explicit-pick start methods (_v415_start_bulk_fill / _v415_start_slow_fill / _v415_start_server_pull) now STOP any running fill before starting their new mode via new _v415_stop_running_fill_for_mode_switch helper, instead of silently no-op-ing past it — launch-time auto-start path keeps its idempotence; (C) cfg gains v415_fill_mode field written from the picker's _on_save, with INCREMENTAL default in load_config so the picker has a persistent record of user intent that survives executor _maybe_transition rewrites; (D) bulk fill's get_scope_tickers call passes None for choices (the May 13 fix slow fill got, finally applied to bulk too) — without this, bulk fill against a partially-cached universe would self-abort because scope = already-filled set. tm_fill_executor.stop() now accepts optional timeout_sec kwarg and joins the worker thread. Bundled because all four problems combined silently swallowed every user attempt to switch into bulk mode. Prior body: Hamburger menu shortcut to universe + fill-mode picker (2026-05-14): new "Stock selection..." entry between AI Mode and Data Providers in the utility menu, calling self._open_fill_mode_picker with no arguments. Settings dialog's "Change data setup (universe + fill mode)..." button left in place — both entry points reach the same picker, with different labels suited to their context. UI discoverability only, no behavior change. Prior body: Queue runner visibility hotfix (2026-05-14): _emit_summary_log no longer suppresses "success, 0 inserts" passes (the runner looked dead when the picked AI was repeatedly in cooldown); _run_one_pass now emits an end-of-pass amber summary line when N/total candidates returned `pred is None` so silent provider failures are visible. No behavior change on the happy path. Prior body: Accuracy → source-weight bridge. The missing connector that activates dormant infrastructure from stages 6 and 7. New module tm_source_accuracy.py reads closed predictions out of PredictionsLog, computes per-model accuracy (target_hits / (target_hits + stop_hits) on closed BUY predictions only — expired/superseded/contradicted are tracked but excluded from the accuracy denominator), maps to within_tier_score on the stage-6 1-15 scale, computes Wilson 95% confidence intervals (stored as integer percent bounds in confidence_band_low/high), and UPSERTs into source_weights table. Three groupings populated: (model, '__global__', '__global__') overall, (model, path, '__global__') per-path, (model, '__global__', ticker) per-ticker (gated on ≥5 decided BUYs for that ticker to avoid creating thousands of low-confidence rows). MODEL_TIERS dict added to tm_source_weights.py with 23 model entries at tier 'M' — all observed in the user's predictions.jsonl. Initialize_source_weights now seeds both data sources (A/B/C/D) AND models (M). get_source_weight recognizes both registries via combined membership check; tier_for() and is_model() helpers added; new list_active_models() symmetric with list_active_sources_for_lane. Score mapping: <10 samples → 5 (default); ≥0.70 → 1-3 (best); 0.60-0.70 → 4-5; 0.55-0.60 → 6-7; 0.50-0.55 → 8 (active threshold); 0.45-0.50 → 9-10 (watched); 0.40-0.45 → 11-13 (watched, lower confidence); <0.40 → 14-15 (removed). Within each band, larger sample sizes pull toward better end. Wired into two existing triggers: _startup_close_outcomes (after the closer + supersession check) and _auto_refresh_tick (after check_outcomes + check_supersessions). 5-minute cooldown via module-level _last_run_at timestamp prevents hammering. Silent on success; visible on failure. Stage 7's source-quality prompt rendering activates automatically once scores differentiate. Stage 6's source_weights infrastructure stops being inert — sample_size and within_tier_score now reflect real prediction outcomes. Out of scope (deferred): state transition logic firing automatically on boundary crossings; per-data-source accuracy (predictions.jsonl doesn't capture which news/social sources informed each prediction — schema extension is a future stage); decay (old predictions weighted same as new); per-context scoring beyond per-path (high_variance vs standard contexts need a context detector that doesn't exist yet); UI surface for showing model accuracy to users. Real-data state at ship: 2,983 predictions in jsonl, 628 closed BUYs, only 59 decided (target+stop) — qwen2.5:14b is the only model crossing the n≥10 threshold (22/46 = 47.8%, lands in score 9 'just-watched'); all other models stay at default score 5 due to insufficient data. Track Record / Recommend / Look Up unchanged in this version. — epistemic humility prompt rendering for source disagreement. Threshold-based detection (not pattern-based) of meaningful per-source directional disagreement in NEWS and SOCIAL blocks; surfaces it to the AI in two reinforcing places: (1) data block flag line ("⚠ Source disagreement: <description>" or "⚠ Cross-source disagreement: <description>"), (2) QUESTION-block prepend asking the AI to reason about uncertainty explicitly, cite conflicting sources by name, avoid generic hedging language, and lean toward WATCH over BUY when the picture is genuinely mixed. NEWS detection criteria (all required): ≥10 articles total, ≥2 sources lean bullish AND ≥2 lean bearish using ±0.2 lean threshold, sentiment-range across per-source means ≥0.4. SOCIAL detection criteria: ≥5 messages, both Reddit and StockTwits represented, opposite per-source leans (one 'bullish' lean tag, the other 'bearish'). Per-source aggregation in detect_news_disagreement avoids the case where a high-volume source overwhelms the signal from a low-volume source. get_news_features now surfaces 'articles' field (per-article (source, sentiment_score) records over a 7-day window normalized to [-1, +1]) so detection can group by source. cache.social() already surfaces source_breakdown.reddit_lean / stocktwits_lean from stage 5's _fetch_social merge; detect_social_disagreement reads those tags. Module-level thresholds in tm_context_builder.py: NEWS_DISAGREEMENT_MIN_ARTICLES=10, NEWS_DISAGREEMENT_MIN_SOURCES_PER_SIDE=2, NEWS_DISAGREEMENT_MIN_SENTIMENT_RANGE=0.4, SOCIAL_DISAGREEMENT_MIN_MESSAGES=5, SOCIAL_DISAGREEMENT_MIN_SOURCES_PER_SIDE=2, SOCIAL_DISAGREEMENT_MIN_SENTIMENT_RANGE=0.4, SOURCE_LEAN_THRESHOLD=0.2 (per-source mean must clear ±0.2 to count toward either side). New function get_disagreement_context(blocks) scans rendered context for the flag markers ("Source disagreement:" / "Cross-source disagreement:") and returns the EPISTEMIC_HUMILITY_PREPEND string when present, None otherwise. Three QUESTION-block injection sites updated in tm_holdings.py: build_holding_analysis (tradable), _build_locked_analysis (locked), _build_candidate_prompt (Look Up + Discover). tm_consensus.fresh-buy path inherits the prepend automatically because it slices on '\nQUESTION:\n' and humility prepends BEFORE that marker. Backward compatibility: when no disagreement is detected, ALL existing prompts render byte-identically to stage 6. Stage 6's source weighting infrastructure NOT consulted in stage 7 — all sources weighted equally for disagreement detection; weight integration is a future stage once accuracy data exists. Stage 7 explicitly does NOT include: pattern-based detection (bimodal distributions etc.), TECHNICAL/EARNINGS/MACRO disagreement (different design problem — single-source-but-mixed-internal-signals), user-tunable Settings thresholds, cross-source framing variance over time. No new dependencies, no new database tables — pure prompt logic. — source weighting schema + storage infrastructure (NOT measurement; that ships post-paper-trade). Two-dimensional weighting locked in: category tier (A=SEC filings, B=News, C=Social, D=reserved) × within-tier score (1-15 scale). State boundaries hardcoded: 1-8 active / 9-13 watched / 14-15 removed. Per-(source × context × ticker) scoring with three-step specificity fallback. Initial state: every registered source seeded at within_tier=5, state='active'. Cross-tier movement is hardcoded; only within-tier numbers are eventually data-driven. New SQLite table source_weights in tired_market.db (PK source_id+context_id+ticker; idx_sw_state index for state lookups). New module tm_source_weights.py: SOURCE_TIERS registry (sec_edgar=A; yahoo_news/finnhub_news/rss_news/google_news=B; reddit/stocktwits=C), LANE_SOURCES mapping (filings/news/social), state boundary helpers, initialize_source_weights migration (idempotent INSERT OR IGNORE — re-running never duplicates rows or resets existing scores), get_source_weight read API with 3-step specificity fallback (ticker-specific → context-default → global-default), list_active_sources_for_lane (filters out watched/removed; sorted by tier then within-tier desc), weights_are_uniform helper, render_source_quality_line (returns None when uniform — stage 6 ships with all weights at 5 so renders nothing today; future stages light up automatically once scores differentiate). Database._init creates the table + idx; Database._init_source_weights seeds defaults on app startup. Additive prompt integration in tm_context_builder._maybe_append_source_quality wired into _news_block, _social_block, _filings_block — defensive getattr(cache, 'source_weights_for_lace', None) check; cache doesn't expose that method today so it's a guaranteed no-op. Existing prompts byte-identically unchanged. Saved for future stages: actual accuracy measurement vs prediction outcomes, state transitions firing, cross-source framing variance detection, per-ticker context history with timeline tracking, decay logic on old prediction data, settings UI surface. — social lane (NEW): Reddit (FWK with embedded credentials default; built on raw urllib + OAuth client_credentials, no PRAW dependency) + StockTwits (keyless public stream, no auth). cache.social(ticker) merges both per-ticker into a normalized snapshot (total_mentions + sentiment_breakdown + top_topics + cross-source agreement). New _social_block (7th built-in) renders compact signal-dense [SOCIAL CONTEXT] in prompts. Path-aware inclusion via _PATH_BLOCK_OVERRIDES — catalyst plays / lottery / aggressive INCLUDE social (primary use case); slow_safe / conservative_income SKIP social (wrong tool); moderate / balanced inherit prompt-kind defaults (which include SOCIAL). TTL_SOCIAL=30min, MAX_DISK_AGE_SOCIAL=24h, persisted disk SWR. Reddit cheat-sheet entry appended to data/internal/provider_signup_specs.json. data/data_providers.json migrated to add 'social' priority entries to all 9 existing profiles + Reddit (priority 1) and StockTwits (priority 2) profiles appended (now 11 total). Reddit credentials shipped blank in _EMBEDDED_CREDS — adapter returns None cleanly until the user provisions shared developer credentials, system falls back to StockTwits-only meanwhile. Macro lane: 'macro' added to DATA_TYPES; FRED profile added (FWK, free 32-char key from fredaccount.stlouisfed.org, priority 1 when configured); Yahoo serves keyless macro at priority 2 via ^TNX/^FVX/^IRX/^TYX/^VIX index tickers. New tm_data_adapter_fred.py for the JSON API. cache.macro() global lookup (no ticker, market_status precedent) with TTL_MACRO=12h, MAX_DISK_AGE_MACRO=7d, persisted disk SWR. _fetch_macro merges Yahoo + FRED into a unified shape. _macro_block (6th built-in) renders [MACRO CONTEXT]. Path-aware block inclusion: _PROMPT_KIND_BLOCK_CONFIG populated, new _PATH_BLOCK_OVERRIDES table; aggressive/lottery paths skip MACRO + FILINGS for speed; build_context grows prompt_kind= parameter. Candidate vocabulary fix: HOLD replaced with WATCH for non-owned tickers (BUY/WATCH/AVOID); HOLD remains valid for owned-position prompts. Touches _build_candidate_prompt question framing, format_prediction_request_block split into _owned/_candidate variants, _PATTERN_DIRECTION regex, _FRESH_BUY_DIRECTION_TOKENS + normalizer (HOLD-as-candidate normalizes to WATCH), prefilter scorer's n_watch bucket, tm_portfolio_panel _direction_color. tm_recommend filter and the closer naturally treat WATCH as non-buy / unresolved (no code change needed there). First cheat-sheet artifact: data/internal/provider_signup_specs.json with the FRED entry; data/internal/ has Windows hidden+system attribute; Settings UI Data Providers row shows the cheat-sheet tier_unlocks blurb upfront and falls back to the cheat sheet for the "Get a free key →" button when tm_provider_discovery doesn't have the provider. data/data_providers.json one-shot migration adds 'macro' priority entries to all 8 existing profiles + appends FRED. User-Agent string in tm_api_providers/tm_provider_discovery stays frozen at 4.13.42.
 DISCLAIMER_VERSION = "2026-04-27-v2"  # bumped because text changed
 DISCLAIMER_MARKER_FILE = SCRIPT_DIR / ".disclaimer_accepted"
 
@@ -3913,7 +3963,8 @@ def _reco_format_band(price_min, price_max) -> str:
     return "any price"
 
 
-def _freshness_state(entry, zone_lo, zone_hi, target, stop, live):
+def _freshness_state(entry, zone_lo, zone_hi, target, stop, live,
+                     window_high=None):
     """v4.14.6.83-recommend-freshness-tag: return where the LIVE price sits
     relative to a pick's frozen plan, so the card can show one glanceable tag
     instead of forcing a manual verify. All inputs are floats already on the
@@ -3929,7 +3980,15 @@ def _freshness_state(entry, zone_lo, zone_hi, target, stop, live):
     the ticker, where it can't clip; for every other state detail is "".
 
     color_key is one of the app theme palette keys: 'green' (still a good entry),
-    'amber' (extended), 'red' (near stop), 'muted' (done / neutral)."""
+    'amber' (extended), 'red' (near stop), 'muted' (done / neutral).
+
+    v4.14.6.111-faded-spike: optional `window_high` (max daily HIGH since the
+    pick's made_at, supplied by the caller — this stays pure/no-fetch) makes the
+    BELOW-ZONE case path-aware. If the price already ran up THROUGH the zone
+    (window_high >= zone_high) and has since fallen back below it, that's a
+    played-out/reversed setup, NOT a fresh entry → "FADED" (amber caution).
+    Genuine never-reached picks stay green "BELOW ZONE". window_high=None →
+    EXACT prior behavior (fail-safe)."""
     try:
         entry = float(entry) if entry is not None else 0.0
         target = float(target) if target is not None else 0.0
@@ -3956,6 +4015,17 @@ def _freshness_state(entry, zone_lo, zone_hi, target, stop, live):
     if live <= stop + 0.25 * (entry - stop):
         return ("NEAR STOP", 'red', "")
     if live < (lo - pad):
+        # v4.14.6.111-faded-spike: path-aware split. If the price already ran up
+        # to/through the zone TOP and then fell back below, the move already
+        # happened and reversed — flag FADED (amber caution), don't paint it
+        # green as a fresh entry. zone_high (hi), not zone_low, is the "reached"
+        # bar — a wick-guard so a one-tick tag near the bottom can't false-flag.
+        # window_high=None (caller couldn't get history) → genuine prior behavior.
+        try:
+            if window_high is not None and float(window_high) >= hi:
+                return ("FADED", 'amber', "ran up, pulled back")
+        except (TypeError, ValueError):
+            pass
         return ("BELOW ZONE", 'green', "")
     if live <= (hi + pad):
         return ("IN ZONE", 'green', "")
@@ -4581,6 +4651,7 @@ def google_quote(ticker):
         if not raw:
             continue
         try:
+            from bs4 import BeautifulSoup  # lazy: bs4 deferred off startup
             soup = BeautifulSoup(raw, "html.parser")
             el = soup.find("div", {"data-last-price": True})
             if el:
@@ -4730,6 +4801,7 @@ def finviz_data(ticker):
     if not raw:
         return {}
     try:
+        from bs4 import BeautifulSoup  # lazy: bs4 deferred off startup
         soup = BeautifulSoup(raw, "html.parser")
         data = {}
         # Find the snapshot table
@@ -4767,6 +4839,7 @@ def finviz_sentiment(ticker):
     if not raw:
         return 0, []
     try:
+        from bs4 import BeautifulSoup  # lazy: bs4 deferred off startup
         soup = BeautifulSoup(raw, "html.parser")
         table = soup.find("table", id="news-table")
         if not table:
@@ -7074,9 +7147,14 @@ def load_config():
         # sort). Off => Layer 3 behaves exactly as today (AVOID-only drops).
         "recommend_layer3_low_opportunity_replace": False,
         # v4.14.6.92-event-market-liveness-gate: smart gating for the event-driven
-        # sweep. Master switch (default OFF) — turn ON to enable the sub-gates
-        # below; OFF = today's exact behavior (discovery triggers fire 24/7).
-        "event_sweep_smart_gating": False,
+        # sweep. Master switch. v4.14.6.111: default flipped ON after soak —
+        # enables the sub-gates below (all already Default-ON under the master) so
+        # fresh installs coast (closed-market price-trigger gating + 2% price-drift
+        # change-dedup + idle-when-unactionable) instead of firing discovery
+        # triggers 24/7. Existing installs already carry their saved value (saved
+        # wins on merge); this only changes the fresh-install default. Set False
+        # to restore the legacy 24/7 behavior.
+        "event_sweep_smart_gating": True,
         # Fix 1: when the market is observed CLOSED from the price DATA itself
         # (prices frozen across sweeps — clock-independent, surprise-closure-proof),
         # suppress the price-movement DISCOVERY triggers (price_drift /
@@ -7409,6 +7487,16 @@ def load_config():
         # "small/empty, grows as validation earns it"). Read once at startup
         # and on Settings save into tm_source_accuracy.set_attributable_only.
         "use_validated_accuracy": False,
+        # v4.14.6.111: keep the tier-1 algo signal funnel OUT of the prediction-
+        # accuracy HEADLINE (OVERALL/per-path/per-confidence) so it reflects only
+        # reasoned tier-2 AI calls. Default ON. The algo is a candidate funnel,
+        # not a reasoned predictor — counting its ~1k fast-resolving flags
+        # dominated and distorted the rate. DISPLAY-ONLY: algo still emits, still
+        # feeds tier-2/Layer-3 consensus, and still appears (relabeled) in the
+        # per-model comparison matrix; no learning loop is affected. False =
+        # restore the prior algo-included rate. Read at startup + on Settings save
+        # into tm_discover.set_exclude_algo_from_accuracy.
+        "exclude_algo_from_accuracy": True,
         # v4.14.5.62-analyst-facts: surface the analyst consensus rating +
         # mean price target (already fetched from Yahoo .info, no new call)
         # into the AI FACTS block. OFF (default) = FACTS block byte-identical
@@ -7545,7 +7633,12 @@ def load_config():
         # absent providers). Touches the VALIDATION path only — Verify keeps its
         # own ConsensusRunner models (flash/pro); scan uses cfg['consensus_models'].
         "layer2_validation_models": [
-            ["groq", "llama-3.3-70b-versatile"],
+            # v4.14.6.111: Groq entry moved off the deprecated 70b-versatile to a
+            # survivor (2026-06-17 deprecation). NOTE: tier-2 NO LONGER PINS this
+            # model — it rotates the provider's models[] (flat round-robin +
+            # cooldown-skip), so this string is a preference/fallback, not a hard
+            # pin. (The -instruct 70B below is CLOUDFLARE's, intentionally kept.)
+            ["groq", "openai/gpt-oss-20b"],
             ["cerebras", "gpt-oss-120b"],
             ["cloudflare", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"],
             ["mistral", "mistral-medium-latest"],
@@ -7855,16 +7948,27 @@ def _proc_image_name(pid: int):
 
 
 def _proc_is_tired_market(pid: int) -> bool:
-    """Best-effort: is `pid` a python/pythonw process? The PID already
-    came from OUR app.lock (only Tired Market writes it), so a matching
-    interpreter image name is a reasonable two-factor confirmation.
-    Unverifiable (None image) ⇒ False ⇒ main() refuses to start rather
+    """Best-effort: is `pid` THIS app's interpreter? The PID already came from
+    OUR app.lock (only Tired Market writes it), so a matching image name is a
+    reasonable two-factor confirmation. Accepts the renamed-interpreter name
+    `tiredmarket.exe` (the v4.14.6.111 process-identity rename — the everyday
+    launch path) AND the bare python/pythonw names (dev runs + the transition
+    period). Bare-python acceptance is still SAFE here because the PID is read
+    only from our own lock file — we never enumerate or act on arbitrary
+    pythons. Unverifiable (None image) ⇒ False ⇒ main() refuses to start rather
     than kill blindly."""
     img = _proc_image_name(pid)
     if not img:
         return False
-    return img in ("python.exe", "pythonw.exe", "python", "pythonw",
-                   "python3", "python3.exe")
+    # v4.14.6.112: recognise ANY packaged image whose basename starts with
+    # "tiredmarket" — covers the renamed dev interpreter (tiredmarket.exe), the
+    # portable/installed build (TiredMarket.exe) AND the single-file build
+    # (tiredmarket-allinone-v….exe) so the latter no longer "refuses to start"
+    # for end users. Anchored on the basename START (not a substring), so it
+    # can't match an unrelated process. Bare python names stay for dev/source.
+    return (img.startswith("tiredmarket")
+            or img in ("python.exe", "pythonw.exe", "python", "pythonw",
+                       "python3", "python3.exe"))
 
 
 def _graceful_close(pid: int, log=None) -> bool:
@@ -8201,6 +8305,100 @@ class Tooltip:
 # tm_ai_chat.py (the chat window). This file is now mostly the shell that
 # launches them.
 # ═══════════════════════════════════════════════════════════════════════════
+# v4.14.6.110: hardware tier classification + fill-defer mapping. Decision-neutral
+# (scheduling only). Pure functions/dict so they're unit-testable without App/Tk.
+_FILL_DEFER_BY_TIER = {'low': 9000, 'normal': 5000, 'high': 1500}  # milliseconds
+
+
+def _classify_hw_tier(ram_gb, cores, disk):
+    """low (potato): RAM<4 OR cores<=2 OR disk=='HDD'.
+    high (strong):  RAM>=16 AND cores>=8 AND disk=='SSD'.
+    normal: everything else (and the fallback). A 'unknown' disk NEVER forces
+    'low' — it only fails the high test. Never raises."""
+    try:
+        ram = float(ram_gb or 0)
+        c = int(cores or 0)
+        d = disk or 'unknown'
+        if ram < 4 or c <= 2 or d == 'HDD':
+            return 'low'
+        if ram >= 16 and c >= 8 and d == 'SSD':
+            return 'high'
+        return 'normal'
+    except Exception:
+        return 'normal'
+
+
+def make_scrollable(parent, bg=None):
+    """v4.14.6.111: wrap `parent` in a vertical Canvas + auto-hiding Scrollbar and
+    return the INNER frame to pack window content into. The universal "every window
+    scrolls by default" primitive.
+
+    - Fits -> no scrollbar shown (the window looks identical to an unscrolled one;
+      no dead bar, no empty gap). Overflows -> the scrollbar appears and the wheel
+      scrolls. Re-evaluated on resize and on content change (auto-hide).
+    - The inner frame's width tracks the canvas width, so content fills horizontally
+      (no dead right-gap); scrollregion recomputes on inner <Configure>, so
+      dynamically added/updated content (live panels) stays reachable.
+    - Mousewheel is SCOPED via <Enter>/<Leave> bind_all (the correct idiom): the
+      wheel scrolls THIS canvas while hovered — including over child widgets (fixes
+      the per-canvas-bind "wheel does nothing over content" bug) — and is released
+      on leave so it never hijacks another window. Windows <MouseWheel> (delta/120).
+    - Vertical-only. Pure tkinter; style-neutral (inherits `bg` from parent).
+    """
+    if bg is None:
+        try:
+            bg = parent.cget('bg')
+        except Exception:
+            bg = None
+    _bgkw = {'bg': bg} if bg else {}
+    canvas = tk.Canvas(parent, highlightthickness=0, **_bgkw)
+    sb = ttk.Scrollbar(parent, orient='vertical', command=canvas.yview)
+    inner = tk.Frame(canvas, **_bgkw)
+    win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+    canvas.configure(yscrollcommand=sb.set)
+    canvas.pack(side='left', fill='both', expand=True)
+
+    def _autohide():
+        # Show the scrollbar only when content overflows the viewport.
+        try:
+            need = inner.winfo_reqheight() > canvas.winfo_height()
+            mapped = bool(sb.winfo_ismapped())
+            if need and not mapped:
+                sb.pack(side='right', fill='y')
+            elif not need and mapped:
+                sb.pack_forget()
+        except Exception:
+            pass
+
+    def _on_inner_config(_e):
+        try:
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        except Exception:
+            pass
+        _autohide()
+    inner.bind('<Configure>', _on_inner_config)
+
+    def _on_canvas_config(e):
+        try:
+            canvas.itemconfig(win_id, width=e.width)
+        except Exception:
+            pass
+        _autohide()
+    canvas.bind('<Configure>', _on_canvas_config)
+
+    def _wheel(e):
+        try:
+            if inner.winfo_reqheight() > canvas.winfo_height():
+                canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units')
+        except Exception:
+            pass
+    # Scoped: active only while the pointer is over this canvas (catches children
+    # via bind_all), released on leave so other windows aren't hijacked.
+    canvas.bind('<Enter>', lambda _e: canvas.bind_all('<MouseWheel>', _wheel))
+    canvas.bind('<Leave>', lambda _e: canvas.unbind_all('<MouseWheel>'))
+    return inner
+
+
 class App:
     # v4.14.5.14-merge-and-unify-fix Fix 1 (2026-05-19): class-level
     # default for _activity_text so `self._log` calls from very early
@@ -8220,6 +8418,13 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Tired Market Analyzation")
+        # v4.14.6.110: pre-ready phase timing (diagnostic, logging-only). _t_cfg
+        # brackets the config/provider setup up to the first DB open.
+        _t_cfg = time.perf_counter()
+        # startup-timing investigation (logging-only): arm the lap clock. Brackets
+        # the steps v110's _log_phase did not isolate — chiefly the hardware/disk
+        # probe. _st_lap("<step>") is called after each major init step below.
+        self._st_t0 = self._st_prev = time.perf_counter()
         # v4.14.5.94-watch-phase1 (2026-06-11): Ctrl+W opens the
         # Watching list — WATCH'd picks per path with their stored
         # wait-rationale. Read-only, reuses signals.jsonl entries the
@@ -8319,6 +8524,11 @@ class App:
 
         # ── State ──
         self.cfg = load_config()
+        # v4.14.6.110: one-time hardware probe (decision-neutral; scales the
+        # fill-defer only). Runs before the fill is scheduled below. Fail-safe to
+        # tier='normal'. Honors cfg['hw_tier_override'] for testing/misclassification.
+        self._detect_hardware()
+        self._st_lap('hardware_detected')
 
         # v4.14.6.97-market-holiday-calendar: push the holiday-calendar flag into
         # tm_market_calendar's module gate once at startup (default ON). OFF =
@@ -8339,6 +8549,14 @@ class App:
             import tm_source_accuracy as _tsa_init
             _tsa_init.set_attributable_only(
                 self.cfg.get('use_validated_accuracy', False))
+        except Exception:
+            pass
+        # v4.14.6.111: push the algo-out-of-accuracy-headline gate into tm_discover
+        # once at startup (re-synced on Settings save). Default ON.
+        try:
+            import tm_discover as _tdsc_init
+            _tdsc_init.set_exclude_algo_from_accuracy(
+                self.cfg.get('exclude_algo_from_accuracy', True))
         except Exception:
             pass
         # v4.14.5.62-analyst-facts: push the FACTS-block analyst gate into
@@ -8433,6 +8651,7 @@ class App:
             _tmc_init.set_parallel_consensus(
                 _pc_eff,
                 self.cfg.get('parallel_consensus_max_workers', 5))
+            self._st_lap('consensus_configured')
             try:
                 _cs_val = self.cfg.get('use_concurrent_scan_dispatch', 'auto')
                 self._log(
@@ -8768,9 +8987,29 @@ class App:
                 pass
 
         self.portfolio = load_portfolio()
+        # v4.14.6.110: pre-ready timers (logging-only). config_provider_init =
+        # everything from __init__ start to here; db_open_* = the two DB opens
+        # (prime "scales with file size on a potato" suspects).
+        try:
+            self._log_phase('config_provider_init',
+                            time.perf_counter() - _t_cfg)
+        except Exception:
+            pass
+        _t_db1 = time.perf_counter()
         self.db = Database()
+        try:
+            self._log_phase('db_open_tired_market',
+                            time.perf_counter() - _t_db1)
+        except Exception:
+            pass
         self.db.set_config_ref(self.cfg)
+        _t_db2 = time.perf_counter()
         tm_cache.get_connection()  # v4.15.0: ensure cache.db exists and schema is current
+        try:
+            self._log_phase('db_open_cache', time.perf_counter() - _t_db2)
+        except Exception:
+            pass
+        self._st_lap('db_opened')
 
         # v4.14.6.33-async-startup: the ~1,270-line migration / hygiene
         # sequence that used to live here (R2 sweep, F5a replay, cache
@@ -8792,7 +9031,13 @@ class App:
 
         def _deferred_migrations_worker():
             try:
+                _t_mig = time.perf_counter()
                 self._run_deferred_migrations()
+                try:
+                    self._log_phase('deferred_migrations',
+                                    time.perf_counter() - _t_mig)
+                except Exception:
+                    pass
             except Exception as _e:
                 # Migration failure must not brick startup. Log it
                 # (via the thread-safe shim added in this version)
@@ -8807,6 +9052,16 @@ class App:
                     pass
             finally:
                 self._migrations_complete.set()
+                try:
+                    _d = getattr(self, '_phase_timings', {}) or {}
+                    if _d:
+                        _tot = sum(_d.values())
+                        _slow = max(_d.items(), key=lambda kv: kv[1])
+                        self._log(
+                            f"[timing] startup phases total={_tot:.2f}s "
+                            f"(slowest: {_slow[0]}={_slow[1]:.2f}s)", 'muted')
+                except Exception:
+                    pass
                 try:
                     self._log(
                         "[startup] deferred migrations complete; "
@@ -9032,7 +9287,14 @@ class App:
             self.root.after(0, self._teacher_ai_show_splash)
 
         # ── Build UI ──
+        # v4.14.6.110: gui_build timer (logging-only) — prime pre-ready suspect.
+        _t_gui = time.perf_counter()
         self._build()
+        try:
+            self._log_phase('gui_build', time.perf_counter() - _t_gui)
+        except Exception:
+            pass
+        self._st_lap('ui_built')
 
         # v4.14.6.108-standalone-prep: show the loading overlay immediately
         # (re-wired — it was orphaned). The overlay animates on the UI thread
@@ -9096,6 +9358,16 @@ class App:
         # v4.13.62.8: cut the two "Click Holdings / Click AI Chat"
         # instructional lines. the user has used the app for months — he
         # knows what the buttons do. Goal is ~3 lines on launch.
+        # v4.14.6.110: TRUE launch->ready total (logging-only) — _BOOT_T0 is set
+        # at module import, so this sums imports + App construction. The pre-ready
+        # sub-phases (config_provider_init / db_open_* / gui_build) sum against it.
+        try:
+            self._log(
+                f"[timing] phase=startup_to_ready "
+                f"total={time.perf_counter() - _BOOT_T0:.2f}s", 'muted')
+        except Exception:
+            pass
+        self._st_lap('ui_ready')
         self._log("Tired Market Analyzation ready.", 'header')
 
         # ── v4.13.39: path enable/disable summary ──
@@ -9195,7 +9467,24 @@ class App:
             # when they click during the closer's run.
             try:
                 if self._holdings_state is None:
+                    _t_pre = time.perf_counter()
                     self._holdings_state = self._build_holdings_state()
+                    try:
+                        self._log_phase('holdings_preload',
+                                        time.perf_counter() - _t_pre)
+                    except Exception:
+                        pass
+                # v4.14.6.110: preload done -> signal + dismiss overlay early.
+                # _holdings_state is built now, so the 17 click-handlers no-op
+                # their synchronous build -> the named data-readiness freeze is
+                # gone. (On build failure we fall through to the except below and
+                # leave the overlay to the 10s fallback — never lift unsafe.)
+                if self._holdings_state is not None:
+                    try:
+                        self._preload_complete.set()
+                        self.root.after(0, self._dismiss_loading_overlay_early)
+                    except Exception:
+                        pass
             except Exception as e:
                 try:
                     self.root.after(0, lambda: self._log(
@@ -9261,8 +9550,24 @@ class App:
                         except Exception:
                             cache['all_stats'] = None
                         try:
+                            # v4.14.6.111 read-side bridge (BUY axis): per-model
+                            # accuracy from the FULL signals.jsonl panel (append-
+                            # only, never pruned) — full history, name-keyed,
+                            # AI-only, resolved via check_outcomes against
+                            # cache.db with a persisted resolution cache. The
+                            # consensus-VERDICT scoreboard (compute_all_stats
+                            # above) is UNCHANGED — still predictions.jsonl. Falls
+                            # back to the predictions-based per-model stats if the
+                            # bridge returns nothing (e.g. signals.jsonl missing).
+                            _pm_bridge = (
+                                tm_discover.compute_per_model_stats_from_signals(
+                                    str(DATA_DIR / 'signals.jsonl'),
+                                    str(DATA_DIR / 'cache.db'),
+                                    str(DATA_DIR
+                                        / 'per_model_resolution_cache.json')))
                             cache['per_model_stats'] = (
-                                tm_discover.compute_per_model_stats(
+                                _pm_bridge if _pm_bridge
+                                else tm_discover.compute_per_model_stats(
                                     plog, hours=168))
                         except Exception:
                             cache['per_model_stats'] = None
@@ -9310,6 +9615,13 @@ class App:
         # for log writes), so it runs cleanly while the disclaimer modal
         # is up. Removing the artificial wait shaves 300ms and lets the
         # keystone thread overlap with disclaimer interaction.
+        # v4.14.6.110: dismiss overlay on preload-done (not closer). The preload
+        # thread sets _preload_complete once _holdings_state is built; the dismiss
+        # path lifts the overlay THEN, so click-handlers find _holdings_state ready
+        # and no-op their synchronous _build_holdings_state() (the named freeze).
+        self._preload_complete = threading.Event()
+        self._overlay_dismissed = False
+        self._ui_interactive = False
         def _kick_preload():
             import threading
             threading.Thread(
@@ -9374,7 +9686,13 @@ class App:
         # was redundant.
         if self._should_run_startup_closer:
             # v4.14.6.33: gated behind _migrations_complete.
-            self._defer_until_migrations_done(self._launch_auto_refresh)
+            # v4.14.6.110: + defer ~5s so the disk-heavy data fill starts AFTER
+            # the overlay dismiss, keeping the first interactive seconds quiet
+            # (biggest win on a potato where these reads hit physical disk). The
+            # daemon still launches (just later) — no pipeline change, just timing.
+            self._defer_until_migrations_done(
+                lambda: self.root.after(self._fill_defer_ms(),
+                                    self._launch_auto_refresh))
         else:
             # Initialize the stop event anyway so _on_close doesn't crash
             # checking for it
@@ -9401,10 +9719,11 @@ class App:
                     self._update_freshness_label()
                 except Exception:
                     pass
-                # v4.14.6.108-standalone-prep: clear the loading overlay here
-                # too (already on the UI thread — this is a root.after callback).
+                # v4.14.6.108-standalone-prep: clear the loading overlay here too.
+                # v4.14.6.110: route through the idempotent early-dismiss so this
+                # 10s timer is the BACKSTOP if preload stalled (overlay can't hang).
                 try:
-                    self._hide_loading_overlay()
+                    self._dismiss_loading_overlay_early()
                 except Exception:
                     pass
                 # Teacher AI MVP Session 4: splash closure is driven by
@@ -9452,7 +9771,11 @@ class App:
         self._queue_runner_thread = None
         if self.cfg.get('queue_runner_enabled', True):
             # v4.14.6.33: gated behind _migrations_complete.
-            self._defer_until_migrations_done(self._launch_queue_runner)
+            # v4.14.6.110: + defer ~5s so the queue runner's first disk-heavy
+            # fill pass starts after the overlay dismiss (quiet early window).
+            self._defer_until_migrations_done(
+                lambda: self.root.after(self._fill_defer_ms(),
+                                    self._launch_queue_runner))
         # v4.14.6.96-daily-rate-snapshot: STARTUP entry point for the
         # once-per-day Formula-C re-snapshot. Deferred like the daemons so it
         # runs after migrations. NO-OP unless the flag is on, the market is
@@ -9507,6 +9830,11 @@ class App:
         # margin; the method itself re-arms once for the rare 30s holdings-
         # build defer before committing to an OFF verdict.
         self.root.after(25000, self._log_active_watching_status)
+        # startup-timing: last reachable line in __init__ before control returns
+        # to the caller and root.mainloop() begins. Everything after this point
+        # (universe load, cold fill, scans, deferred migrations) runs on the Tk
+        # event loop / background threads, NOT synchronously in __init__.
+        self._st_lap('daemons_scheduled / init_end')
 
     # ═══════════════════════════════════════════════════════════════════════
     # v4.10.2 — AUTO-REFRESH BACKGROUND LOOP
@@ -9669,6 +9997,107 @@ class App:
             except Exception:
                 pass
 
+    def _autoheal_deprecated_models(self):
+        """v4.14.6.111: detector->actor. Swap any vendor-deprecated model id that
+        has a KNOWN replacement to that replacement — in BOTH the singular 'model'
+        AND the 'models[]' rotation list (deduped) — so the provider keeps working
+        without the user editing AI Providers. Runs ONCE per process, SYNCHRONOUSLY
+        BEFORE the discovery daemon (which also rewrites models[]) is dispatched, so
+        the swap lands first (no concurrent-write race) and discovery then probes
+        the already-fixed list.
+
+        Blast radius bounded: ONLY ids that are KEYS in tm_model_deprecations are
+        rewritten (custom/user model choices are never clobbered). Ids with NO
+        mapped replacement are left untouched for the existing warn-only nag.
+        Persists via the registry's ATOMIC writer (update->_save). Idempotent:
+        replacements are not themselves map keys, so a second run is a no-op.
+        Heals enabled AND disabled providers (so re-enabling later can't resurrect
+        a dead id). Never raises — a heal fault must not break startup."""
+        if getattr(self, '_autoheal_done', False):
+            return
+        self._autoheal_done = True
+        try:
+            import tm_api_providers as _tmap_ah
+            import tm_model_deprecations as _depr_ah
+            from pathlib import Path as _P_ah
+            try:
+                base = DATA_DIR
+            except Exception:
+                base = _P_ah('data')
+            path = base / 'api_providers.json'
+            reg = _tmap_ah.APIProviderRegistry(path)
+            backed_up = False
+            for prov in reg.all():            # enabled AND disabled
+                preset = prov.get('preset', '') or ''
+                pid = prov.get('id')
+                if not pid:
+                    continue
+                changed = False
+                swaps = []   # (old, new) pairs for the log
+                # ── singular 'model' ──
+                old_single = prov.get('model', '') or ''
+                new_single = old_single
+                if old_single:
+                    info = _depr_ah.lookup(preset, old_single)
+                    if info and info.get('replacement'):
+                        new_single = info['replacement']
+                        if new_single != old_single:
+                            changed = True
+                            swaps.append((old_single, new_single))
+                # ── 'models[]' rotation list ──
+                old_list = prov.get('models')
+                new_list = None
+                if isinstance(old_list, (list, tuple)) and old_list:
+                    mapped = []
+                    for m in old_list:
+                        ms = str(m)
+                        li = _depr_ah.lookup(preset, ms)
+                        if li and li.get('replacement'):
+                            repl = li['replacement']
+                            if repl != ms:
+                                swaps.append((ms, repl))
+                                changed = True
+                            mapped.append(repl)
+                        else:
+                            mapped.append(ms)   # not in map -> untouched
+                    # dedup, preserve order (don't double the replacement)
+                    seen = set()
+                    deduped = []
+                    for m in mapped:
+                        k = m.strip().lower()
+                        if k and k not in seen:
+                            seen.add(k)
+                            deduped.append(m)
+                    new_list = deduped
+                    if new_list != list(old_list):
+                        changed = True
+                if not changed:
+                    continue
+                # one-time backup before the FIRST heal-write (revert/inspect)
+                if not backed_up:
+                    try:
+                        import shutil as _sh_ah
+                        bak = path.with_suffix('.json.bak_autoheal')
+                        if path.exists() and not bak.exists():
+                            _sh_ah.copy2(path, bak)
+                    except Exception:
+                        pass
+                    backed_up = True
+                patch = {'model': new_single}
+                if new_list is not None:
+                    patch['models'] = new_list
+                try:
+                    reg.update(pid, patch)   # atomic _save() inside
+                    label = prov.get('name') or prov.get('id', '?')
+                    for _old, _new in swaps:
+                        self._log(
+                            f"self-healed: swapped deprecated {label} "
+                            f"'{_old}' -> '{_new}'", 'muted')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _v45012_launch_arc_b_daemons(self):
         """v4.14.5.12: launch the three Arc B daemons at startup.
 
@@ -9689,11 +10118,23 @@ class App:
         class of bug this patch exists to fix. The per-daemon
         "started" line is what the user reads to confirm the integration
         works (he reads the activity log, not the code)."""
-        # v4.14.5.62-model-routing Part 3: self-maintaining rotation lists.
-        # On a background thread (so it never blocks startup), probe each
-        # installed provider's live model list and prune dead rotation models
-        # (e.g. a deprecated Groq mixtral, a never-real glm-4.7-flash). A
-        # failed/empty probe never prunes. Logged per prune.
+        # v4.14.5.62-model-routing Part 3 / v4.14.6.111 add-and-remove:
+        # self-maintaining rotation lists. On a background thread (so it never
+        # blocks startup), probe each installed provider's live model list, PRUNE
+        # dead rotation models (e.g. a Groq deprecation) AND ADD newly-offered
+        # text-capable models (tag-first, probe-fallback). A failed/empty probe
+        # never prunes; a text-capability non-pass never adds (re-probed later).
+        # Pruned count is summarized; adds are logged per-model.
+        # v4.14.6.111: self-heal vendor-deprecated model ids to their known
+        # replacements BEFORE the discovery daemon below rewrites models[]. Running
+        # this synchronously here guarantees the swap lands first (no concurrent
+        # api_providers.json write race) and discovery then probes the fixed list.
+        # Once-guarded internally; never raises.
+        try:
+            self._autoheal_deprecated_models()
+        except Exception:
+            pass
+
         try:
             import threading as _th_mscan
 
@@ -11537,6 +11978,45 @@ class App:
         except Exception:
             pass
 
+    def _log_phase(self, name, secs, extra=''):
+        # v4.14.6.110: startup phase timing (diagnostic). Logging only — changes
+        # no behavior, adds no scans, changes no ordering. Records into
+        # self._phase_timings for the end-of-pass summary so the dominant phase
+        # is obvious at a glance. Greppable line: [timing] phase=<name> took=<s>s
+        try:
+            secs = float(secs)
+            d = getattr(self, '_phase_timings', None)
+            if d is None:
+                d = self._phase_timings = {}
+            d[name] = secs
+            _ex = (' ' + extra) if extra else ''
+            self._log(f"[timing] phase={name} took={secs:.2f}s{_ex}", 'muted')
+        except Exception:
+            pass
+
+    def _st_lap(self, label):
+        # startup-timing investigation helper (logging-only, dependency-free).
+        # Logs the delta since the previous lap and the running total since the
+        # startup clock was armed at the top of __init__. Greppable line:
+        #   [startup-timing] <label>  +<ms>ms  (total <ms>ms)
+        # Self-contained: if the clock was never armed it no-ops. Never raises.
+        # Independent of the v110 _log_phase timers (it brackets the steps v110
+        # did not isolate: hardware probe, disk subprocess, consensus, daemons).
+        try:
+            now = time.perf_counter()
+            t0 = getattr(self, '_st_t0', None)
+            prev = getattr(self, '_st_prev', None)
+            if t0 is None or prev is None:
+                self._st_t0 = self._st_prev = now
+                return
+            self._log(
+                "[startup-timing] %-26s +%7.1f ms  (total %7.1f ms)" % (
+                    label, (now - prev) * 1000.0, (now - t0) * 1000.0),
+                'muted')
+            self._st_prev = now
+        except Exception:
+            pass
+
     def _run_deferred_migrations(self):
         """v4.14.6.33-async-startup: the migration / hygiene
         sequence that used to run inline at the top of __init__.
@@ -12447,8 +12927,11 @@ class App:
         # Fail-open: any error leaves config untouched + marker unset → retries.
         if not self.cfg.get('_v414672_validation_capable_bench'):
             try:
+                # v4.14.6.111: Groq entry moved off the deprecated 70b-versatile
+                # to a survivor so this migration never writes a dead id; tier-2
+                # rotates the provider models[] regardless (un-pinned).
                 _CAPABLE_BENCH = [
-                    ["groq", "llama-3.3-70b-versatile"],
+                    ["groq", "openai/gpt-oss-20b"],
                     ["cerebras", "gpt-oss-120b"],
                     ["cloudflare", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"],
                     ["mistral", "mistral-medium-latest"],
@@ -12713,16 +13196,31 @@ class App:
         # cheaply (NULL filter), so subsequent restarts stamp 0.
         try:
             import tm_cache as _tmc_bf
+            _t_bf = time.perf_counter()
             _bf_result = _tmc_bf.backfill_have_to_period()
             try:
-                _N = int(_bf_result.get('stamped', 0))
-                _M = int(_bf_result.get('no_period_left_null', 0))
-                _K = int(_bf_result.get('already_filled_skipped', 0))
-                self._log(
-                    f"[migration] have_to_period backfill: stamped {_N} rows, "
-                    f"{_K} already-stamped (skipped), {_M} had no derivable period "
-                    f"(left NULL - will use 90-day backstop once, then stamp normally).",
-                    'muted')
+                if _bf_result.get('skipped'):
+                    # v4.14.6.110: cheap-probe gate found nothing unstamped —
+                    # skipped the full scan + COUNT.
+                    self._log(
+                        "[migration] have_to_period backfill: nothing to stamp "
+                        "(gated skip).", 'muted')
+                else:
+                    _N = int(_bf_result.get('stamped', 0))
+                    _M = int(_bf_result.get('no_period_left_null', 0))
+                    _K = int(_bf_result.get('already_filled_skipped', 0))
+                    self._log(
+                        f"[migration] have_to_period backfill: stamped {_N} rows, "
+                        f"{_K} already-stamped (skipped), {_M} had no derivable period "
+                        f"(left NULL - will use 90-day backstop once, then stamp normally).",
+                        'muted')
+                try:
+                    self._log_phase(
+                        'have_to_period_backfill',
+                        time.perf_counter() - _t_bf,
+                        extra=f"stamped={int(_bf_result.get('stamped', 0))}")
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception as _bf_e:
@@ -14602,6 +15100,110 @@ class App:
         except Exception:
             pass
 
+    # NOTE: intentionally NO LONGER CALLED at startup (v4.14.6.109 disk-probe cut,
+    # see DISK_TIER_FINDINGS.md). Kept defined — small/easy-to-revert, referenced
+    # by the smoke test, and on hand if a self-measuring I/O-timing replacement is
+    # ever built. _detect_hardware() now passes disk='unknown' instead of calling
+    # this, so no PowerShell subprocess is spawned during launch.
+    def _detect_disk_type(self):
+        """SSD/HDD heuristic via a SHORT, bounded PowerShell Get-PhysicalDisk
+        (reuses tm_power's subprocess pattern). Returns 'SSD'/'HDD'/'unknown'.
+        Bounded ~2s; any error/timeout -> 'unknown' (never forces 'low'). Never
+        raises. No long timed-read benchmark — keeps startup fast."""
+        if os.name != 'nt':
+            return 'unknown'
+        try:
+            import subprocess
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-PhysicalDisk | Select-Object -ExpandProperty MediaType'],
+                capture_output=True, text=True, timeout=2,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            types = [t.strip().upper() for t in (out.stdout or '').splitlines()
+                     if t.strip()]
+            has_ssd = any('SSD' in t for t in types)
+            has_hdd = any(t == 'HDD' or 'HARD' in t for t in types)
+            if has_hdd and not has_ssd:
+                return 'HDD'
+            if has_ssd and not has_hdd:
+                return 'SSD'
+            return 'unknown'   # mixed / unspecified / empty
+        except Exception:
+            return 'unknown'
+
+    def _detect_hardware(self):
+        """v4.14.6.110: one-time startup hardware probe -> tier, used ONLY to scale
+        scheduling (the fill-defer). Decision-neutral. Honors
+        cfg['hw_tier_override'] ('low'/'normal'/'high'). Fail-safe: ANY error ->
+        tier='normal' (today's behavior) so a probe fault can't break/slow startup.
+        Stores self._hw = {'ram_gb','cores','disk','tier'}."""
+        try:
+            override = (self.cfg or {}).get('hw_tier_override') if self.cfg else None
+            if isinstance(override, str) and override.lower() in (
+                    'low', 'normal', 'high'):
+                tier = override.lower()
+                self._hw = {'ram_gb': None, 'cores': None,
+                            'disk': None, 'tier': tier}
+                try:
+                    self._log(f"[hardware] tier={tier} (override)", 'muted')
+                except Exception:
+                    pass
+                return
+            import psutil
+            ram_gb = round(psutil.virtual_memory().total / 1e9, 1)
+            cores = (psutil.cpu_count(logical=False)
+                     or psutil.cpu_count() or 0)
+            # startup-timing: isolate the psutil RAM/cores read from the disk
+            # subprocess so the Get-PhysicalDisk PowerShell cost stands alone.
+            self._st_lap('hw_psutil_read')
+            # disk probe removed: _detect_disk_type() was a ~2s PowerShell
+            # Get-PhysicalDisk spawn that returned 'unknown' on this rig anyway
+            # (see DISK_TIER_FINDINGS.md). Treat disk as omitted/'unknown' — this
+            # is byte-identical to the prior detected-unknown path: tier is then
+            # decided by RAM/cores alone (the SSD/HDD clauses in
+            # _classify_hw_tier simply don't fire). No subprocess at startup.
+            disk = 'unknown'
+            self._st_lap('disk_probe')   # now a no-op (constant); proves cost is gone
+            tier = _classify_hw_tier(ram_gb, cores, disk)
+            self._hw = {'ram_gb': ram_gb, 'cores': cores,
+                        'disk': disk, 'tier': tier}
+            try:
+                self._log(
+                    f"[hardware] tier={tier} ram={ram_gb}GB cores={cores} "
+                    f"disk={disk}  (detected)", 'muted')
+            except Exception:
+                pass
+        except Exception:
+            self._hw = {'ram_gb': None, 'cores': None,
+                        'disk': None, 'tier': 'normal'}
+
+    def _fill_defer_ms(self):
+        """v4.14.6.110: hardware-tiered fill-defer delay (ms). low=9000 (longer
+        quiet window — physical-disk reads cost most on a potato), normal=5000
+        (unchanged), high=1500 (RAM-cached/SSD). Falls back to normal."""
+        try:
+            tier = (getattr(self, '_hw', None) or {}).get('tier', 'normal')
+        except Exception:
+            tier = 'normal'
+        return _FILL_DEFER_BY_TIER.get(tier, 5000)
+
+    def _dismiss_loading_overlay_early(self):
+        """v4.14.6.110: lift the loading overlay as soon as the PRELOAD is done
+        (i.e. _holdings_state is built) instead of waiting on the background
+        closer (check_outcomes). Safe because at this point every click-handler's
+        `if self._holdings_state is None: ... _build_holdings_state()` no-ops, so
+        no synchronous load runs on the UI thread. Runs on the UI thread (called
+        via root.after(0, ...)). Idempotent. The closer keeps running in the
+        background and still flips _startup_complete for the status icon."""
+        if getattr(self, '_overlay_dismissed', False):
+            return
+        self._overlay_dismissed = True
+        self._ui_interactive = True
+        try:
+            self._hide_loading_overlay()
+        except Exception:
+            pass
+
     def _hide_loading_overlay(self):
         """Tear down the loading overlay. Idempotent."""
         try:
@@ -14620,6 +15222,15 @@ class App:
                 ov.place_forget()
                 ov.destroy()
                 self._loading_overlay = None
+                # v4.14.6.110: loading_dismiss timing marker (logging only) —
+                # fires once, at the true dismiss, so launch->experienced-dismiss
+                # is measurable (was un-measurable).
+                try:
+                    self._log(
+                        f"[timing] phase=loading_dismiss "
+                        f"total={time.perf_counter() - _BOOT_T0:.2f}s", 'muted')
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -19571,41 +20182,45 @@ class App:
                      font=('Segoe UI', 10, 'bold')
                      ).pack(side='top', anchor='w', pady=(2, 4))
 
-            # v4.13.19: Consensus target/stop summary line. Shows
-            # range of model targets/stops with average + R/R.
+            # v4.13.19 / v4.14.6.111: Consensus target/stop summary line.
+            # The TARGET now comes from the SHARED AI-target aggregate
+            # (tm_discover.aggregate_ai_target): responders-only mean, switching
+            # to MEDIAN on a wide spread, with an N-of-M count and NO floor (any
+            # model that gave a number counts; zero numbers → no target line).
+            # Stops keep the prior avg/range logic; R/R uses the aggregate target.
             try:
-                # Collect targets and stops from BUY+HOLD votes
-                targets = []
-                stops = []
-                for _p in recent:
-                    _d = (_p.get('direction') or '').upper()
-                    if _d in ('BUY', 'HOLD'):
-                        _t = _p.get('target')
-                        _s = _p.get('stop')
-                        if _t is not None:
-                            try: targets.append(float(_t))
-                            except (ValueError, TypeError): pass
-                        if _s is not None:
-                            try: stops.append(float(_s))
-                            except (ValueError, TypeError): pass
-                # Get current price for R/R calc
+                import tm_discover as _tmd
+                # Current price first (feeds the aggregate's wide-spread guard).
                 _cprice = None
                 try:
                     _q = self._holdings_state['cache'].quote(ticker)
                     _cprice = (_q or {}).get('price')
                 except Exception:
-                    pass
+                    _cprice = None
 
-                if targets or stops:
+                _lu_agg = _tmd.aggregate_ai_target(
+                    recent, current_price=_cprice, ticker=ticker)
+
+                stops = []
+                for _p in recent:
+                    _d = (_p.get('direction') or '').upper()
+                    if _d in ('BUY', 'HOLD'):
+                        _s = _p.get('stop')
+                        if _s is not None:
+                            try: stops.append(float(_s))
+                            except (ValueError, TypeError): pass
+
+                if _lu_agg.get('target') or stops:
                     summary_parts = []
-                    if targets:
-                        avg_t = sum(targets) / len(targets)
-                        if len(targets) > 1 and max(targets) > min(targets):
-                            summary_parts.append(
-                                f"target ~${avg_t:.2f} "
-                                f"(${min(targets):.2f}-${max(targets):.2f})")
-                        else:
-                            summary_parts.append(f"target ~${avg_t:.2f}")
+                    if _lu_agg.get('target'):
+                        _lo, _hi = _lu_agg.get('low'), _lu_agg.get('high')
+                        _tp = f"target ~${_lu_agg['target']:.2f}"
+                        if _lo is not None and _hi is not None and _hi > _lo:
+                            _tp += f" (${_lo:.2f}-${_hi:.2f})"
+                        _tp += (f" [{_lu_agg['n']} of {_lu_agg['m']}"
+                                + (", median" if _lu_agg.get('method') == 'median'
+                                   else "") + "]")
+                        summary_parts.append(_tp)
                     if stops:
                         avg_s = sum(stops) / len(stops)
                         if len(stops) > 1 and max(stops) > min(stops):
@@ -19614,17 +20229,15 @@ class App:
                                 f"(${min(stops):.2f}-${max(stops):.2f})")
                         else:
                             summary_parts.append(f"stop ~${avg_s:.2f}")
-                    # R/R if we have everything
-                    if (targets and stops and _cprice
+                    # R/R if we have everything (aggregate target + stops + price)
+                    if (_lu_agg.get('target') and stops and _cprice
                             and _cprice > 0):
                         try:
-                            avg_t = sum(targets) / len(targets)
                             avg_s = sum(stops) / len(stops)
-                            up = avg_t - _cprice
+                            up = _lu_agg['target'] - _cprice
                             down = _cprice - avg_s
                             if down > 0:
-                                rr = up / down
-                                summary_parts.append(f"R/R {rr:.2f}x")
+                                summary_parts.append(f"R/R {up / down:.2f}x")
                         except Exception:
                             pass
 
@@ -19975,7 +20588,66 @@ class App:
                 lookup_state['consensus_running'] = False
                 return
 
-            run_state_5b = {'completed': 0}
+            run_state_5b = {'completed': 0, 'votes': []}
+
+            def _render_lookup_running_block():
+                """v4.14.6.111-streaming: live vote-by-vote fill-in for Look Up,
+                matching the Portfolio/Recommend pattern — header "N/M done", a
+                progressive "so far" tally, and one row per vote (model + colored
+                direction) as each lands. Rendered into the scrollable body; the
+                final rich panel (_on_all_done_5b) clears + replaces it. UI thread
+                only (called via root.after); guarded against a closed dialog;
+                never raises (fail-safe → prior progress-text-only behavior)."""
+                try:
+                    if not win.winfo_exists():
+                        return
+                    _clear_results()
+                    _votes = run_state_5b.get('votes', []) or []
+                    _total = len(models_to_run) if models_to_run else len(_votes)
+                    try:
+                        import tm_api_providers as _tmap_lu
+                        _norm_lu = _tmap_lu.canonicalize_model_label
+                    except Exception:
+                        _norm_lu = lambda x: x
+                    tk.Label(result_inner,
+                             text=(f"CONSENSUS RUNNING  ·  "
+                                   f"{len(_votes)}/{_total} done"),
+                             bg=c['bg'], fg=c.get('accent', '#4a9'),
+                             font=('Segoe UI', 9, 'bold'), anchor='w'
+                             ).pack(fill='x', pady=(0, 2))
+                    try:
+                        _runner_lu = lookup_state.get('consensus_running_runner')
+                        _so_far_lu = _tmc5b.format_votes_so_far(
+                            _votes,
+                            getattr(_runner_lu, 'weight_map', None),
+                            getattr(_runner_lu,
+                                    'accuracy_weighting_enabled', False))
+                    except Exception:
+                        _so_far_lu = ""
+                    if _so_far_lu:
+                        tk.Label(result_inner, text=f"so far: {_so_far_lu}",
+                                 bg=c['bg'],
+                                 fg=c.get('dim', c.get('muted', '#888')),
+                                 font=('Segoe UI', 8, 'italic'), anchor='w'
+                                 ).pack(fill='x', pady=(0, 4))
+                    for v in _votes:
+                        if not isinstance(v, dict):
+                            continue
+                        row = tk.Frame(result_inner, bg=c['bg'])
+                        row.pack(fill='x', pady=(1, 0))
+                        tk.Label(row, text=_norm_lu(v.get('model', '?')),
+                                 bg=c['bg'], fg=c.get('text', '#fff'),
+                                 font=('Consolas', 9)).pack(side='left')
+                        d = (v.get('direction', '') or '?').upper()
+                        _col = (c['green'] if d == 'BUY' else
+                                c['amber'] if d == 'HOLD' else
+                                c['red'] if d == 'AVOID' else
+                                c.get('muted', '#999'))
+                        tk.Label(row, text=d, bg=c['bg'], fg=_col,
+                                 font=('Segoe UI', 8, 'bold'), padx=6
+                                 ).pack(side='right')
+                except Exception:
+                    pass
 
             def _quote_price():
                 try:
@@ -20063,6 +20735,17 @@ class App:
 
             def _on_model_done_5b(model_label, vote):
                 _write_prediction_from_vote(model_label, vote)
+                # v4.14.6.111-streaming: accumulate the vote and fill the panel
+                # in live (vote-by-vote), matching Portfolio/Recommend. Recording
+                # above is unchanged; this is display-only and marshalled to the
+                # UI thread.
+                try:
+                    if isinstance(vote, dict) and (vote.get('direction') or
+                                                   '').strip():
+                        run_state_5b.setdefault('votes', []).append(vote)
+                        self.root.after(0, _render_lookup_running_block)
+                except Exception:
+                    pass
 
             def _on_model_error_5b(model_label, err_msg):
                 _write_no_call_from_error(model_label, err_msg)
@@ -21548,6 +22231,14 @@ class App:
                   padx=10, pady=2,
                   font=self.fonts['body_bold']).pack(side='right')
 
+        # v4.14.6.111-scroll: wrap the WHOLE window body (everything below the
+        # pinned header) in ONE scroll region so the dialog scrolls when it
+        # overflows (e.g. the recommended grid on a small screen). All body frames
+        # below are parented to `body`; the configured list renders directly into it
+        # (its old sub-canvas was removed to avoid scrollregion-inside-scrollregion
+        # nesting). Auto-hides when content fits -> looks identical to before.
+        body = make_scrollable(win)
+
         # v4.14.5.28 (Fix 5): manual learned-cap reset. Advanced UI mode
         # only (mirrors the per-row Refresh gating — Simple users get
         # automatic recovery and don't need a manual control). Confirms
@@ -21577,7 +22268,7 @@ class App:
             _voice_color = (c['green'] if _voice_count >= 3
                             else c['amber'] if _voice_count >= 1
                             else c['red'])
-            _src_frame = tk.Frame(win, bg=c['bg'], padx=12, pady=4)
+            _src_frame = tk.Frame(body, bg=c['bg'], padx=12, pady=4)
             _src_frame.pack(fill='x')
             tk.Label(_src_frame,
                      text=f"  {_cfg_count} cloud providers configured  ",
@@ -21614,7 +22305,7 @@ class App:
                 data_providers_path=USER_DATA_DIR / "data_providers.json",
                 config_path=CONFIG_PATH)
             if _recs:
-                _adv_frame = tk.Frame(win, bg=c['bg'], padx=12, pady=4)
+                _adv_frame = tk.Frame(body, bg=c['bg'], padx=12, pady=4)
                 _adv_frame.pack(fill='x')
                 tk.Label(_adv_frame,
                          text="Recommendations",
@@ -21639,7 +22330,7 @@ class App:
             pass
 
         # Action bar
-        action = tk.Frame(win, bg=c['bg'], padx=12, pady=4)
+        action = tk.Frame(body, bg=c['bg'], padx=12, pady=4)
         action.pack(fill='x')
         tk.Button(action, text="+ Add Provider",
                   command=lambda: self._show_api_provider_form(
@@ -21672,7 +22363,13 @@ class App:
                 ('cerebras', '1M tokens/day free, very fast inference'),
                 ('google',   '1500 RPD free, long context window'),
                 ('mistral',  '1B tokens/month free, EU-hosted'),
-                ('github',   '~50 RPD via GitHub Marketplace Models'),
+                # v4.14.6.111: GitHub card re-added with the CORRECT preset key
+                # 'github_models' (the old 'github' key didn't match PRESETS, so
+                # _quick_add_factory got {} and built malformed empty entries). Keyed
+                # right, the Add prefills the real endpoint + gpt-4o and canonical
+                # dedup ('github_models') drives the "Key added" state correctly.
+                ('github_models', '~50 RPD via GitHub Marketplace Models. gpt-4o. '
+                                  'Needs a PAT with Models scope.'),
                 ('openrouter','Aggregator — many free models available'),
                 # v4.14.5.14b-prov: four researched free-tier adds.
                 ('cohere',   '1,000 calls/mo free, 20 RPM. Command R+.'),
@@ -21682,6 +22379,13 @@ class App:
                              'Large, Qwen3 235B.'),
                 ('zhipu',    'Free GLM-4.7-Flash / GLM-4.5-Flash. '
                              '200K context, English supported.'),
+                # v4.14.6.111: SambaNova is already a first-class backend voice
+                # (PRESETS['sambanova'] + rotation/consensus) but had no card.
+                # Card reuses the EXISTING sambanova preset (name/signup_url/
+                # default_model resolved from PRESETS); canonical-aware dedup below
+                # recognises an already-configured SambaNova so this never dups.
+                ('sambanova', '~20 calls/day free (tight tier). DeepSeek-V3.1, '
+                              'Llama 3.3 70B, gpt-oss-120b.'),
             ]
             # v4.14.5.14b-prov: canonical-aware "already added" so
             # endpoint-detected Custom entries (Cerebras/GitHub/Samba)
@@ -21709,7 +22413,7 @@ class App:
             _rec_card_cids = {k.lower() for k, _b in recommended_specs}
             self._provdlg_rec_card_cids = _rec_card_cids
             self._provdlg_v2_active = _provdlg_v2
-            rec_panel = tk.Frame(win, bg=c['card'], padx=12, pady=10)
+            rec_panel = tk.Frame(body, bg=c['card'], padx=12, pady=10)
             rec_panel.pack(fill='x', padx=12, pady=(8, 0))
             tk.Label(rec_panel,
                      text="RECOMMENDED FREE PROVIDERS",
@@ -21968,19 +22672,14 @@ class App:
         # ── end v4.13.60 Recommended Free Providers panel ────────────
 
         # List area (scrollable)
-        list_wrap = tk.Frame(win, bg=c['bg'])
+        # v4.14.6.111-scroll: the configured list renders directly into the
+        # window-level scroll `body` now — its former sub-canvas was removed so
+        # there is no scrollregion-inside-scrollregion nesting. `inner` stays the
+        # row host, so the _refresh() closure below is unchanged.
+        list_wrap = tk.Frame(body, bg=c['bg'])
         list_wrap.pack(fill='both', expand=True, padx=12, pady=(8, 12))
-        canvas = tk.Canvas(list_wrap, bg=c['bg'], highlightthickness=0)
-        sb = tk.Scrollbar(list_wrap, orient='vertical',
-                          command=canvas.yview)
-        inner = tk.Frame(canvas, bg=c['bg'])
-        inner.bind('<Configure>',
-                   lambda e: canvas.configure(
-                       scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=inner, anchor='nw')
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        sb.pack(side='right', fill='y')
+        inner = tk.Frame(list_wrap, bg=c['bg'])
+        inner.pack(fill='both', expand=True)
 
         def _refresh():
             # v4.14.5.39-guided-add: if this session started with no enabled
@@ -22085,14 +22784,32 @@ class App:
                         _lcs_dot = _st_dot.get_last_call_state(_pid_dot)
                         _cool_dot, _cool_sec = (
                             _st_dot.provider_in_cooldown(_pid_dot))
+                    # v4.14.6.111 (Item 5): PERSISTENT deprecated state, computed
+                    # at open (D4) for ENABLED providers only — a deprecation-map
+                    # hit with NO replacement (autoheal already swaps the
+                    # replaceable ones, so this is the no-replacement retirement
+                    # the user must fix). Cheap dict lookup; no stored flag.
+                    _dep_dot = False
+                    if bool(p.get('enabled')):
+                        try:
+                            import tm_model_deprecations as _depr_dot
+                            _di = _depr_dot.lookup(
+                                p.get('preset', ''), p.get('model', ''))
+                            _dep_dot = bool(_di) and not _di.get('replacement')
+                        except Exception:
+                            _dep_dot = False
                     _dot_key, _dot_tip = _tph_dot.resolve_dot_state(
                         bool(p.get('enabled')), _lcs_dot, _cool_dot,
-                        _cool_sec, health_enabled=_hflag)
+                        _cool_sec, health_enabled=_hflag, deprecated=_dep_dot)
                     _dot_fg = {'green': c['green'], 'red': c['red'],
-                               'amber': c['amber'], 'gray': c['dim']}.get(
+                               'amber': c['amber'], 'gray': c['dim'],
+                               'deprecated': c.get('purple', c['amber'])}.get(
                                    _dot_key, c['dim'])
+                    # v4.14.6.111: distinct glyph for deprecated so it reads
+                    # apart from the round health dot at a glance.
+                    _dot_glyph = '⚠' if _dot_key == 'deprecated' else '●'
                     _dot_lbl = tk.Label(
-                        row, text='●', bg=c['card'], fg=_dot_fg,
+                        row, text=_dot_glyph, bg=c['card'], fg=_dot_fg,
                         font=('Segoe UI', 12, 'bold'),
                         width=int(24 / 8), anchor='w', padx=6)
                     _dot_lbl.pack(side='left')
@@ -22333,7 +23050,11 @@ class App:
         except Exception:
             pass
 
-        body = tk.Frame(form, bg=c['bg'], padx=16, pady=12)
+        # v4.14.6.111-scroll: scrollable form fields, with Save/Cancel PINNED at
+        # the bottom (see btn_row below) so they're always reachable on a small
+        # screen even when the field list overflows.
+        _scroll = make_scrollable(form)
+        body = tk.Frame(_scroll, bg=c['bg'], padx=16, pady=12)
         body.pack(fill='both', expand=True)
 
         # v4.14.0 stage 6d: Display name field + Look up button removed.
@@ -22922,15 +23643,25 @@ class App:
         # validate_key result failures (401/403/network/timeout/etc.).
         # Cleared on each Save click; painted red on failure; switched
         # to amber "Validating..." while the background thread runs.
+        # v4.14.6.111 (Item 10): PIN the validation label to the form bottom
+        # (parent=form, side='bottom'), OUTSIDE the scrollable `body`, just like
+        # Save/Cancel below. Pre-fix it was packed into `body`, so a validation
+        # message scrolled away with the fields / shifted layout instead of
+        # staying put. Created here (so _set_status's closure has the ref) but
+        # PACKED after btn_row so it stacks directly ABOVE the buttons.
         validation_status_lbl = tk.Label(
-            body, text='', bg=c['bg'], fg=c['red'],
+            form, text='', bg=c['bg'], fg=c['red'],
             font=self.fonts['caption'],
             wraplength=520, justify='left', anchor='w')
-        validation_status_lbl.pack(fill='x', pady=(0, 4))
 
-        # Buttons
-        btn_row = tk.Frame(body, bg=c['bg'])
-        btn_row.pack(fill='x', pady=(8, 0))
+        # Buttons — v4.14.6.111-scroll: PINNED to the form bottom (parent=form,
+        # side='bottom'), outside the scrollable `body`, so Save/Cancel stay
+        # visible regardless of how far the fields scroll.
+        btn_row = tk.Frame(form, bg=c['bg'], padx=16, pady=8)
+        btn_row.pack(side='bottom', fill='x')
+        # Pinned just above the buttons (later side='bottom' stacks higher).
+        validation_status_lbl.pack(side='bottom', fill='x', padx=16,
+                                   pady=(0, 4))
 
         # save_btn captured here so the background-thread callback
         # can disable/enable it. Defined below — declared as a slot
@@ -23257,7 +23988,10 @@ class App:
         except Exception:
             pass
 
-        body = tk.Frame(win, bg=c['bg'], padx=16, pady=12)
+        # v4.14.6.111-scroll: wrap the whole body so the dialog scrolls when it
+        # overflows (auto-hide when it fits). Padded body lives inside the scroll.
+        _scroll = make_scrollable(win)
+        body = tk.Frame(_scroll, bg=c['bg'], padx=16, pady=12)
         body.pack(fill='both', expand=True)
 
         tk.Label(body, text="SCAN SETTINGS",
@@ -23364,491 +24098,6 @@ class App:
                   font=self.fonts['body_bold']
                   ).pack(side='right')
 
-    # ── v4.13.55: Data Providers dialog ──────────────────────────────
-    def _show_data_providers(self):
-        """Open the Data Providers manager. Lets the user paste API
-        keys for keyed sources (Finnhub, Massive), enable/disable
-        providers, and see at-a-glance which sources serve which data
-        types. Mirrors the API Providers dialog visually.
-        """
-        if not _DATA_LAYER_ENABLED or tm_data_providers is None:
-            try:
-                messagebox.showinfo(
-                    "Data Providers",
-                    "The data layer modules are not loaded. The app "
-                    "will continue to work in legacy mode (Yahoo only "
-                    "for prices/news).")
-            except Exception:
-                pass
-            return
-
-        c = self.c
-        registry = tm_data_providers.get_registry()
-        if registry is None:
-            # Holdings state not built yet — build it so registry inits
-            try:
-                if self._holdings_state is None:
-                    self._holdings_state = self._build_holdings_state()
-                registry = tm_data_providers.get_registry()
-            except Exception as e:
-                self._log(f"Could not init data layer: {e}", 'amber')
-                return
-        if registry is None:
-            return
-
-        win = tk.Toplevel(self.root)
-        win.title("Data Providers")
-        win.configure(bg=c['bg'])
-        win.geometry('900x700')
-        try:
-            win.transient(self.root)
-            win.grab_set()
-        except Exception:
-            pass
-
-        body = tk.Frame(win, bg=c['bg'], padx=16, pady=12)
-        body.pack(fill='both', expand=True)
-
-        tk.Label(body, text="DATA PROVIDERS",
-                 bg=c['bg'], fg=c['accent'],
-                 font=self.fonts['heading'],
-                 anchor='w').pack(fill='x', pady=(0, 4))
-        tk.Label(body,
-                 text=("Manages where Tired Market gets news, "
-                       "fundamentals, earnings, and SEC filings. "
-                       "Yahoo handles prices on its own thread (lighter "
-                       "load = no cooldowns). Each source has its own "
-                       "lane — they don't compete."),
-                 bg=c['bg'], fg=c['muted'],
-                 font=self.fonts['caption'],
-                 wraplength=720, justify='left',
-                 anchor='w').pack(fill='x', pady=(0, 12))
-
-        # ── v4.13.58: recommended-sources nudge ──────────────────────
-        # If the user only has 1 active news source, suggest enabling
-        # alternates. Same idea as the AI providers nudge — more sources
-        # means better coverage and the data router can rotate among
-        # them based on observed quota.
-        try:
-            active_news = []
-            inactive_news = []
-            for prof in registry.all():
-                pri = prof.priorities.get('news') if hasattr(
-                    prof, 'priorities') else None
-                if pri is not None and prof.enabled:
-                    active_news.append(prof.display_name)
-                elif pri is not None and not prof.enabled:
-                    inactive_news.append(prof)
-            if len(active_news) <= 1 and inactive_news:
-                nudge_frame = tk.Frame(body, bg=c['card2'], padx=12,
-                                        pady=10)
-                nudge_frame.pack(fill='x', pady=(0, 12))
-                heading = (
-                    "💡  You have only "
-                    f"{'1' if active_news else '0'} active news source"
-                    f"{'s' if len(active_news) != 1 else ''}"
-                    f"{' (' + active_news[0] + ')' if active_news else ''}.")
-                tk.Label(nudge_frame, text=heading,
-                         bg=c['card2'], fg=c['accent'],
-                         font=self.fonts['body_bold'],
-                         anchor='w').pack(fill='x')
-                names = ", ".join(p.display_name for p in inactive_news[:4])
-                tk.Label(
-                    nudge_frame,
-                    text=(
-                        f"For better coverage and quota safety, consider "
-                        f"enabling: {names}. Each takes a free API key. "
-                        f"More sources = the data router can rotate among "
-                        f"them as quotas burn down."),
-                    bg=c['card2'], fg=c['muted'],
-                    font=self.fonts['caption'],
-                    wraplength=720, justify='left',
-                    anchor='w').pack(fill='x', pady=(4, 0))
-        except Exception:
-            pass
-
-        # Scrollable area for provider list
-        canvas = tk.Canvas(body, bg=c['bg'], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(body, orient='vertical',
-                                    command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=c['bg'])
-        scroll_frame.bind(
-            '<Configure>',
-            lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=scroll_frame, anchor='nw')
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        scrollbar.pack(side='right', fill='y')
-
-        def _render_providers():
-            # Clear existing rows
-            for w in scroll_frame.winfo_children():
-                try:
-                    w.destroy()
-                except Exception:
-                    pass
-
-            for profile in registry.all():
-                row = tk.Frame(scroll_frame, bg=c['card'],
-                                padx=12, pady=10)
-                row.pack(fill='x', pady=(0, 6))
-
-                # Header row: name + health badge + enable toggle
-                hdr = tk.Frame(row, bg=c['card'])
-                hdr.pack(fill='x')
-
-                # Health dot
-                health_color = {
-                    'green': '#22c55e',
-                    'amber': '#f59e0b',
-                    'red': '#ef4444',
-                    'unknown': c['muted'],
-                }.get(profile.health, c['muted'])
-                tk.Label(hdr, text='●',
-                          bg=c['card'], fg=health_color,
-                          font=('Segoe UI', 14, 'bold')
-                          ).pack(side='left')
-
-                # Display name
-                tk.Label(hdr, text=profile.display_name,
-                          bg=c['card'], fg=c['text'],
-                          font=self.fonts['body_bold']
-                          ).pack(side='left', padx=(6, 0))
-
-                # ON/OFF toggle (click label to toggle, like API providers)
-                on_off_text = '● ON' if profile.enabled else '○ OFF'
-                on_off_color = c['accent'] if profile.enabled else c['muted']
-                toggle_lbl = tk.Label(
-                    hdr, text=on_off_text,
-                    bg=c['card'], fg=on_off_color,
-                    font=self.fonts['body_bold'],
-                    cursor='hand2')
-                toggle_lbl.pack(side='right')
-
-                def _toggle(pid=profile.id):
-                    cur = registry.get(pid)
-                    if cur:
-                        registry.set_enabled(pid, not cur.enabled)
-                        _render_providers()
-                toggle_lbl.bind('<Button-1>', lambda e, p=profile.id: _toggle(p))
-
-                # Body: capabilities list + key field
-                serves_list = [
-                    dt for dt in tm_data_providers.DATA_TYPES
-                    if profile.serves(dt)
-                ]
-                if serves_list:
-                    serves_str = "Provides: " + ", ".join(serves_list)
-                else:
-                    serves_str = "Provides: (nothing currently)"
-                tk.Label(row, text=serves_str,
-                          bg=c['card'], fg=c['text'],
-                          font=self.fonts['caption'],
-                          anchor='w').pack(fill='x', pady=(4, 2))
-
-                if profile.notes:
-                    tk.Label(row, text=profile.notes,
-                              bg=c['card'], fg=c['muted'],
-                              font=self.fonts['caption'],
-                              wraplength=680, justify='left',
-                              anchor='w').pack(fill='x', pady=(0, 4))
-
-                # v4.14.2 stage 4: cheat-sheet upfront blurb. For
-                # providers with a data/internal/provider_signup_specs.json
-                # entry, render a green one-liner summarizing what the
-                # signup unlocks + how long it takes — the AI's
-                # walk-the-user-through-it copy made user-visible
-                # ahead of the embedded assistant landing.
-                try:
-                    _specs = _load_provider_signup_specs()
-                    _entry = _specs.get(profile.id)
-                    if _entry and (_entry.get('tier_unlocks')
-                                    or _entry.get('estimated_signup_time_seconds')):
-                        time_part = ''
-                        secs = _entry.get('estimated_signup_time_seconds')
-                        if secs:
-                            try:
-                                t = int(secs)
-                                if t < 90:
-                                    time_part = f" ~{t}s, "
-                                else:
-                                    time_part = f" ~{t // 60}min, "
-                            except Exception:
-                                pass
-                        blurb_parts = []
-                        if _entry.get('tier_unlocks'):
-                            blurb_parts.append(_entry['tier_unlocks'])
-                        if time_part:
-                            blurb_parts.append(
-                                f"{time_part.strip()} email-only signup")
-                        elif 'email' in (_entry.get('signup_requires')
-                                          or []):
-                            blurb_parts.append("email-only signup")
-                        if _entry.get('tier_limits'):
-                            blurb_parts.append(_entry['tier_limits'])
-                        if blurb_parts:
-                            tk.Label(row,
-                                      text="✓ " + " · ".join(blurb_parts),
-                                      bg=c['card'], fg=c['accent'],
-                                      font=self.fonts['caption'],
-                                      wraplength=680, justify='left',
-                                      anchor='w'
-                                      ).pack(fill='x', pady=(0, 4))
-                except Exception:
-                    pass
-
-                # Key entry (only if needs_key) - vertical layout so Save
-                # button is always visible regardless of window width
-                if profile.needs_key:
-                    # Row 1: label
-                    tk.Label(row, text='API key:',
-                              bg=c['card'], fg=c['muted'],
-                              font=self.fonts['caption'],
-                              anchor='w').pack(fill='x', pady=(6, 2))
-                    # Row 2: input field (full width)
-                    key_var = tk.StringVar(value=profile.key)
-                    show_var = tk.BooleanVar(value=False)
-                    key_entry = tk.Entry(
-                        row, textvariable=key_var,
-                        bg=c['card2'], fg=c['text'],
-                        font=self.fonts['body'],
-                        relief='flat', insertbackground=c['accent'],
-                        show='*' if profile.key else '')
-                    key_entry.pack(fill='x', pady=(0, 4), ipady=4)
-                    # Row 3: Show/Hide toggle + Save button + status
-                    btn_row = tk.Frame(row, bg=c['card'])
-                    btn_row.pack(fill='x', pady=(0, 2))
-
-                    def _toggle_show(pid=profile.id, ent=key_entry,
-                                      sv=show_var, kv=key_var):
-                        sv.set(not sv.get())
-                        ent.configure(show='' if sv.get() else '*')
-
-                    tk.Button(btn_row, text='Show/Hide',
-                                command=_toggle_show,
-                                bg=c['card2'], fg=c['muted'],
-                                relief='flat', borderwidth=0,
-                                cursor='hand2', padx=8, pady=2,
-                                font=self.fonts['caption']
-                                ).pack(side='left')
-
-                    # v4.13.59: Get-a-free-key button — looks up the
-                    # provider in the discovery registry and opens its
-                    # signup page in the user's default browser. This
-                    # is way more useful than expecting the user to
-                    # know where to sign up.
-                    #
-                    # v4.14.2 stage 4: fall back to the cheat sheet
-                    # (data/internal/provider_signup_specs.json) for
-                    # data providers like FRED that aren't in the AI-
-                    # provider tm_provider_discovery registry.
-                    signup_url = None
-                    try:
-                        import tm_provider_discovery as _disc_dp
-                        info = _disc_dp.lookup(profile.display_name) \
-                                or _disc_dp.lookup(profile.id)
-                        if info is not None and info.signup_url:
-                            signup_url = info.signup_url
-                    except Exception:
-                        pass
-                    if not signup_url:
-                        # Cheat-sheet fallback (stage 4)
-                        try:
-                            specs = _load_provider_signup_specs()
-                            entry = specs.get(profile.id) or {}
-                            if entry.get('signup_url'):
-                                signup_url = entry['signup_url']
-                        except Exception:
-                            pass
-                    if signup_url:
-                        def _open_signup_data(url=signup_url):
-                            try:
-                                import webbrowser
-                                webbrowser.open(url, new=2)
-                                self._log(
-                                    f"Opened {url} in your browser",
-                                    'green')
-                            except Exception:
-                                pass
-                        tk.Button(btn_row, text='Get a free key →',
-                                    command=_open_signup_data,
-                                    bg=c['card2'], fg=c['accent'],
-                                    relief='flat', borderwidth=0,
-                                    cursor='hand2', padx=8, pady=2,
-                                    font=self.fonts['caption']
-                                    ).pack(side='left', padx=(8, 0))
-
-                    save_status = tk.Label(
-                        btn_row, text='', bg=c['card'], fg=c['accent'],
-                        font=self.fonts['caption'])
-                    save_status.pack(side='left', padx=(8, 0))
-
-                    # v4.14.0 stage 7: validate-on-save for data
-                    # provider keys. Mirrors the AI-provider form
-                    # pattern: disable button, paint amber
-                    # "Validating...", run validate_data_key on a
-                    # background thread, marshal result back via
-                    # root.after. On success → registry.update_key +
-                    # green '✓ Saved'. On failure → red plain-English
-                    # reason; the key is NOT persisted (per the
-                    # marketable-build-user-target decision: never
-                    # silently save a key the user thinks worked but
-                    # didn't).
-                    save_btn_holder7 = {'btn': None}
-
-                    def _save_key(pid=profile.id, var=key_var,
-                                   stat=save_status,
-                                   pname=profile.display_name,
-                                   needs_key=profile.needs_key,
-                                   btn_holder=save_btn_holder7):
-                        new_key = var.get()
-                        if needs_key and not new_key:
-                            try:
-                                stat.config(
-                                    text=f"✗ No API key entered.",
-                                    fg=c['red'])
-                            except Exception:
-                                pass
-                            return
-
-                        # Disable button + amber "Validating..."
-                        try:
-                            stat.config(
-                                text=f"Validating with {pname}...",
-                                fg=c['amber'])
-                        except Exception:
-                            pass
-                        try:
-                            btn = btn_holder.get('btn')
-                            if btn is not None:
-                                btn.config(state='disabled')
-                        except Exception:
-                            pass
-
-                        def _on_validation_result(ok, category, msg):
-                            try:
-                                btn = btn_holder.get('btn')
-                                if btn is not None:
-                                    btn.config(state='normal')
-                            except Exception:
-                                pass
-                            if ok:
-                                try:
-                                    registry.update_key(pid, new_key)
-                                    stat.config(text='✓ Saved',
-                                                 fg=c['green'])
-                                    self._log(
-                                        f"Saved API key for {pid} "
-                                        f"(validated)", 'green')
-                                except Exception as e:
-                                    stat.config(
-                                        text=f"✗ Save failed: {e}",
-                                        fg=c['red'])
-                                    return
-                                # If the validation was 'no_canary'
-                                # (we couldn't validate), the save
-                                # still went through — log a debug
-                                # event so future-the user can add canary
-                                # coverage.
-                                if category == 'no_canary':
-                                    try:
-                                        import tm_provider_discovery as _tpd
-                                        _tpd.log_discovery_event(
-                                            'discovery_error', pid,
-                                            '',
-                                            reason=('no canary endpoint '
-                                                    'defined — key '
-                                                    'saved without '
-                                                    'validation'))
-                                    except Exception:
-                                        pass
-                                # v4.15.0 Step 11: keep lane_config in sync
-                                # with key changes. Best-effort — failure
-                                # here must not break the save flow above.
-                                try:
-                                    _v415_sync_lane_config_after_key_change(
-                                        pid, key_present=bool(new_key))
-                                except Exception:
-                                    pass
-                                self.root.after(800, _render_providers)
-                            else:
-                                try:
-                                    stat.config(
-                                        text=f"✗ {msg}", fg=c['red'])
-                                except Exception:
-                                    pass
-                                # Log validation_failure to debug log
-                                try:
-                                    import tm_provider_discovery as _tpd
-                                    _tpd.log_discovery_event(
-                                        'validation_failure', pid,
-                                        '',
-                                        reason=f'{category}: {msg}')
-                                except Exception:
-                                    pass
-
-                        def _bg():
-                            try:
-                                import tm_provider_discovery as _tpd
-                                ok, cat, msg = _tpd.validate_data_key(
-                                    pid, new_key,
-                                    display_name=pname)
-                            except Exception as _e:
-                                ok, cat, msg = (
-                                    False, 'unknown',
-                                    f"Couldn't validate the key: "
-                                    f"{type(_e).__name__}: {_e}")
-                            self.root.after(
-                                0,
-                                lambda: _on_validation_result(
-                                    ok, cat, msg))
-
-                        import threading as _th7
-                        _th7.Thread(target=_bg, daemon=True,
-                                     name='validate-data-key').start()
-
-                    save_key_btn = tk.Button(
-                        btn_row, text='Save Key',
-                        command=_save_key,
-                        bg=c['accent'], fg=c['bg'],
-                        relief='flat', borderwidth=0,
-                        cursor='hand2', padx=14, pady=4,
-                        font=self.fonts['body_bold'])
-                    save_key_btn.pack(side='right')
-                    save_btn_holder7['btn'] = save_key_btn
-
-                # Stats footer
-                stats_parts = []
-                if profile.calls_today:
-                    stats_parts.append(
-                        f"calls today: {profile.calls_today}")
-                if profile.fails_today:
-                    stats_parts.append(
-                        f"failures today: {profile.fails_today}")
-                if profile.last_error:
-                    stats_parts.append(
-                        f"last error: {profile.last_error[:60]}")
-                if stats_parts:
-                    tk.Label(
-                        row, text=" · ".join(stats_parts),
-                        bg=c['card'], fg=c['muted'],
-                        font=self.fonts['caption'],
-                        anchor='w').pack(fill='x', pady=(4, 0))
-
-        _render_providers()
-
-        # Footer with Done button
-        footer = tk.Frame(body, bg=c['bg'])
-        footer.pack(side='bottom', fill='x', pady=(8, 0))
-        tk.Button(footer, text="Done",
-                    command=win.destroy,
-                    bg=c['accent'], fg=c['bg'],
-                    relief='flat', borderwidth=0, cursor='hand2',
-                    padx=14, pady=4,
-                    font=self.fonts['body_bold']
-                    ).pack(side='right')
-
-    # ── v4.13.55: Data Mode dialog ───────────────────────────────────
     def _show_data_mode(self):
         """Pick the data routing mode: api / free / hybrid.
 
@@ -26619,13 +26868,37 @@ class App:
                                 # v4.13.19: target hint after cost (same line as
                                 # the relocated cluster in reflow mode).
                                 try:
-                                    _t = pos.get('target')
-                                    if _t and float(_t) > 0:
-                                        tk.Label(_dparent,
-                                                 text=f"  → ${float(_t):.2f}",
-                                                 bg=c['card'], fg=c['green'],
-                                                 font=('Consolas', 8, 'bold')
-                                                 ).pack(side='left')
+                                    # v4.14.6.111 conditional-algo-display:
+                                    #  - HAS AI → show the AI consensus target
+                                    #    aggregate (mean/median + range + N-of-M);
+                                    #    SUPPRESS the algo/ATR number. If no model
+                                    #    gave a number, show NOTHING (the BUY card
+                                    #    + verdict still render) — never the algo.
+                                    #  - NO AI → no Tier-2 ran; show the algo/ATR
+                                    #    target (the floor) so a no-AI user still
+                                    #    has a level, labeled honestly.
+                                    if self._recommend_has_ai():
+                                        _ai_str = self._fmt_ai_target(
+                                            self._compute_ai_target_for(
+                                                pos.get('ticker'),
+                                                pos.get('path')))
+                                        if _ai_str:
+                                            tk.Label(
+                                                _dparent,
+                                                text=f"  → {_ai_str}",
+                                                bg=c['card'], fg=c['green'],
+                                                font=('Consolas', 8, 'bold')
+                                                ).pack(side='left')
+                                    else:
+                                        _t = pos.get('target')
+                                        if _t and float(_t) > 0:
+                                            tk.Label(
+                                                _dparent,
+                                                text=(f"  → ${float(_t):.2f} "
+                                                      f"(algo/ATR)"),
+                                                bg=c['card'], fg=c['muted'],
+                                                font=('Consolas', 8)
+                                                ).pack(side='left')
                                 except Exception:
                                     pass
 
@@ -26672,7 +26945,25 @@ class App:
                                 if _reprice_on and _current is not None:
                                     try:
                                         _entry = float(pos.get('entry') or 0)
-                                        _target = float(pos.get('target') or 0)
+                                        # v4.14.6.111 conditional-algo-display:
+                                        # the "best case" upside derives from the
+                                        # AI target aggregate when ≥1 AI provider
+                                        # is enabled (no AI number → _target is 0
+                                        # so the existing `if _target > 0` guard
+                                        # suppresses the line; never the algo).
+                                        # With NO AI provider, fall to the algo/ATR
+                                        # target (the floor) so a no-AI user still
+                                        # sees a best-case figure.
+                                        _bc_has_ai = self._recommend_has_ai()
+                                        if _bc_has_ai:
+                                            _bc_agg = self._compute_ai_target_for(
+                                                pos.get('ticker'), pos.get('path'))
+                                            _target = (float(_bc_agg['target'])
+                                                       if (_bc_agg and _bc_agg.get('target'))
+                                                       else 0.0)
+                                        else:
+                                            _bc_agg = None
+                                            _target = float(pos.get('target') or 0)
                                         _bz_high = pos.get('buy_zone_high')
                                         _bz_high_f = (
                                             float(_bz_high)
@@ -26707,8 +26998,17 @@ class App:
                                         # there), so the pill stays a short state
                                         # word that can't clip on the ticker row.
                                         _fresh_detail_text = ""
+                                        _is_faded = False
                                         if _fresh_on:
                                             try:
+                                                # v4.14.6.111-faded-spike: max
+                                                # daily HIGH since this pick's
+                                                # made_at (cache-only, no fetch).
+                                                # None on any failure → pill keeps
+                                                # the prior green BELOW ZONE.
+                                                _win_hi = self._window_high_since(
+                                                    pos.get('ticker'),
+                                                    pos.get('timestamp'))
                                                 _fr_label, _fr_ck, _fr_detail = (
                                                     _freshness_state(
                                                         pos.get('entry'),
@@ -26716,7 +27016,9 @@ class App:
                                                         _bz_high,
                                                         pos.get('target'),
                                                         pos.get('stop'),
-                                                        _current))
+                                                        _current,
+                                                        _win_hi))
+                                                _is_faded = (_fr_label == 'FADED')
                                                 # Reuse the v88 flag: ON => short
                                                 # state-word pill + detail line;
                                                 # OFF => prior long pill label
@@ -26766,6 +27068,14 @@ class App:
                                             _now_color = (
                                                 c['amber']
                                                 if _gap > 0 else c['green'])
+                                            # v4.14.6.111-faded-spike: under a
+                                            # FADED pill the price is below entry
+                                            # only because it ran up THROUGH the
+                                            # zone and reversed — don't paint the
+                                            # line green ("still attractive"); use
+                                            # amber to match the caution pill.
+                                            if _is_faded:
+                                                _now_color = c['amber']
                                         # v4.14.6.89-extended-pct-to-detail-line:
                                         # the EXTENDED "N% of move gone" (and the
                                         # NEAR-TARGET qualifier) ride here on the
@@ -26815,6 +27125,18 @@ class App:
                                                 _rem_upside = (
                                                     (_target - _current)
                                                     / _current * 100.0)
+                                                # v4.14.6.111: tag the source as
+                                                # the AI aggregate + N-of-M so the
+                                                # "best case" reads as the models'
+                                                # call, not the algo's.
+                                                _ai_tag = ''
+                                                try:
+                                                    if _bc_agg and _bc_agg.get('n'):
+                                                        _ai_tag = (
+                                                            f" (AI {int(_bc_agg['n'])}"
+                                                            f" of {int(_bc_agg.get('m', _bc_agg['n']))})")
+                                                except Exception:
+                                                    _ai_tag = ''
                                                 if _entry_upside is not None:
                                                     _rem_text = (
                                                         f"   best case "
@@ -26822,12 +27144,12 @@ class App:
                                                         f"from entry · "
                                                         f"+{_rem_upside:.0f}% "
                                                         f"remaining from "
-                                                        f"${_current:.2f}")
+                                                        f"${_current:.2f}{_ai_tag}")
                                                 else:
                                                     _rem_text = (
                                                         f"   +{_rem_upside:.0f}% "
                                                         f"remaining to target "
-                                                        f"from ${_current:.2f}")
+                                                        f"from ${_current:.2f}{_ai_tag}")
                                                 _rem_color = c['muted']
                                             _rem_row = tk.Frame(
                                                 col_outer, bg=c['card'])
@@ -26931,28 +27253,81 @@ class App:
                                                .replace(' day', 'd')
                                                .replace(' months', 'mo')
                                                .replace(' month', 'mo'))
-                                detail = (f"  {pos['ticker']}: "
-                                           f"T ${pos['target']:.2f}, "
-                                           f"S ${pos['stop']:.2f}  "
-                                           f"({pos['reward_to_risk']:.1f}x, "
-                                           f"{tf_short}, {agree_str})")
+                                # v4.14.6.111 conditional-algo-display:
+                                #  - HAS AI → show the AI consensus target
+                                #    aggregate (or "n/a" if no model gave a
+                                #    number); SUPPRESS the algo/ATR stop (no AI
+                                #    stop aggregate exists, so no stop is shown).
+                                #  - NO AI → show the algo/ATR target + stop
+                                #    (the floor), labeled honestly.
+                                if self._recommend_has_ai():
+                                    _alt_ai = self._compute_ai_target_for(
+                                        pos.get('ticker'), pos.get('path'))
+                                    _alt_t = (f"AI ~${float(_alt_ai['target']):.2f}"
+                                              if (_alt_ai and _alt_ai.get('target'))
+                                              else "AI target n/a")
+                                    detail = (f"  {pos['ticker']}: "
+                                               f"{_alt_t}  "
+                                               f"({pos['reward_to_risk']:.1f}x, "
+                                               f"{tf_short}, {agree_str})")
+                                else:
+                                    detail = (f"  {pos['ticker']}: "
+                                               f"T ${pos['target']:.2f}, "
+                                               f"S ${pos['stop']:.2f} (algo/ATR)  "
+                                               f"({pos['reward_to_risk']:.1f}x, "
+                                               f"{tf_short}, {agree_str})")
                                 tk.Label(col_outer,
                                          text=detail,
                                          bg=c['card'], fg=c['dim'],
                                          font=('Consolas', 8), justify='left'
                                          ).pack(side='top', anchor='w')
 
-                            # Best/worst case for this alternative
-                            tk.Label(col_outer,
-                                     text=(f"Best case: +"
-                                           f"${basket['best_case_gain']:.2f} "
-                                           f"({basket['best_case_pct']:+.0f}%)  "
-                                           f"·  Worst: -"
-                                           f"${basket['worst_case_loss']:.2f} "
-                                           f"({basket['worst_case_pct']:+.0f}%)"),
-                                     bg=c['card'], fg=c['muted'],
-                                     font=('Segoe UI', 8)
-                                     ).pack(side='top', anchor='w', pady=(4, 0))
+                            # Best/worst case for this alternative.
+                            # v4.14.6.111 conditional-algo-display:
+                            #  - HAS AI → best case derives from the AI consensus
+                            #    targets (× shares) summed over the picks whose
+                            #    models gave a number; the algo/ATR worst-case is
+                            #    SUPPRESSED (algo numbers hidden in AI mode). If no
+                            #    pick has an AI target, nothing is shown (never the
+                            #    algo number).
+                            #  - NO AI → show the algo best/worst (the floor) so a
+                            #    no-AI user still sees deploy projections.
+                            if self._recommend_has_ai():
+                                _ai_best = 0.0
+                                _ai_have = 0
+                                for _bp in basket.get('positions', []):
+                                    _ba = self._compute_ai_target_for(
+                                        _bp.get('ticker'), _bp.get('path'))
+                                    if _ba and _ba.get('target'):
+                                        try:
+                                            _ai_best += ((float(_ba['target'])
+                                                          - float(_bp['entry']))
+                                                         * float(_bp['shares']))
+                                            _ai_have += 1
+                                        except Exception:
+                                            pass
+                                if _ai_have > 0:
+                                    tk.Label(
+                                        col_outer,
+                                        text=(f"Best case (AI, {_ai_have} pick"
+                                              f"{'s' if _ai_have != 1 else ''}): "
+                                              f"+${_ai_best:.2f}"),
+                                        bg=c['card'], fg=c['muted'],
+                                        font=('Segoe UI', 8)
+                                        ).pack(side='top', anchor='w',
+                                               pady=(4, 0))
+                            else:
+                                tk.Label(col_outer,
+                                         text=(f"Best case: +"
+                                               f"${basket['best_case_gain']:.2f} "
+                                               f"({basket['best_case_pct']:+.0f}%)  "
+                                               f"·  Worst: -"
+                                               f"${basket['worst_case_loss']:.2f} "
+                                               f"({basket['worst_case_pct']:+.0f}%)"),
+                                         bg=c['card'], fg=c['muted'],
+                                         font=('Segoe UI', 8)
+                                         ).pack(side='top', anchor='w',
+                                                pady=(4, 0))
 
                             # Cash deployed
                             tk.Label(col_outer,
@@ -27582,6 +27957,24 @@ class App:
                  font=('Segoe UI', 8, 'bold'), anchor='w'
                  ).pack(side='top', anchor='w')
 
+        # v4.14.6.111-streaming: progressive "so far" tally that updates per vote
+        # (3 HOLD · 1 BUY). Same shared helper as Portfolio/Look Up; finalizes
+        # naturally when all respond or each straggler hits its own timeout.
+        try:
+            import tm_consensus as _tc_tally_rec
+            _so_far_rec = _tc_tally_rec.format_votes_so_far(
+                votes_done,
+                getattr(runner, 'weight_map', None),
+                getattr(runner, 'accuracy_weighting_enabled', False))
+            if _so_far_rec:
+                tk.Label(block, text=f"so far: {_so_far_rec}",
+                         bg=block.cget('bg'),
+                         fg=c.get('dim', c.get('muted', '#888')),
+                         font=('Segoe UI', 8, 'italic'), anchor='w'
+                         ).pack(side='top', anchor='w')
+        except Exception:
+            pass
+
         # v4.14.5.14-recommend-narration-and-freshness (Fix A): self-fix
         # narration line — the engine's recovery events translated to
         # friendly text by the engine-generic _translate_lookup_progress
@@ -27609,6 +28002,14 @@ class App:
             tk.Label(row, text=_norm_rec1(v.get('model', '?')),
                      bg=block.cget('bg'), fg=c.get('text', '#fff'),
                      font=('Consolas', 9)).pack(side='left')
+            # v4.14.6.111-finalize-deadline: a model that missed the deadline is
+            # a DISTINCT "timed out" state (muted) — not a vote, not an error.
+            if v.get('timed_out'):
+                tk.Label(row, text='timed out', bg=block.cget('bg'),
+                         fg=c.get('muted', '#999'),
+                         font=('Segoe UI', 8, 'italic'), padx=6
+                         ).pack(side='right')
+                continue
             d = (v.get('direction', '') or '?').upper()
             color = (c['green'] if d == 'BUY' else
                      c['amber'] if d == 'HOLD' else
@@ -27725,10 +28126,20 @@ class App:
             row = tk.Frame(block, bg=block.cget('bg'))
             row.pack(side='top', fill='x', pady=(2, 0))
             model = _norm_rec2(v.get('model', '?'))
-            d = (v.get('direction', '') or '?').upper()
             tk.Label(row, text=model, bg=block.cget('bg'),
                      fg=c.get('text', '#fff'),
                      font=('Consolas', 9)).pack(side='left')
+            # v4.14.6.111 (Item 8): a model that missed the finalize deadline is
+            # shown as a DISTINCT "timed out" tag (muted italic) so its absence
+            # from the tally is VISIBLE, not silent. Display-only — the verdict
+            # already excludes it (no direction).
+            if v.get('timed_out'):
+                tk.Label(row, text='timed out', bg=block.cget('bg'),
+                         fg=c.get('muted', '#999'),
+                         font=('Segoe UI', 8, 'italic'), padx=6
+                         ).pack(side='right')
+                continue
+            d = (v.get('direction', '') or '?').upper()
             d_color = (c['green'] if d == 'BUY' else
                        c['amber'] if d == 'HOLD' else
                        c['red'] if d == 'AVOID' else
@@ -27748,6 +28159,115 @@ class App:
             highlightbackground=c.get('border', '#444'),
             highlightthickness=1)
         btn.pack(side='top', anchor='w', pady=(6, 0))
+
+    def _pick_is_algo_sourced(self, ticker, path):
+        """v4.14.6.111 (algo-display): True when the most-recent prediction for
+        (ticker, path) is an algo_tier1 pick — i.e. its levels are mechanical
+        ATR-derived structural levels, NOT a reasoned forecast. REUSES the exact
+        source detection the 'Algorithm' verdict pill already uses (no new
+        classification, so a consensus pick is never mislabelled as algo).
+        Display-only; never raises (False on any error → treated as reasoned, so
+        the worst case is the prior behaviour, not a wrong 'algo' tag)."""
+        try:
+            _plog = (self._holdings_state.get('predictions_log')
+                     if getattr(self, '_holdings_state', None) else None)
+            if _plog is None:
+                return False
+            _rec = _plog.get_most_recent_for_ticker_and_path(ticker, path)
+            return bool(_rec and (_rec.get('source') or '').lower()
+                        == 'algo_tier1')
+        except Exception:
+            return False
+
+    def _recommend_has_ai(self):
+        """v4.14.6.111 conditional-algo-display: True when at least ONE AI
+        provider is enabled — the SAME enabled-provider set consensus dispatches
+        to (_load_enabled_api_providers → APIProviderRegistry.enabled()). 1 AI
+        counts as AI.
+
+        Gate semantics for the Recommend display (DISPLAY-ONLY; the algo stays
+        load-bearing internally for R/R, sizing, sort and Tier-1 screening in
+        BOTH modes):
+          - has AI  → the AI consensus numbers are the trustworthy ones (a pick
+            only reaches Recommend if the AI endorsed it), so SHOW the AI
+            aggregate and SUPPRESS the algo/ATR numbers as redundant clutter.
+          - no AI   → no Tier-2 ran; the algo screener is the ONLY analysis, so
+            SHOW the algo numbers (the floor) so a no-AI user still has levels.
+        Never raises → False (treated as no-AI, the safe floor that still shows
+        levels rather than hiding everything)."""
+        try:
+            return bool(self._load_enabled_api_providers())
+        except Exception:
+            return False
+
+    def _compute_ai_target_for(self, ticker, path):
+        """v4.14.6.111 AI-target-aggregate: the AI consensus's own price-target
+        aggregate for (ticker, path), or None. Gathers the recent PER-MODEL
+        prediction rows, EXCLUDES algo_tier1 rows (the screener's ATR math must
+        never enter the AI number) and bearish rows, dedupes to the latest row
+        per model, and runs the pure tm_discover.aggregate_ai_target() over them.
+        Display-only; reads the in-memory predictions cache (no network, no AI
+        call, no re-ask). Never raises → None on any error (card shows nothing,
+        never the algo number)."""
+        try:
+            plog = (self._holdings_state.get('predictions_log')
+                    if getattr(self, '_holdings_state', None) else None)
+            if plog is None or not ticker:
+                return None
+            rows = plog.get_recent_for_ticker(ticker, limit=40) or []
+            seen = set()
+            votes = []
+            for r in rows:
+                if path and (r.get('path') or '') != path:
+                    continue
+                if (r.get('source') or '').lower() == 'algo_tier1':
+                    continue  # exclude the mechanical ATR screener target
+                if (r.get('direction') or '').upper() not in ('BUY', 'HOLD', 'WATCH'):
+                    continue
+                mk = (r.get('canonical_model') or r.get('model')
+                      or r.get('actual_model_string') or r.get('id') or id(r))
+                if mk in seen:
+                    continue  # latest row per model (rows are newest-first)
+                seen.add(mk)
+                votes.append(r)
+            if not votes:
+                return None
+            cprice = None
+            try:
+                cprice = (self._holdings_state['cache'].quote(ticker) or {}).get('price')
+            except Exception:
+                cprice = None
+            import tm_discover as _tmd
+            agg = _tmd.aggregate_ai_target(votes, current_price=cprice, ticker=ticker)
+            return agg if agg.get('n', 0) > 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fmt_ai_target(agg):
+        """Render an AI-target aggregate as 'AI ~$13.50  $12-$15  (3 of 6)' (or
+        '... (median)' on a wide spread). Returns '' if there is no target
+        (n == 0) so the caller suppresses the line entirely — never the algo
+        number. Display helper; never raises."""
+        try:
+            if not agg or not agg.get('target'):
+                return ''
+            t = float(agg['target'])
+            n = int(agg.get('n', 0))
+            m = int(agg.get('m', n))
+            lo = agg.get('low')
+            hi = agg.get('high')
+            parts = [f"AI ~${t:.2f}"]
+            if lo is not None and hi is not None and hi > lo:
+                parts.append(f"${lo:.2f}-${hi:.2f}")
+            tail = f"({n} of {m}"
+            if agg.get('method') == 'median':
+                tail += ", median"
+            tail += ")"
+            parts.append(tail)
+            return "  ".join(parts)
+        except Exception:
+            return ''
 
     def _format_relative_time(self, iso_ts):
         """'2026-04-28T20:15:30' → '5 min ago'. Returns '' on parse failure."""
@@ -27874,6 +28394,45 @@ class App:
             if days <= 0:
                 return None
             return min(days, 60.0)         # cap the horizon
+        except Exception:
+            return None
+
+    def _window_high_since(self, ticker, made_at_iso):
+        """v4.14.6.111-faded-spike: max daily HIGH for `ticker` since the pick's
+        made_at, from CACHED daily_bars (cache-only — 0 network, same source the
+        resolver uses). Lets _freshness_state tell a FADED spike (price ran up
+        through the zone then fell back) from a genuine never-reached BELOW-ZONE
+        entry. Window = since made_at (this setup's own lifetime); if made_at is
+        missing/unparseable, falls back to the last 30 bars. Returns None on any
+        failure → _freshness_state keeps the current green BELOW ZONE behavior
+        (fail-safe). DISPLAY-ONLY input; never raises, never fetches."""
+        try:
+            tk = (ticker or '').upper()
+            if not tk:
+                return None
+            import tm_cache as _tc
+            bars = _tc.get_daily_bars(tk)   # cache-only DB read, ASC by date
+            if not bars:
+                return None
+            made_date = str(made_at_iso)[:10] if made_at_iso else None
+            win = None
+            if made_date:
+                try:
+                    win = [b for b in bars
+                           if str(b['date'])[:10] >= made_date]
+                except Exception:
+                    win = None
+            if not win:
+                win = bars[-30:]            # fallback window when no made_at
+            highs = []
+            for b in win:
+                try:
+                    h = float(b['high'] or 0)
+                except (TypeError, ValueError, KeyError, IndexError):
+                    continue
+                if h > 0:
+                    highs.append(h)
+            return max(highs) if highs else None
         except Exception:
             return None
 
@@ -28151,6 +28710,27 @@ class App:
             real_votes = [v for v in all_votes
                            if not v.get('error') and not v.get('skipped')
                            and v.get('direction')]
+            # v4.14.6.111: record per-model accuracy for this FRESH-BUY consensus
+            # (the AI's calls on a fresh buy candidate), scored purely on price vs
+            # each model's own target/stop — independent of any holding/ownership.
+            # This path (Recommend Verify) writes the consensus_fresh_buy signal
+            # but never recorded per-model predictions, so its AI votes were
+            # unscored. (Look Up already records per-model via _on_model_done_5b;
+            # owned-position is build 38; the Layer-2 daemon is intentionally
+            # excluded — high-volume re-validation would flood the store.) No
+            # representative row is written on this path, so record all committed
+            # votes. Reuses the shared writer (same shape/dedup/resolution).
+            try:
+                import tm_consensus as _tc_acc
+                _cid_fb = (f"{(ticker or '').upper()}:"
+                           f"{(consensus.get('ts') or '')}")
+                _tc_acc.write_consensus_vote_predictions(
+                    predictions_log, ticker, path, all_votes, _cid_fb,
+                    source='consensus_vote', consensus_kind='fresh_buy',
+                    skip_model_key=None, current_price=None,
+                    log_fn=self._log)
+            except Exception:
+                pass
             winner = None
             if votes:
                 from collections import Counter
@@ -28183,6 +28763,43 @@ class App:
                 self._log(
                     f"Recommend consensus {ticker}: complete — "
                     f"no models committed", 'amber')
+
+            # v4.14.6.111 (Item 5): STARVE escalation. A verdict resting on a
+            # single live voice is low-confidence. Banner on EVERY starved run
+            # (contextual); emit_system_event only when the starve state CHANGES
+            # for this ticker (layered on emit's own 5-min dedup) so a chronic
+            # case doesn't re-nag. "Starved" = 0 < committed < FLOOR (the 0-voice
+            # all-failed case has its own message above, so it's excluded here).
+            # READ-ONLY: does not alter the verdict, the committed votes, or any
+            # recording — it only reads the count finalize already computed.
+            try:
+                import tm_consensus as _tc_starve
+                _floor = int(getattr(_tc_starve, 'CONSENSUS_STARVE_FLOOR', 2))
+                _live = len(real_votes)
+                _starved = (0 < _live < _floor)
+                if _starved:
+                    self._log(
+                        f"⚠ Recommend consensus {ticker}: STARVED — only "
+                        f"{_live} live voice(s) (< {_floor}); treat the verdict "
+                        f"as low confidence (providers cooled/capped/out).",
+                        'amber')
+                _ss = getattr(self, '_consensus_starve_state', None)
+                if _ss is None:
+                    _ss = {}
+                    self._consensus_starve_state = _ss
+                _key = f"{ticker.upper()}:recommend"
+                if _starved and _ss.get(_key) is not True:
+                    try:
+                        import tm_teacher_intercept as _tm_ic_st
+                        _tm_ic_st.emit_system_event(
+                            'consensus_starved', app=self,
+                            context={'ticker': ticker, 'live_voices': _live,
+                                     'floor': _floor})
+                    except Exception:
+                        pass
+                _ss[_key] = _starved
+            except Exception:
+                pass
 
             # v4.15.0 Phase 2: wire to the observation contract.
             # Stash the verified pick so start_verify intent dispatcher
@@ -28764,7 +29381,8 @@ class App:
                         label, ckey = ("Algorithm", 'muted')
                         tip = ("Algorithm — picked by the rule-based "
                                "scorer, not yet validated by AI "
-                               "consensus.")
+                               "consensus. Its target/stop are ATR-derived "
+                               "structural levels, not a reasoned forecast.")
                         _algo_label_set = True
             except Exception:
                 _algo_label_set = False
@@ -29214,21 +29832,10 @@ class App:
             wraplength=720
         ).pack(side='left', fill='x', expand=True)
 
-        # Scrollable body — list per path.
-        body = tk.Frame(win, bg=c['bg'])
-        body.pack(side='top', fill='both', expand=True)
-        canvas = tk.Canvas(body, bg=c['bg'], highlightthickness=0)
-        sb = tk.Scrollbar(body, orient='vertical',
-                          command=canvas.yview)
-        scroll_inner = tk.Frame(canvas, bg=c['bg'])
-        scroll_inner.bind(
-            '<Configure>',
-            lambda _e: canvas.configure(
-                scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=scroll_inner, anchor='nw')
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        sb.pack(side='right', fill='y')
+        # v4.14.6.111-scroll: window-level scroll (hdr + sub stay pinned above).
+        # scroll_inner stays the per-path section host; the old sub-canvas was
+        # removed so there is exactly one scroll region (no nesting).
+        scroll_inner = make_scrollable(win)
 
         # Render per-path sections. Sort path names alphabetically for
         # determinism; empty paths get a one-line "nothing on watch."
@@ -29707,12 +30314,13 @@ class App:
 
     # ── _show_utility_menu REMOVED (v4.14.5.14-gui-cleanup-e) ──
     # The ≡ hamburger popup (Help / Settings / AI Providers / Data Providers /
-    # Exit) is gone. Settings is now a direct ⚙ toolbar button; AI Providers
-    # and Data Providers are link-out sections INSIDE the Settings dialog
-    # (_show_api_providers / _show_data_providers still exist, just launched
-    # from there); Help (Teacher AI will own it) and Exit (the window X runs
-    # the same graceful _on_close) were dropped. _show_help stays defined but
-    # is no longer reachable from the UI (Phase A dead-code precedent).
+    # Exit) is gone. Settings is now a direct ⚙ toolbar button; AI Providers is
+    # a link-out section INSIDE the Settings dialog (_show_api_providers, launched
+    # from there). v4.14.6.111: the Data Providers settings SCREEN was removed —
+    # data sources run HEADLESS (tm_data_providers code defaults +
+    # data_providers.json), so there's no UI to configure them. Help (Teacher AI
+    # will own it) and Exit (the window X runs the same graceful _on_close) were
+    # dropped. _show_help stays defined but is no longer reachable from the UI.
 
     def _discover_quick_scan(self):
         """Run a Discover scan immediately, no panel popup. Streams to
@@ -30442,7 +31050,7 @@ class App:
                     "Finnhub (news/fundamentals/earnings, "
                     "needs key), EDGAR (filings). "
                     "Optional: Marketaux, NewsAPI, Twelve Data "
-                    "(news fallbacks; configure in Data Providers).",
+                    "(news fallbacks).",
                     'muted')
             except Exception as e:
                 self._log(
@@ -30735,27 +31343,25 @@ class App:
                             prov.get('preset', ''),
                             prov.get('model', ''))
                         if info:
-                            deprecation_count += 1
                             label = (
                                 prov.get('name')
                                 or prov.get('id', '?'))
                             replacement = info.get('replacement')
+                            # v4.14.6.111: swappable deprecations are auto-healed
+                            # by _autoheal_deprecated_models (singular + models[]),
+                            # so they no longer need a user-facing nag — silently
+                            # skip them here regardless of heal-vs-nag thread order.
+                            # The nag now fires ONLY for genuine no-replacement
+                            # cases the user must resolve manually (fallback).
                             if replacement:
-                                self._log(
-                                    f"⚠ {label}: model "
-                                    f"'{prov.get('model')}' is deprecated. "
-                                    f"Smart router will skip it. "
-                                    f"Update to '{replacement}' in "
-                                    f"AI Providers.",
-                                    'amber')
-                            else:
-                                note = info.get(
-                                    'replacement_note', '')
-                                self._log(
-                                    f"⚠ {label}: model "
-                                    f"'{prov.get('model')}' is "
-                                    f"deprecated. {note}",
-                                    'amber')
+                                continue
+                            deprecation_count += 1
+                            note = info.get('replacement_note', '')
+                            self._log(
+                                f"⚠ {label}: model "
+                                f"'{prov.get('model')}' is "
+                                f"deprecated. {note}",
+                                'amber')
                     if deprecation_count == 0 and enabled_providers:
                         self._log(
                             f"AI provider configs verified — no "
@@ -31261,23 +31867,6 @@ class App:
                   command=self._show_api_providers
                   ).pack(side='top', anchor='w', pady=(2, 0))
 
-        # ── Data Providers (link-out) — v4.14.5.14-gui-cleanup-e ──
-        dataprov_frame = tk.Frame(body, bg=c['card'], padx=14, pady=12)
-        dataprov_frame.pack(side='top', fill='x', pady=(0, 8))
-        tk.Label(dataprov_frame, text="DATA PROVIDERS", bg=c['card'],
-                 fg=c['accent'], font=('Segoe UI', 9, 'bold')
-                 ).pack(side='top', anchor='w')
-        tk.Label(dataprov_frame,
-                 text="Configure stock data sources (Finnhub, Yahoo, etc.).",
-                 bg=c['card'], fg=c['dim'], font=('Segoe UI', 8),
-                 wraplength=480, justify='left'
-                 ).pack(side='top', anchor='w', pady=(2, 6))
-        tk.Button(dataprov_frame, text="Open Data Providers...",
-                  bg=c['card2'], fg=c['text'], relief='flat',
-                  padx=self.space['md'], pady=self.space['xs'],
-                  font=('Segoe UI', 9), cursor='hand2',
-                  command=self._show_data_providers
-                  ).pack(side='top', anchor='w', pady=(2, 0))
 
         # ── Buttons ──
         # btn_row was packed at the top of this method (before the scrollable
@@ -31297,6 +31886,13 @@ class App:
                 import tm_source_accuracy as _tsa_set
                 _tsa_set.set_attributable_only(
                     self.cfg.get('use_validated_accuracy', False))
+            except Exception:
+                pass
+            # v4.14.6.111: re-sync the algo-out-of-accuracy gate on Settings save.
+            try:
+                import tm_discover as _tdsc_set
+                _tdsc_set.set_exclude_algo_from_accuracy(
+                    self.cfg.get('exclude_algo_from_accuracy', True))
             except Exception:
                 pass
             try:
@@ -31500,11 +32096,20 @@ class App:
                  bg=c['bg'], fg=c['muted'], font=('Segoe UI', 9)
                  ).pack(side='top', pady=(0, 14))
 
-        body = tk.Text(win, bg=c['card'], fg=c['text'],
+        # v4.14.6.111-scroll: a tk.Text scrolls its own content natively (wheel +
+        # yview), so it does NOT use make_scrollable (that's for frame content).
+        # Give it a visible Scrollbar in a wrapper so overflow is reachable by bar
+        # too, not just the wheel. btn_row stays pinned at the window bottom.
+        _txt_wrap = tk.Frame(win, bg=c['card'])
+        _txt_wrap.pack(side='top', fill='both', expand=True, padx=20, pady=(4, 8))
+        body = tk.Text(_txt_wrap, bg=c['card'], fg=c['text'],
                        font=('Segoe UI', 9), wrap='word',
                        relief='flat', padx=14, pady=10,
                        highlightthickness=0)
-        body.pack(side='top', fill='both', expand=True, padx=20, pady=(4, 8))
+        _dsb = ttk.Scrollbar(_txt_wrap, orient='vertical', command=body.yview)
+        _dsb.pack(side='right', fill='y')
+        body.configure(yscrollcommand=_dsb.set)
+        body.pack(side='left', fill='both', expand=True)
 
         body.insert('end',
             "This is a personal tool you're using on your own machine. "
@@ -32226,6 +32831,11 @@ class App:
                         'muted')
                 except Exception:
                     pass
+                try:
+                    self._log_phase(f'vacuum_{label}', elapsed,
+                                    extra=f'reclaimed={reclaimed_mb:.1f}MB')
+                except Exception:
+                    pass
                 state[f'last_vacuum_{label}'] = now
                 changed = True
             except Exception as _e_outer:
@@ -32892,6 +33502,33 @@ def main():
     _startup_log(
         f"Tired Market starting — PID={os.getpid()} "
         f"APP_VERSION={APP_VERSION}")
+
+    # v4.14.6.111-process-identity: write THIS app's own PID file at the repo
+    # root so external tools (and "is Tired Market running?" checks) can identify
+    # this app unambiguously by its own PID + the unique TiredMarket.exe name —
+    # never by bare "python.exe". Best-effort; cleaned up on normal exit. The
+    # in-app single-instance lock above remains the authority via data/app.lock;
+    # this is the conventionally-named, externally-readable identity marker.
+    try:
+        _tm_pid_path = SCRIPT_DIR / "TiredMarket.pid"
+    except Exception:
+        _tm_pid_path = None
+    if _tm_pid_path is not None:
+        try:
+            _tm_pid_path.write_text(str(os.getpid()), encoding='utf-8')
+            import atexit as _atexit
+
+            def _cleanup_tm_pid():
+                try:
+                    if _tm_pid_path.exists() and \
+                            _tm_pid_path.read_text(encoding='utf-8').strip() \
+                            == str(os.getpid()):
+                        _tm_pid_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            _atexit.register(_cleanup_tm_pid)
+        except Exception:
+            pass
 
     # v4.14.6.105-retire-mover: the two-phase startup move (process_startup_move)
     # and orphan-staging sweep were REMOVED — there is no runtime move feature

@@ -106,6 +106,33 @@ MIGRATIONS: dict[tuple, dict] = {
         'deprecation_date': '2026-04-06',
         'source': 'SambaNova Cloud deprecation email',
     },
+    # ── Groq (announced 2026-06-17) ──────────────────────────────────
+    # 70b-versatile / 8b-instant / qwen3-32b / llama-4-scout retired.
+    # Survivors: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b.
+    ('groq', 'llama-3.3-70b-versatile'): {
+        'replacement': 'openai/gpt-oss-120b',
+        'replacement_note': 'Most capable Groq survivor (gpt-oss-120b).',
+        'deprecation_date': '2026-06-17',
+        'source': 'Groq deprecation announcement 2026-06-17',
+    },
+    ('groq', 'llama-3.1-8b-instant'): {
+        'replacement': 'openai/gpt-oss-20b',
+        'replacement_note': 'High-throughput Groq survivor (gpt-oss-20b).',
+        'deprecation_date': '2026-06-17',
+        'source': 'Groq deprecation announcement 2026-06-17',
+    },
+    ('groq', 'qwen/qwen3-32b'): {
+        'replacement': 'qwen/qwen3.6-27b',
+        'replacement_note': 'Current Qwen line on Groq; or gpt-oss-120b.',
+        'deprecation_date': '2026-06-17',
+        'source': 'Groq deprecation announcement 2026-06-17',
+    },
+    ('groq', 'meta-llama/llama-4-scout-17b-16e-instruct'): {
+        'replacement': 'openai/gpt-oss-120b',
+        'replacement_note': 'Use gpt-oss-120b or qwen3.6-27b.',
+        'deprecation_date': '2026-06-17',
+        'source': 'Groq deprecation announcement 2026-06-17',
+    },
 }
 
 # Common error message patterns that indicate a deprecated model.

@@ -23,7 +23,7 @@ import os
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 BUILD_MODE = os.environ.get("TM_BUILD_MODE", "onefile").strip().lower()
-VERSION = "4.14.6.109"
+VERSION = "4.14.6.112"
 ICON = "tired_market.ico"
 
 # ---------------------------------------------------------------------------

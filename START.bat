@@ -12,15 +12,24 @@ setlocal
 title Tired Market
 cd /d "%~dp0"
 
-REM Check Python is still available
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python is not available.
-    echo.
-    echo Run INSTALL.bat to set up, or install Python from python.org.
-    echo.
-    pause
-    exit /b 1
+REM v4.14.6.111-process-identity: launch via the renamed interpreter
+REM (venv\Scripts\TiredMarket.exe) so the app shows as "TiredMarket.exe" in
+REM Task Manager, distinct from other Python apps. This is a ONE-TIME launcher
+REM copy of pythonw.exe (interpreter only, no app code) — NOT a build.
+set "TMEXE=%~dp0venv\Scripts\TiredMarket.exe"
+
+REM Check the renamed interpreter exists (falls back to system python if not)
+if not exist "%TMEXE%" (
+    echo NOTE: venv\Scripts\TiredMarket.exe not found - falling back to system python.
+    python --version >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Python is not available.
+        echo Run INSTALL.bat to set up, or install Python from python.org.
+        echo.
+        pause
+        exit /b 1
+    )
+    set "TMEXE=pythonw"
 )
 
 REM Check the main script exists
@@ -32,16 +41,14 @@ if not exist "tired_market.py" (
     exit /b 1
 )
 
-REM Launch with pythonw (no console window). If it crashes, show the error.
-REM We use python (not pythonw) so any startup errors are visible.
 echo Starting Tired Market...
 echo (This window will close when the app is ready.)
 echo.
 
-REM Try pythonw first - silent launch
-start "" pythonw tired_market.py
+REM Silent launch via the renamed interpreter (windowless).
+start "" "%TMEXE%" tired_market.py
 if errorlevel 1 (
-    echo pythonw failed, trying python...
+    echo launch failed, trying system python...
     python tired_market.py
     if errorlevel 1 (
         echo.

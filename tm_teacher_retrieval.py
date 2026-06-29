@@ -440,7 +440,7 @@ def build_research_prompt(question: str) -> str:
     """Templated CLOUD prompt for an open-world research question. Frames it as
     factual/educational lookup and explicitly bans advice/predictions (only
     research questions ever reach this — advice is caught upstream). Authored
-    draft pending chat-Claude wording review."""
+    draft pending wording review."""
     return (
         "You are answering a factual research question for someone using a "
         "stock-analysis app. Give a brief, plain, factual answer (companies, "

@@ -245,8 +245,15 @@ def _summarize_consensus(consensus: dict) -> tuple[str, str]:
     # Sort by count desc, then alphabetically for stable ordering
     parts = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     pieces = [f"{n} {d}" for d, n in parts]
-    if no_calls > 0:
-        pieces.append(f"{no_calls} no-call")
+    # v4.14.6.111 (Item 8): surface timed-out models distinctly from genuine
+    # no-calls so a model that missed the finalize deadline is VISIBLE in the
+    # holdings verdict line (it folds into no_calls otherwise). Display-only.
+    timed_out = sum(1 for v in votes if v.get('timed_out'))
+    other_no_calls = no_calls - timed_out
+    if other_no_calls > 0:
+        pieces.append(f"{other_no_calls} no-call")
+    if timed_out > 0:
+        pieces.append(f"{timed_out} timed out")
     verdict_line = " · ".join(pieces)
     # Target/stop line — pick the consensus.verdict_target if present, else blank
     target_line = consensus.get('verdict_target', '') or ''
@@ -1566,6 +1573,44 @@ class PortfolioPanel:
                      font=self._card_fonts['caption'], anchor='w', justify='left'
                      ).pack(fill='x', pady=(s['xs'], 0))
 
+    def _starve_escalate(self, ticker, committed, run_kind):
+        """v4.14.6.111 (Item 5): STARVE escalation for a holdings consensus.
+        Banner on EVERY starved run (contextual); emit_system_event only when the
+        starve state CHANGES for this ticker (layered on emit's own 5-min dedup),
+        so a chronically-starved provider doesn't re-nag. "Starved" =
+        0 < committed live voices < CONSENSUS_STARVE_FLOOR (the all-failed
+        0-voice case has its own message). READ-ONLY: reads the committed count
+        finalize already computed; never alters the verdict, the votes that
+        counted, consensus_id, or recording. Never raises."""
+        try:
+            import tm_consensus as _tc_st
+            floor = int(getattr(_tc_st, 'CONSENSUS_STARVE_FLOOR', 2))
+            live = len(committed or [])
+            starved = (0 < live < floor)
+            if starved:
+                self.app._log(
+                    f"⚠ Consensus {ticker}: STARVED — only {live} live "
+                    f"voice(s) (< {floor}); treat the verdict as low confidence "
+                    f"(providers cooled/capped/out).", 'amber')
+            app = self.app
+            ss = getattr(app, '_consensus_starve_state', None)
+            if ss is None:
+                ss = {}
+                app._consensus_starve_state = ss
+            key = f"{(ticker or '').upper()}:{run_kind}"
+            if starved and ss.get(key) is not True:
+                try:
+                    import tm_teacher_intercept as _tm_ic_st
+                    _tm_ic_st.emit_system_event(
+                        'consensus_starved', app=app,
+                        context={'ticker': ticker, 'live_voices': live,
+                                 'floor': floor})
+                except Exception:
+                    pass
+            ss[key] = starved
+        except Exception:
+            pass
+
     def _is_running_for(self, ticker):
         """Return the run_state dict if a consensus is currently running
         for this ticker, else None."""
@@ -1594,6 +1639,11 @@ class PortfolioPanel:
             'current': current_model,
             'queued': queued,
             'all_models': models,
+            # v4.14.6.111-streaming: carry the runner's pre-fetched per-model
+            # weights so the running block can show a progressive tally line.
+            'weight_map': getattr(runner, 'weight_map', None),
+            'accuracy_enabled': getattr(
+                runner, 'accuracy_weighting_enabled', False),
         }
 
     def _render_running_block(self, block, run_state):
@@ -1610,6 +1660,22 @@ class PortfolioPanel:
                  bg=c['card2'], fg=c['accent'],
                  font=('Segoe UI', 7, 'bold'), anchor='w'
                  ).pack(fill='x')
+
+        # v4.14.6.111-streaming: progressive "so far" tally that updates as each
+        # vote lands (3 HOLD · 1 BUY). The FINAL verdict is just this when the run
+        # completes — no forced deadline; a slow model simply fills in later.
+        try:
+            import tm_consensus as _tc_tally
+            _so_far = _tc_tally.format_votes_so_far(
+                votes, run_state.get('weight_map'),
+                run_state.get('accuracy_enabled'))
+            if _so_far:
+                tk.Label(block, text=f"so far: {_so_far}",
+                         bg=c['card2'], fg=c.get('dim', c.get('muted', '#888')),
+                         font=('Segoe UI', 7, 'italic'), anchor='w'
+                         ).pack(fill='x', pady=(1, 0))
+        except Exception:
+            pass
 
         # v4.14.5.14-portfolio-narration-and-honesty (Fix B): self-fix
         # narration line — the engine's recovery events ("An AI was busy
@@ -1639,6 +1705,14 @@ class PortfolioPanel:
             tk.Label(row, text=_norm_run(v.get('model', '?')),
                      bg=c['card2'], fg=c['text'],
                      font=self._card_fonts['mono']).pack(side='left')
+            # v4.14.6.111-finalize-deadline: distinct "timed out" state for a
+            # model that didn't answer within the finalize deadline.
+            if v.get('timed_out'):
+                tk.Label(row, text='timed out', bg=c['card2'],
+                         fg=c.get('dim', c.get('muted', '#888')),
+                         font=('Segoe UI', 7, 'italic'), padx=6
+                         ).pack(side='right')
+                continue
             d = (v.get('direction', '') or '?').upper()
             tk.Label(row, text=d, bg=c['card2'],
                      fg=self._direction_color(d),
@@ -1696,6 +1770,25 @@ class PortfolioPanel:
             return
         if target <= 0 or stop <= 0:
             return
+
+        # v4.14.6.111 AI-target-aggregate: prefer the AI consensus target
+        # AGGREGATE (responders-only mean/median + N-of-M) for consistency with
+        # Look Up / Recommend. Owned-position predictions are AI-sourced (never
+        # the algo screener), so this only refines the displayed target + adds an
+        # N-of-M note; it never introduces an algo value. Falls back to the
+        # single prediction target when no aggregate is computable. Stop stays
+        # the prediction's stop (the labeled mechanical reference). Display-only:
+        # the portfolio TOTAL / cost-basis / P&L math is elsewhere and untouched.
+        _agg_note = ''
+        try:
+            _agg = self.app._compute_ai_target_for(ticker, pred.get('path'))
+            if _agg and _agg.get('target'):
+                target = float(_agg['target'])
+                _agg_note = (f" · {int(_agg['n'])} of {int(_agg['m'])}"
+                             + (", median" if _agg.get('method') == 'median'
+                                else ""))
+        except Exception:
+            _agg_note = ''
 
         try:
             shares = float(holding.get('shares') or 0)
@@ -1760,7 +1853,7 @@ class PortfolioPanel:
         tk.Label(hdr_row, text="SELL TRIGGERS",
                  bg=c['card2'], fg=c['accent'],
                  font=('Segoe UI', 7, 'bold')).pack(side='left')
-        tk.Label(hdr_row, text="  (AI estimates)",
+        tk.Label(hdr_row, text=f"  (AI estimates{_agg_note})",
                  bg=c['card2'], fg=c['dim'],
                  font=('Segoe UI', 7, 'italic')).pack(side='left')
         if superseded:
@@ -2556,6 +2649,17 @@ class PortfolioPanel:
         target+stop, or when the winner is SELL/AVOID (no trigger levels apply
         to a holder). `PredictionsLog.append` adds id/timestamp/status. Never
         raises — a write fault must not break the panel re-render.
+
+        v4.14.6.111 (Option A — per-model consensus accuracy): in ADDITION to the
+        single representative display row above (UNCHANGED — it still drives the
+        SELL TRIGGERS block via _find_buy_prediction_for_triggers), this now ALSO
+        writes ONE accuracy row PER PARTICIPATING MODEL (source='consensus_vote',
+        linked by `consensus_id`) so tm_discover's per-model + headline accuracy
+        scores EVERY model's vote, not just the representative — fixing the
+        under-recording where a 6-model consensus produced at most one scoreable
+        row. The representative model is skipped in the per-model pass (no
+        double-count); rows resolve via the SAME check_outcomes. Forward-only — no
+        backfill of existing data.
         """
         try:
             plog = self._predictions_log()
@@ -2570,50 +2674,115 @@ class PortfolioPanel:
             from collections import Counter as _C
             winner = _C((v.get('direction') or '').upper()
                         for v in committed).most_common(1)[0][0]
-            # SELL / AVOID winners carry no actionable trigger levels for an
-            # existing holder — _find_buy_prediction_for_triggers excludes them
-            # anyway, so don't write one.
-            if winner in ('SELL', 'AVOID'):
-                return
             import tm_discover as _tmd
             cprice = self._latest_price(ticker)
-            for v in committed:
-                if (v.get('direction') or '').upper() != winner:
-                    continue
-                resp = v.get('response') or ''
-                if not resp:
-                    continue
-                try:
-                    pred = _tmd.parse_prediction(resp, ticker,
-                                                 current_price=cprice)
-                except Exception:
-                    continue
-                if pred.get('target') is None or pred.get('stop') is None:
-                    continue
-                # The consensus winner is the authoritative call; parse_prediction
-                # may normalise the per-vote direction (e.g. SELL→AVOID), so
-                # stamp the winner explicitly. Tag provenance + carry the v4.14
-                # model/provider trailer (same fields the Look Up writer keeps).
-                pred['direction'] = winner
-                pred['source'] = 'refresh_triggers'
-                pred['path'] = path
-                for k in ('model', 'provider_id', 'provider_preset',
-                          'canonical_model', 'actual_provider',
-                          'actual_model_string', 'lineup_version'):
-                    if v.get(k) is not None:
-                        pred[k] = v.get(k)
-                try:
-                    plog.append(pred)
-                    self.app._log(
-                        f"[refresh-triggers] wrote prediction for {ticker}: "
-                        f"{winner} target={pred.get('target')} "
-                        f"stop={pred.get('stop')} (src=refresh_triggers)",
-                        'muted')
-                except Exception as e:
-                    self.app._log(
-                        f"[refresh-triggers] prediction write failed for "
-                        f"{ticker}: {type(e).__name__}: {e}", 'amber')
-                return  # one representative prediction per refresh
+            # v4.14.6.111: stable id linking this consensus's rows (and guarding a
+            # re-render from duplicating them). Uses the rollup ts when present.
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                _cts = (consensus or {}).get('ts') or _dt.now(_tz.utc).isoformat()
+            except Exception:
+                _cts = (consensus or {}).get('ts') or ''
+            consensus_id = f"{(ticker or '').upper()}:{_cts}"
+
+            # v4.14.6.111: full dedup — if this consensus was already recorded
+            # (same consensus_id, ts-stable), don't re-write the representative or
+            # the per-model rows. _write_refresh_prediction is called run-time on
+            # consensus completion (not per render), so a genuine re-run yields a
+            # NEW ts -> new id -> fresh rows; this only suppresses a re-call of the
+            # SAME consensus from multiplying rows.
+            try:
+                _dup = any((r.get('consensus_id') == consensus_id)
+                           for r in (plog.get_all() or [])[-500:])
+            except Exception:
+                _dup = False
+            if _dup:
+                return
+
+            # ── (1) representative DISPLAY row — behavior UNCHANGED ──
+            # SELL / AVOID winners carry no actionable trigger levels for an
+            # existing holder — _find_buy_prediction_for_triggers excludes them
+            # anyway, so don't write one. (The per-model accuracy pass below still
+            # records every model's vote even in that case.)
+            rep_model_key = None
+            if winner not in ('SELL', 'AVOID'):
+                for v in committed:
+                    if (v.get('direction') or '').upper() != winner:
+                        continue
+                    resp = v.get('response') or ''
+                    if not resp:
+                        continue
+                    try:
+                        pred = _tmd.parse_prediction(resp, ticker,
+                                                     current_price=cprice)
+                    except Exception:
+                        continue
+                    if pred.get('target') is None or pred.get('stop') is None:
+                        continue
+                    # The consensus winner is the authoritative call;
+                    # parse_prediction may normalise the per-vote direction
+                    # (e.g. SELL→AVOID), so stamp the winner explicitly. Tag
+                    # provenance + carry the v4.14 model/provider trailer.
+                    pred['direction'] = winner
+                    pred['source'] = 'refresh_triggers'
+                    pred['path'] = path
+                    pred['consensus_id'] = consensus_id
+                    for k in ('model', 'provider_id', 'provider_preset',
+                              'canonical_model', 'actual_provider',
+                              'actual_model_string', 'lineup_version'):
+                        if v.get(k) is not None:
+                            pred[k] = v.get(k)
+                    try:
+                        plog.append(pred)
+                        rep_model_key = (v.get('model') or '').strip().lower()
+                        self.app._log(
+                            f"[refresh-triggers] wrote prediction for {ticker}: "
+                            f"{winner} target={pred.get('target')} "
+                            f"stop={pred.get('stop')} (src=refresh_triggers)",
+                            'muted')
+                    except Exception as e:
+                        self.app._log(
+                            f"[refresh-triggers] prediction write failed for "
+                            f"{ticker}: {type(e).__name__}: {e}", 'amber')
+                    break  # one representative prediction per refresh
+
+            # ── (2) per-model accuracy rows — NEW (forward-only) ──
+            self._write_consensus_vote_predictions(
+                ticker, path, committed, consensus_id, rep_model_key, cprice)
+        except Exception:
+            pass
+
+    def _write_consensus_vote_predictions(self, ticker, path, committed,
+                                          consensus_id, rep_model_key, cprice):
+        """v4.14.6.111 (Option A): write ONE accuracy row per committed consensus
+        vote (source='consensus_vote', linked by `consensus_id`) so the
+        track-record computation scores EVERY participating model — not just the
+        representative. Each row carries that model's OWN parsed direction +
+        target/stop and resolves via the SAME check_outcomes resolver (BUY →
+        target/stop axis, HOLD → hold axis; every row expires at timeframe_days,
+        so none sit forever-open). SKIPS: the representative model (already
+        written by the caller — no double-count), votes with no usable
+        target+stop (unresolvable — would only pad the open pile), and any
+        (consensus_id, model) already present (dedup across a re-render). The
+        per-model rows feed the per-model matrix + headline (algo-exclusion only
+        catches model=='Algorithm', so these AI rows are INCLUDED). Never raises.
+        """
+        # v4.14.6.111: delegates to the shared tm_consensus writer (extracted so
+        # the fresh-buy path reuses the SAME machinery — no parallel impl). Owned-
+        # position behavior is unchanged: same per-model rows, same consensus_id
+        # dedup, same skip of the representative model (rep_model_key).
+        try:
+            plog = self._predictions_log()
+            if plog is None:
+                return
+            import tm_consensus as _tc
+            _log_fn = (self.app._log
+                       if getattr(self, 'app', None) is not None else None)
+            _tc.write_consensus_vote_predictions(
+                plog, ticker, path, committed, consensus_id,
+                source='consensus_vote', consensus_kind='owned',
+                skip_model_key=rep_model_key, current_price=cprice,
+                log_fn=_log_fn)
         except Exception:
             pass
 
@@ -2795,6 +2964,7 @@ class PortfolioPanel:
                 self._write_refresh_prediction(ticker, path, consensus)
                 self.app._log(
                     f"Consensus {ticker}: complete — {verdict}", 'green')
+                self._starve_escalate(ticker, _real, 'holdings')
             # Fix D: post-action coaching on the live path.
             self._fire_verify_observation(ticker, consensus)
             root.after(0, self.render)
@@ -3019,6 +3189,7 @@ class PortfolioPanel:
                     f"Refresh {ticker}: complete -- {verdict}. Triggers "
                     f"updated from new {verdict.split()[0] if verdict else ''} "
                     f"prediction.", 'green')
+                self._starve_escalate(ticker, _real, 'holdings')
             # Fix D: post-action coaching on the live path.
             self._fire_verify_observation(ticker, consensus)
             root.after(0, self.render)

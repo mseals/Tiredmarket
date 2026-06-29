@@ -41,7 +41,7 @@ Threading model:
     it being running.
 
 — the user doesn't read code. Plain English summary lives at the top of
-  the file and in each section comment so future-Claude can navigate.
+  the file and in each section comment so future maintainers can navigate.
 """
 
 from __future__ import annotations

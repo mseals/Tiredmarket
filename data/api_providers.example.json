@@ -149,23 +149,6 @@
         "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         "@cf/qwen/qwq-32b"
       ]
-    },
-    {
-      "id": "065ac300",
-      "name": "Cloudflare Workers AI",
-      "preset": "cloudflare",
-      "format": "openai_compat",
-      "endpoint": "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1/chat/completions",
-      "api_key": "",
-      "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-      "enabled": false,
-      "created_at": "2026-06-07T16:40:49.029600",
-      "updated_at": "2026-06-07T16:40:49.029600",
-      "last_discovered_at": null,
-      "models": [
-        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-        "@cf/qwen/qwq-32b"
-      ]
     }
   ]
 }

@@ -84,6 +84,11 @@ TICKER_UNRESOLVABLE = object()
 VALID_MODES = ('api_only', 'free_only', 'hybrid')
 DEFAULT_MODE = 'hybrid'
 
+# v4.14.6.111: window (seconds) for coalescing the per-data_type "No eligible
+# source" notice. ~2 min covers a fundfile seed cycle's burst (30 tickers cluster
+# in <2 min) so the burst yields one line, not ~30.
+_NO_SOURCE_LOG_WINDOW = 120.0
+
 
 def _filter_by_mode(profiles: list[ProviderProfile], mode: str
                      ) -> list[ProviderProfile]:
@@ -160,6 +165,11 @@ class Router:
         self._lock = threading.Lock()
         # adapter_id -> callable. Adapters register at startup.
         self._adapters: dict[str, Callable] = {}
+        # v4.14.6.111: dedup state for the "No eligible source" notice — per
+        # data_type {last, supp}. Was firing once per ticker (the fundfile seed
+        # loop -> ~30 identical lines/cycle); now coalesced to one line per
+        # data_type per window, with a suppressed-count on the next emission.
+        self._no_source_log: dict = {}
 
     # ── Adapter registration (called by adapter modules at import) ──
 
@@ -221,9 +231,7 @@ class Router:
         candidates = self._candidates(data_type, mode)
 
         if not candidates:
-            self._note(
-                f"No eligible source for {data_type} (mode={mode})",
-                'amber')
+            self._note_no_source(data_type, mode)   # v4.14.6.111: deduped
             return _ret(None, 'no_source')
 
         last_error: Optional[str] = None
@@ -468,6 +476,41 @@ class Router:
             self._log(msg, color)
         except Exception:
             pass
+
+    # v4.14.6.111: coalesce the "No eligible source" notice. Per data_type, log
+    # at most once per _NO_SOURCE_LOG_WINDOW seconds; suppressed repeats are
+    # counted and surfaced on the next emitted line ("(+N more suppressed)"). A
+    # fundfile seed cycle (~30 tickers, all hitting a cooled source) now yields
+    # one line per data_type instead of ~30. Source SELECTION is unchanged — this
+    # only governs the log line. Fail-open: any bookkeeping fault emits the line.
+    def _note_no_source(self, data_type, mode) -> None:
+        try:
+            now = time.time()
+            with self._lock:
+                rec = self._no_source_log.get(data_type) or {'last': 0.0,
+                                                              'supp': 0}
+                if (now - rec.get('last', 0.0)) >= _NO_SOURCE_LOG_WINDOW:
+                    extra = (f" (+{rec.get('supp', 0)} more suppressed)"
+                             if rec.get('supp') else "")
+                    rec['last'] = now
+                    rec['supp'] = 0
+                    self._no_source_log[data_type] = rec
+                    emit = True
+                else:
+                    rec['supp'] = rec.get('supp', 0) + 1
+                    self._no_source_log[data_type] = rec
+                    emit = False
+                    extra = ""
+            if emit:
+                self._note(
+                    f"No eligible source for {data_type} (mode={mode}){extra}",
+                    'amber')
+        except Exception:
+            try:
+                self._note(
+                    f"No eligible source for {data_type} (mode={mode})", 'amber')
+            except Exception:
+                pass
 
     def _log_cooldown(self, profile, cd: dict,
                        data_type: Optional[str] = None) -> None:

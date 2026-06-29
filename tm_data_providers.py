@@ -556,6 +556,18 @@ class Registry:
         # until midnight / stuck-red-until-restart" behaviour. Eligibility is
         # gated on cooldown expiry, so providers self-recover within a session.
         self._cooldown: dict[str, dict] = {}
+        # v4.14.6.111-yahoo-counter-fix: per-(provider_id, data_type) consecutive
+        # failure counter — SAME key shape as self._cooldown. This drives the
+        # escalation rung (level → _DATA_COOLDOWN_CURVE). Finishing the
+        # v4.14.6.56 per-type refactor, which bucketed cooldowns + the coalescing
+        # guard per-type but LEFT the escalation counter provider-wide — so a
+        # cold-start burst tripping prices+fundamentals+earnings inflated ONE
+        # shared counter to 3 and over-escalated each bucket to 30m. With a
+        # per-type counter, earnings' rung is driven by earnings' OWN failures.
+        # In-memory / session-only (matches the "does not persist
+        # consecutive_failures" design — the provider-wide field stays for the
+        # DISPLAY-only health signal). Never persisted.
+        self._type_consec_fail: dict = {}
         # v4.14.6.64-reliability-persist (S2): SORT-ONLY snapshot of last
         # session's active cooldowns, restored from source_reliability.json on
         # load(). Read ONLY by reliability_score (at _RELIABILITY_HINT_WEIGHT);
@@ -914,9 +926,17 @@ class Registry:
                           if isinstance(key, tuple) and key[0] == provider_id]:
                     if self._cooldown.pop(k, None) is not None:
                         cd_cleared = True
+                # v4.14.6.111: reset every per-type failure counter too.
+                for k in [key for key in self._type_consec_fail
+                          if isinstance(key, tuple) and key[0] == provider_id]:
+                    self._type_consec_fail.pop(k, None)
             else:
                 if self._cooldown.pop((provider_id, data_type), None) is not None:
                     cd_cleared = True
+                # v4.14.6.111: a success on THIS data_type resets ITS counter
+                # (mirrors the per-type cooldown clear) — the curve restarts at
+                # 60s for the next genuine failure on this type.
+                self._type_consec_fail.pop((provider_id, data_type), None)
             # Promote health on sustained success
             if p.health != 'green':
                 p.health = 'green'
@@ -1011,13 +1031,23 @@ class Registry:
             p.fails_today += 1
             p.calls_today += 1
 
+            # v4.14.6.111-yahoo-counter-fix: advance the PER-TYPE counter (same
+            # _cd_key as the cooldown bucket). This — not the provider-wide
+            # p.consecutive_failures — now drives the escalation rung, so a
+            # prices/fundamentals 429 can no longer push the EARNINGS bucket up
+            # the curve. The coalescing guard above already returned early for
+            # within-window same-bucket 429s, so this only fires on a genuine
+            # NEW failure for THIS data_type.
+            _type_fails = self._type_consec_fail.get(_cd_key, 0) + 1
+            self._type_consec_fail[_cd_key] = _type_fails
+
             # Health is now a DISPLAY signal only (does NOT gate eligibility).
             if p.consecutive_failures >= 3:
                 p.health = 'red'
             elif p.consecutive_failures >= 1:
                 p.health = 'amber'
 
-            level = min(p.consecutive_failures - 1,
+            level = min(_type_fails - 1,
                         len(_DATA_COOLDOWN_CURVE) - 1)
             seconds = 0
             kind = ''
@@ -1042,9 +1072,11 @@ class Registry:
                     # per-minute / unknown → short, escalating, auto-clearing.
                     seconds = max(ra, _DATA_COOLDOWN_CURVE[level])
                     kind = 'per-minute' if ctype == 'per_minute' else 'rate-limit'
-            elif p.consecutive_failures >= 3:
+            elif _type_fails >= 3:
                 # Generic errors: tolerate 1-2 transient blips, then apply an
                 # escalating (auto-clearing) cooldown — was a permanent red.
+                # v4.14.6.111: gate on the PER-TYPE count so a generic earnings
+                # error isn't escalated by unrelated prices/fundamentals blips.
                 seconds = _DATA_COOLDOWN_CURVE[level]
                 kind = 'error'
 

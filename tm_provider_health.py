@@ -205,15 +205,24 @@ def _classify_failure(error: str) -> str:
 
 def resolve_dot_state(enabled: bool, last_call_state: str,
                       in_cooldown: bool, cooldown_sec: int = 0,
-                      health_enabled: bool = True) -> tuple[str, str]:
+                      health_enabled: bool = True,
+                      deprecated: bool = False) -> tuple[str, str]:
     """v4.14.5.14-status-dot-meaning: PURE resolver from health inputs to
-    (color, tooltip). color is one of 'green' / 'red' / 'amber' / 'gray'.
-    Single source of truth shared by the AI Providers dialog dot and the
-    audit (per HANDOFF item 16 the audit drives this directly).
+    (color, tooltip). color is one of 'green' / 'red' / 'amber' / 'gray' /
+    'deprecated'. Single source of truth shared by the AI Providers dialog dot
+    and the audit (per HANDOFF item 16 the audit drives this directly).
 
     Priority (per the patch spec D1):
-      disabled -> gray; no calls yet -> gray; in cooldown -> amber;
-      last call succeeded -> green; last call failed -> red.
+      disabled -> gray; DEPRECATED (model retired, no replacement) -> deprecated;
+      no calls yet -> gray; in cooldown -> amber; last call succeeded -> green;
+      last call failed -> red.
+
+    v4.14.6.111 (Item 5): `deprecated` is a PERSISTENT state for an ENABLED
+    provider whose configured model is vendor-retired with no live replacement
+    (autoheal swaps the replaceable ones at startup, so this only lights up for
+    no-replacement retirements the user must resolve by hand). It outranks the
+    transient cooled/last-call states (a retired model is a standing problem),
+    but never shows for a DISABLED provider (it doesn't dispatch).
 
     health_enabled=False -> legacy/rollback: the dot just mirrors the
     enable toggle (green if enabled, gray if not)."""
@@ -222,6 +231,10 @@ def resolve_dot_state(enabled: bool, last_call_state: str,
                 else ("gray", "Provider disabled."))
     if not enabled:
         return ("gray", "Provider disabled.")
+    if deprecated:
+        return ("deprecated",
+                "Model retired, no replacement available — choose another "
+                "model for this provider.")
     lcs = last_call_state or "unknown"
     if lcs == "unknown":
         return ("gray", "Not yet called this session.")

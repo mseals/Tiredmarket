@@ -104,6 +104,17 @@ _DEFAULTS = {
     '_fund_has_eps': False,
     '_fund_has_margin': False,
     '_fund_has_revenue_growth': False,
+    # v4.14.6.111 (Tier-2 float): float as % of shares-outstanding (band-
+    # agnostic "tight float" measure). Computed by the caller from the cached
+    # float_shares + shares_outstanding; USE-IF-PRESENT — both fields needed and
+    # >0, else _has_float_pct stays False → 0 contribution (like RS).
+    'fund_float_pct': 100.0,           # float / shares_out * 100 (100 = all free)
+    '_fund_has_float_pct': False,
+    # v4.14.6.111 (Tier-3 short interest): short % of float as a PERCENT (0-100).
+    # Set by the caller only when present AND not stale (the lag guard); else
+    # _has_short_pct stays False → 0 contribution (use-if-present, like RS/float).
+    'fund_short_pct_float': 0.0,
+    '_fund_has_short_pct': False,
     'fund_eps_ttm': 0.0,
     'fund_pe_ratio': 0.0,
     'fund_revenue_growth': 0.0,        # ratio: latest-vs-prior, -1..+1
@@ -213,7 +224,267 @@ _DEFAULTS = {
     '_enrich_factors_available': (),  # tuple of factor names whose data
                                        # was present (whether or not it
                                        # nudged the score).
+    # v4.14.6.111 (Tier-1 rel-strength): ticker return minus benchmark (SPY)
+    # return over the lookback, in PERCENT. Computed by the caller (cache
+    # access) and stashed before scoring. USE-IF-PRESENT: short history → the
+    # has-flag stays False → the rule contributes exactly 0.
+    'rel_strength_pct': 0.0,
+    '_has_rel_strength': False,
+    # v4.14.6.111 (Tier-1 bundle): four price-structure / market-context score
+    # contributions. All computed by the caller from already-on-hand data
+    # (daily_bars + cached SPY); USE-IF-PRESENT — short history leaves the
+    # has-flag False → 0 contribution.
+    'pct_off_high_20': 0.0,   # % the latest close sits below the 20d high
+    '_has_breakout': False,
+    'consec_up_days': 0,      # trailing consecutive up-closes
+    '_has_consec': False,
+    'gap_pct': 0.0,           # (latest open − prior close)/prior close, %
+    '_has_gap': False,
+    'regime_state': 'unknown',  # risk_on / risk_off / neutral / unknown
+    '_has_regime': False,
 }
+
+
+# ─── Tier-1 price-structure / market-context signals (v4.14.6.111) ─────
+#
+# Two audit-recommended additions that need NO new data (daily_bars +
+# already-cached SPY): a DOLLAR-VOLUME LIQUIDITY FLOOR (a gate, applied by the
+# caller) and RELATIVE STRENGTH vs SPY (a score contribution, applied inside
+# score_for_promotion). Helpers are pure + unit-testable.
+
+# Per-band avg dollar-volume floors ($/day). A candidate whose ~20-day average
+# close×volume is below its band's floor is untradeable (can't fill without
+# moving it) and is GATE-rejected before promotion. Conservative — each floor
+# sits well below its band's median ADV, culling only the truly illiquid tail
+# (penny/lottery names legitimately trade thinner than large caps). cfg can
+# override per band via cfg['algo_liquidity_floor'] = {band: float}.
+LIQUIDITY_FLOOR_BY_BAND = {
+    'penny_lottery':   50_000.0,
+    'lottery':        100_000.0,
+    'band_5_10':      250_000.0,
+    'band_10_50':     400_000.0,
+    'band_50_up':     750_000.0,
+}
+DEFAULT_LIQUIDITY_FLOOR = 250_000.0   # unknown/legacy band keys
+LIQUIDITY_LOOKBACK_DAYS = 20
+REL_STRENGTH_LOOKBACK_DAYS = 60       # ~3 months, standard momentum window
+
+
+def avg_dollar_volume(bars, lookback: int = LIQUIDITY_LOOKBACK_DAYS):
+    """Mean(close×volume) over the last `lookback` bars.
+
+    bars: iterable of mappings with 'close' and 'volume'. Returns None when
+    fewer than 5 usable bars exist (too thin to judge — the caller treats None
+    as 'unknown' and does NOT gate; absence of data ≠ illiquid). Never raises."""
+    vals = []
+    try:
+        window = list(bars or [])[-int(lookback):]
+    except Exception:
+        return None
+    for b in window:
+        try:
+            cl = float(b.get('close') or 0.0)
+            v = float(b.get('volume') or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if cl > 0 and v > 0:
+            vals.append(cl * v)
+    if len(vals) < 5:
+        return None
+    return sum(vals) / len(vals)
+
+
+def liquidity_floor_for_band(path, cfg: dict | None = None) -> float:
+    """The avg$vol floor for a price band, with optional cfg override."""
+    cfg = cfg or {}
+    try:
+        ov = cfg.get('algo_liquidity_floor') or {}
+        if path in ov:
+            return float(ov[path])
+    except Exception:
+        pass
+    return float(LIQUIDITY_FLOOR_BY_BAND.get(path, DEFAULT_LIQUIDITY_FLOOR))
+
+
+def relative_strength_pct(ticker_closes, bench_closes,
+                          lookback: int = REL_STRENGTH_LOOKBACK_DAYS):
+    """Ticker return minus benchmark return over `lookback` bars, in PERCENT.
+
+    ticker_closes / bench_closes: ordered (oldest→newest) lists of closes.
+    Returns None when either series has fewer than lookback+1 usable closes
+    (short history → the caller leaves the has-flag False → 0 contribution).
+    Never raises."""
+    def _ret(closes):
+        try:
+            cl = [float(c) for c in (closes or []) if c and float(c) > 0]
+        except (TypeError, ValueError):
+            return None
+        if len(cl) < lookback + 1:
+            return None
+        old = cl[-(lookback + 1)]
+        if old <= 0:
+            return None
+        return (cl[-1] / old - 1.0) * 100.0
+    rt = _ret(ticker_closes)
+    rb = _ret(bench_closes)
+    if rt is None or rb is None:
+        return None
+    return rt - rb
+
+
+# v4.14.6.111 (Tier-3 short interest): official short interest is a FINRA
+# bi-monthly settlement figure, so it's inherently lagged. Beyond this bound
+# (~two missed settlement cycles) the data is treated as MISSING — we don't
+# score on a figure that's six-plus weeks stale. Tunable.
+SHORT_INTEREST_STALE_DAYS = 45
+
+
+# ── Tier-1 bundle helpers (v4.14.6.111): breakout / consec / gap / regime ──
+# All pure, never raise; return None / 0 / 'unknown' on thin data so the caller
+# leaves the has-flag False and the score contribution is exactly 0.
+
+BREAKOUT_LOOKBACK_DAYS = 20
+
+
+def pct_off_high(bars, lookback: int = BREAKOUT_LOOKBACK_DAYS):
+    """Percent the latest close sits BELOW the highest high over the last
+    `lookback` bars (0 = at/above the high → breakout; larger = further below).
+    bars: mappings with 'high' and 'close'. None if < lookback bars."""
+    try:
+        w = list(bars or [])[-int(lookback):]
+    except Exception:
+        return None
+    if len(w) < lookback:
+        return None
+    try:
+        highs = [float(b.get('high')) for b in w if b.get('high') is not None]
+        last = float(w[-1].get('close'))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not highs or last <= 0:
+        return None
+    hi = max(highs)
+    if hi <= 0:
+        return None
+    return max(0.0, (hi - last) / hi * 100.0)
+
+
+def consecutive_up_days(bars, maxlook: int = 10):
+    """Trailing count of consecutive up-closes (close > prior close), capped at
+    `maxlook`. 0 when none / <2 bars. Never raises."""
+    try:
+        cl = [float(b.get('close')) for b in (bars or [])
+              if b.get('close') is not None]
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    if len(cl) < 2:
+        return 0
+    n = 0
+    for i in range(len(cl) - 1, 0, -1):
+        if cl[i] > cl[i - 1]:
+            n += 1
+            if n >= maxlook:
+                break
+        else:
+            break
+    return n
+
+
+def gap_pct(bars):
+    """(latest open − prior close) / prior close, in PERCENT. None if < 2 bars
+    or the latest bar has no usable open (e.g. no fresh session print → gap
+    contributes 0 gracefully; never fabricated). Never raises."""
+    try:
+        w = list(bars or [])
+    except Exception:
+        return None
+    if len(w) < 2:
+        return None
+    try:
+        op = float(w[-1].get('open') or 0.0)
+        pc = float(w[-2].get('close') or 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if op <= 0 or pc <= 0:
+        return None
+    return (op - pc) / pc * 100.0
+
+
+def market_regime(spy_bars, ma_lookback: int = 50, ret_lookback: int = 20):
+    """Risk-on / risk-off from SPY: above its `ma_lookback`-day MA AND positive
+    `ret_lookback`-day return → 'risk_on'; below MA AND negative return →
+    'risk_off'; mixed → 'neutral'; thin history → 'unknown'. Never raises."""
+    try:
+        cl = [float(b.get('close')) for b in (spy_bars or [])
+              if b.get('close') is not None]
+    except (AttributeError, TypeError, ValueError):
+        return 'unknown'
+    if len(cl) < ma_lookback + 1:
+        return 'unknown'
+    ma = sum(cl[-ma_lookback:]) / ma_lookback
+    above = cl[-1] > ma
+    ret = ((cl[-1] / cl[-(ret_lookback + 1)] - 1.0)
+           if len(cl) >= ret_lookback + 1 else 0.0)
+    if above and ret > 0:
+        return 'risk_on'
+    if (not above) and ret < 0:
+        return 'risk_off'
+    return 'neutral'
+
+
+def _fmt_dollars(a):
+    """Human-friendly $ (e.g. $2.1M)."""
+    try:
+        a = float(a)
+    except (TypeError, ValueError):
+        return '?'
+    if a >= 1e9:
+        return f'${a / 1e9:.1f}B'
+    if a >= 1e6:
+        return f'${a / 1e6:.1f}M'
+    if a >= 1e3:
+        return f'${a / 1e3:.0f}K'
+    return f'${a:.0f}'
+
+
+def format_score_breakdown(features, avg_dollar_volume=None):
+    """v4.14.6.111 (DISPLAY-ONLY): compact per-signal breakdown of the algo
+    score, READ from the contribs recorded during score_for_promotion — no
+    recompute, no logic change. e.g.:
+
+        base 50 · trend +18 · rvol +6 · RS +8 · breakout +6 · consec +4 ·
+        gap +3 · regime +3 · avg$vol $2.1M  (sum 98 → clamped 100)
+
+    base + Σ(contribs) == the pre-clamp score by construction, so this doubles
+    as a self-check (a mismatch would mean a contribution wasn't captured).
+    Returns '' when no breakdown was stashed (older feature dict)."""
+    contribs = features.get('_score_contribs')
+    if contribs is None:
+        return ''
+    base = features.get('_score_base', NEUTRAL_BASELINE)
+    parts = [f'base {base:.0f}']
+    for pts, reason in contribs:
+        # leading token of the reason = the signal name (e.g. 'rel-strength',
+        # 'breakout', 'trend', 'gap', 'regime', 'momentum', 'RSI ...').
+        _r = str(reason)
+        # v4.14.6.111 (cosmetic): the volume-confirmed-reclaim contribution
+        # shares the 'trend:' prefix with the uptrend nudge, so the compact
+        # line would read "trend +18 · trend +12". Give it a distinct tag here
+        # only — the full reason text + the reasons[] log are unchanged.
+        if 'reclaim confirmed by volume' in _r:
+            tag = 'vol-confirm'
+        else:
+            tag = _r.split(':')[0].split('(')[0].strip()
+            tag = (tag or 'signal')[:16]
+        parts.append(f'{tag} {pts:+.0f}')
+    if avg_dollar_volume is not None:
+        parts.append(f'avg$vol {_fmt_dollars(avg_dollar_volume)}')
+    line = ' · '.join(parts)
+    pre = features.get('_score_preclamp')
+    if features.get('_score_clamped') and pre is not None:
+        clamped = max(SCORE_MIN, min(SCORE_MAX, pre))
+        line += f'  (sum {pre:.0f} → clamped {clamped:.0f})'
+    return line
 
 
 # ─── Adapter — the dataset-compatibility contract ─────────────────────
@@ -389,6 +660,47 @@ def normalize_features(
                 feats['_fund_has_pe_ratio'] = True
             except (TypeError, ValueError):
                 pass
+        # v4.14.6.111 (Tier-2 float): float as % of shares-outstanding — the
+        # band-agnostic "tight float" measure (a low % = constrained tradeable
+        # supply = amplifier for the breakout setups). Needs BOTH float_shares
+        # and shares_outstanding present + >0; else _has_float_pct stays False →
+        # 0 contribution (USE-IF-PRESENT, like RS). Clamped [0,100].
+        try:
+            _fl = raw_fundamentals.get('float_shares')
+            _so = raw_fundamentals.get('shares_outstanding')
+            _fl = float(_fl) if _fl is not None else None
+            _so = float(_so) if _so is not None else None
+            if _fl is not None and _so and _so > 0 and _fl > 0:
+                feats['fund_float_pct'] = max(0.0, min(100.0,
+                                                       _fl / _so * 100.0))
+                feats['_fund_has_float_pct'] = True
+        except (TypeError, ValueError):
+            pass
+        # v4.14.6.111 (Tier-3 short interest): short % of float (squeeze fuel),
+        # gated by the LAG GUARD — short interest is FINRA bi-monthly, so a
+        # figure older than SHORT_INTEREST_STALE_DAYS is treated as MISSING (we
+        # don't score on stale positioning). yfinance returns the fraction
+        # (0.0098); store as a PERCENT (0.98). USE-IF-PRESENT → 0 when absent or
+        # stale.
+        try:
+            _sp = raw_fundamentals.get('short_percent_float')
+            _sp = float(_sp) if _sp is not None else None
+            if _sp is not None and _sp >= 0:
+                _fresh = True
+                _dsi = raw_fundamentals.get('date_short_interest')
+                if _dsi is not None:
+                    try:
+                        from datetime import datetime as _dt_si
+                        _age_d = ((_dt_si.now().timestamp() - float(_dsi))
+                                  / 86400.0)
+                        _fresh = (0 <= _age_d <= SHORT_INTEREST_STALE_DAYS)
+                    except (TypeError, ValueError):
+                        _fresh = True   # unparseable date → don't block on it
+                if _fresh:
+                    feats['fund_short_pct_float'] = _sp * 100.0
+                    feats['_fund_has_short_pct'] = True
+        except (TypeError, ValueError):
+            pass
         # ENRICH (algo-enrichment-2026-06-14): extra fundamentals dict
         # reads — free, no API call (the dict is already in hand).
         # revenue + net_income for revenue-trend / loss-and-shrinking
@@ -545,11 +857,17 @@ def score_for_promotion(features: dict) -> tuple[float, list[str]]:
     """
     ts: float = NEUTRAL_BASELINE
     reasons: list[str] = []
+    # v4.14.6.111 (display-only): record each contribution as (points, reason)
+    # so the emit can show a per-signal breakdown. Populated in the SAME pass as
+    # the math — no recompute, no logic change. base + sum(contribs) == ts
+    # (pre-clamp) by construction (ts is only mutated here and by the clamp).
+    contribs: list = []
 
     def _add(points: float, reason: str) -> None:
         nonlocal ts
         ts += points
         reasons.append(f"{reason} ({points:+.1f})")
+        contribs.append((points, reason))
 
     # ── TREND (algo-trend-filter-2026-06-14): the missing rule ──
     #
@@ -636,6 +954,123 @@ def score_for_promotion(features: dict) -> tuple[float, list[str]]:
             and features['daily_return'] > 0):
         _add(+12, 'trend: reclaim confirmed by volume '
                   f"({features['volume_ratio']:.1f}x up-day)")
+
+    # ── RELATIVE STRENGTH vs the market (v4.14.6.111, the Phase-2 signal) ──
+    # Outperforming SPY over the lookback is the classic momentum-screen edge
+    # (IBD-style RS). A SCORE contribution, NOT a gate. Kept MODEST (max +8 /
+    # −4) so it COMPLEMENTS rather than double-counts the trend filter (+18 for
+    # a confirmed uptrend): the trend rule says "this stock is rising"; RS says
+    # "it's rising FASTER than the market" — a distinct, smaller nudge.
+    # USE-IF-PRESENT: short ticker/benchmark history → _has_rel_strength stays
+    # False (caller never sets it) → this contributes exactly 0.
+    if features.get('_has_rel_strength'):
+        _rs = features['rel_strength_pct']
+        if _rs >= 10.0:
+            _add(+8, f'rel-strength: +{_rs:.0f}% vs SPY (strong outperformer)')
+        elif _rs >= 3.0:
+            _add(+4, f'rel-strength: +{_rs:.0f}% vs SPY (outperforming)')
+        elif _rs <= -10.0:
+            _add(-4, f'rel-strength: {_rs:.0f}% vs SPY (strong laggard)')
+        elif _rs <= -3.0:
+            _add(-2, f'rel-strength: {_rs:.0f}% vs SPY (lagging)')
+        # −3%..+3% ≈ in-line with the market → 0 (no nudge).
+
+    # ── Tier-1 bundle (v4.14.6.111): four capped price-structure / regime ──
+    # nudges. Kept SMALL + partly bidirectional so they SPREAD the ranking
+    # rather than push everything to the 100 cap, and so they don't double-count
+    # the trend(+18)/RS(+8) signals (related but distinct: trend=above MAs,
+    # breakout=near the high; RS/trend=momentum, consec=short run; gap≈volume but
+    # independent). Combined positive headroom (+6+4+3+3=+16 max, rarely all at
+    # once) stays well under the trend+RS block. USE-IF-PRESENT throughout.
+
+    # ① BREAKOUT / % off the 20-day high — near a new high is the breakout setup.
+    if features.get('_has_breakout'):
+        _off = features['pct_off_high_20']
+        if _off <= 2.0:
+            _add(+6, 'breakout: at/near 20d high (≤2% off)')
+        elif _off <= 8.0:
+            _add(+3, f'breakout: near 20d high ({_off:.0f}% off)')
+        elif _off >= 30.0:
+            _add(-2, f'breakout: {_off:.0f}% below 20d high (no breakout)')
+        # 8–30% off → 0 (neither breaking out nor deeply broken).
+
+    # ② CONSECUTIVE-DAY MOMENTUM — a clean multi-day run; TAPER a blow-off
+    # (≥6 straight up days scores LESS than a healthy 3–5, to avoid chasing a
+    # parabolic top).
+    if features.get('_has_consec'):
+        _n = int(features['consec_up_days'])
+        if _n >= 6:
+            _add(+2, f'momentum: {_n} up days (extended — tapered)')
+        elif _n >= 3:
+            _add(+4, f'momentum: {_n} consecutive up days')
+        elif _n >= 2:
+            _add(+2, f'momentum: {_n} consecutive up days')
+
+    # ③ GAP % — bidirectional: a constructive up-gap is positive, a down-gap is
+    # a real negative (this one SPREADS scores both ways).
+    if features.get('_has_gap'):
+        _g = features['gap_pct']
+        if _g >= 3.0:
+            _add(+3, f'gap: +{_g:.1f}% up-gap')
+        elif _g >= 1.0:
+            _add(+1, f'gap: +{_g:.1f}% up-gap')
+        elif _g <= -3.0:
+            _add(-3, f'gap: {_g:.1f}% down-gap')
+        elif _g <= -1.0:
+            _add(-1, f'gap: {_g:.1f}% down-gap')
+
+    # ④ MARKET-REGIME — a market-wide nudge (computed once per scan by the
+    # caller). Uniform across all candidates in a scan, so it shifts the bar vs
+    # the threshold without altering RELATIVE ranking; bidirectional.
+    if features.get('_has_regime'):
+        _reg = features['regime_state']
+        if _reg == 'risk_on':
+            _add(+3, 'regime: risk-on (SPY>50dMA, +20d)')
+        elif _reg == 'risk_off':
+            _add(-3, 'regime: risk-off (SPY<50dMA, −20d)')
+
+    # ── Tier-2 FLOAT (v4.14.6.111): low-float amplifier ──
+    # A TIGHT float (small tradeable supply relative to shares outstanding) means
+    # the same buying volume moves price more — an amplifier for the momentum/
+    # breakout setups the algo targets. Measured band-agnostically as float % of
+    # shares-outstanding (a low % = constrained supply; a ~100% = everything
+    # freely tradeable). Small + positive-only, capped +5 (under trend +18 / RS
+    # +8) so it can't dominate or collapse the ranking. USE-IF-PRESENT: needs
+    # both float + shares-out (the caller leaves _has_float_pct False otherwise)
+    # → 0 contribution. Anti-double-count: a thin name is already removed by the
+    # liquidity GATE, so float only nudges names that PASSED that gate; it
+    # measures SUPPLY (shares locked up), distinct from avg$vol (traded value)
+    # and RVOL (today vs normal). Kept small for that overlap.
+    if features.get('_fund_has_float_pct'):
+        _flp = features['fund_float_pct']
+        if _flp <= 30.0:
+            _add(+5, f'float: tight ({_flp:.0f}% of shares free) — amplifier')
+        elif _flp <= 50.0:
+            _add(+3, f'float: low ({_flp:.0f}% of shares free)')
+        elif _flp <= 70.0:
+            _add(+1, f'float: moderate ({_flp:.0f}% of shares free)')
+        # >70% (most shares freely tradeable) → 0, no amplifier.
+
+    # ── Tier-3 SHORT INTEREST (v4.14.6.111): squeeze-fuel, TAPERED ──
+    # Design choice (Mike-tunable): reward the MODERATE-HIGH short-% band as
+    # squeeze fuel (shorts must cover into a breakout → adds buying), but TAPER
+    # BACK TO 0 at EXTREME short% — extreme short interest is genuine bearish
+    # conviction (a value-trap / trouble flag), NOT a green light, so we do NOT
+    # lavish points there. Positive-only, small cap +3 (< float +5, well under
+    # trend/RS) — short interest is LAGGED (FINRA bi-monthly, gated by the
+    # staleness guard in normalize_features) + ambiguous, so it's a gentle nudge,
+    # not a driver. USE-IF-PRESENT: missing/stale → 0. Anti-double-count vs float
+    # (both are small-cap supply structure): kept small so float+short can't
+    # stack into an outsized structure bonus on the same name.
+    if features.get('_fund_has_short_pct'):
+        _sip = features['fund_short_pct_float']   # percent (0-100)
+        if 10.0 <= _sip <= 20.0:
+            _add(+3, f'short interest: {_sip:.0f}% of float (squeeze-fuel band)')
+        elif 5.0 <= _sip < 10.0:
+            _add(+1, f'short interest: {_sip:.0f}% of float (elevated)')
+        elif 20.0 < _sip <= 40.0:
+            _add(+1, f'short interest: {_sip:.0f}% of float (high — tapering)')
+        # <5% (normal) → 0; >40% (extreme = red flag, not fuel) → 0.
 
     # Knife-block flag: set when oversold is meaningless because we're
     # in a falling structure with no reversal sign. Fed into the
@@ -1288,11 +1723,20 @@ def score_for_promotion(features: dict) -> tuple[float, list[str]]:
     features['_enrich_factors_present'] = tuple(_enrich_factors_present)
     features['_enrich_factors_available'] = tuple(_enrich_factors_available)
 
+    # v4.14.6.111 (display-only): stash the per-signal breakdown for the emit.
+    # _score_preclamp is captured BEFORE the clamp so a 100 that would have been
+    # 112 is visible as clamped (useful for the anti-flatten audit).
+    features['_score_base'] = NEUTRAL_BASELINE
+    features['_score_contribs'] = contribs
+    features['_score_preclamp'] = ts
+
     # Clamp.
     if ts < SCORE_MIN:
         ts = SCORE_MIN
     elif ts > SCORE_MAX:
         ts = SCORE_MAX
+    features['_score_clamped'] = (
+        round(ts, 2) != round(features['_score_preclamp'], 2))
 
     return round(ts, 2), reasons
 

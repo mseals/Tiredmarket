@@ -1456,6 +1456,437 @@ def compute_per_model_stats(predictions_log,
     return out
 
 
+# v4.14.6.111 (non-BUY AVOID axis, Phase 1): grade AVOID-class votes by ABSOLUTE
+# DECLINE over a fixed horizon (rule A1, Mike-confirmed). An AVOID is "correct"
+# if the close is LOWER ~AVOID_HORIZON_TD trading days after the call than at the
+# call — i.e. avoiding it was right because it fell. NOT using the row's
+# target/stop (unreliable parse artifacts for non-BUY). HOLD is deferred
+# (Phase 2, needs the H1/H2/H3 choice); WATCH is coverage-only, never scored.
+AVOID_HORIZON_TD = 20                         # trading days from the call date
+_AVOID_CLASS = {'AVOID', 'TRIM', 'SELL'}      # same downside expectation
+_AVOID_CLOSED = {'avoid_correct', 'avoid_incorrect'}   # decided outcomes
+
+
+def _avoid_outcome(bars, call_ts, horizon_td=AVOID_HORIZON_TD):
+    """A1 absolute-decline grade for an AVOID-class vote.
+
+    bars: ascending list of {'date','close'} for the ticker (from cache.db).
+    Returns (status, close_call, close_horizon):
+      'avoid_correct'   — close FELL over the horizon (avoiding it was right)
+      'avoid_incorrect' — close rose OR was flat (>= the call price)
+      'undecided'       — fewer than horizon_td bars exist after the call bar
+                          (not enough time elapsed) or no usable bar at the call
+    Strict '< call price' = correct (flat counts as incorrect — simplest, and a
+    flat name was not a decline). Never raises."""
+    if not bars:
+        return ('undecided', None, None)
+    cd = str(call_ts)[:10]
+    idx = -1
+    for i, b in enumerate(bars):
+        if str(b.get('date'))[:10] <= cd:
+            idx = i
+        else:
+            break
+    if idx < 0:
+        return ('undecided', None, None)
+    j = idx + int(horizon_td)
+    if j >= len(bars):
+        return ('undecided', None, None)   # < horizon_td trading days elapsed
+    try:
+        c0 = float(bars[idx]['close'])
+        c1 = float(bars[j]['close'])
+    except (TypeError, ValueError, KeyError):
+        return ('undecided', None, None)
+    if c0 <= 0 or c1 <= 0:
+        return ('undecided', None, None)
+    return (('avoid_correct' if c1 < c0 else 'avoid_incorrect'), c0, c1)
+
+
+# v4.14.6.111 (HOLD axis, tolerant): owned-position HOLD = "still expect upside
+# but near target — keep, don't add" (the redefined prompt meaning). Graded
+# TOLERANTLY: correct if the price HELD or ROSE over the horizon (>= call ×
+# (1 − flat_tol)), wrong only if it FELL below that band — a near-target HOLD is
+# expected to flatten, so "held = correct" is the right rule, not a fudge.
+HOLD_HORIZON_TD = 20
+HOLD_FLAT_TOL = 0.02                           # ±2% = "held"
+_HOLD_CLOSED = {'hold_correct', 'hold_incorrect'}
+# OLD-VOTES BOUNDARY: HOLDs cast BEFORE this date were under the OLD "neutral"
+# prompt meaning — they are NOT scored on the room-left rule (it would grade old
+# votes against a rule they were never given). ISO date, lexicographic vs ts[:10].
+HOLD_RULE_EPOCH = '2026-06-27'
+
+
+def _hold_outcome(bars, call_ts, horizon_td=HOLD_HORIZON_TD,
+                  flat_tol=HOLD_FLAT_TOL):
+    """Tolerant HOLD grade — mirrors _avoid_outcome, FLIPPED + flat tolerance.
+    Returns (status, close_call, close_horizon):
+      'hold_correct'   — close HELD or ROSE (>= call × (1 − flat_tol))
+      'hold_incorrect' — close FELL below the flat tolerance
+      'undecided'      — < horizon_td bars after the call, or no usable bar.
+    Never raises."""
+    if not bars:
+        return ('undecided', None, None)
+    cd = str(call_ts)[:10]
+    idx = -1
+    for i, b in enumerate(bars):
+        if str(b.get('date'))[:10] <= cd:
+            idx = i
+        else:
+            break
+    if idx < 0:
+        return ('undecided', None, None)
+    j = idx + int(horizon_td)
+    if j >= len(bars):
+        return ('undecided', None, None)
+    try:
+        c0 = float(bars[idx]['close'])
+        c1 = float(bars[j]['close'])
+    except (TypeError, ValueError, KeyError):
+        return ('undecided', None, None)
+    if c0 <= 0 or c1 <= 0:
+        return ('undecided', None, None)
+    held = c1 >= c0 * (1.0 - flat_tol)
+    return (('hold_correct' if held else 'hold_incorrect'), c0, c1)
+
+
+def compute_per_model_stats_from_signals(
+        signals_path,
+        cache_db_path,
+        resolution_cache_path=None,
+        exclude_algo: bool = True) -> list[dict]:
+    """v4.14.6.111 READ-SIDE BRIDGE (BUY axis) — per-model accuracy from the FULL
+    signals.jsonl panel instead of the pruned predictions.jsonl.
+
+    signals.jsonl is append-only and never pruned, so it holds every per-model
+    vote across full history; predictions.jsonl (what compute_per_model_stats
+    reads) is eroded by _run_predictions_cleanup (non-BUY directions dropped) and
+    only carries per-model rows since builds 38/40. This bridge reads the
+    per_model_* signal rows, resolves each BUY vote via the SAME check_outcomes
+    logic against cache.db daily bars, and aggregates by model NAME.
+
+    BUY axis only: BUY votes are scored (target_hit / stop_hit / open / expired /
+    unresolved). NON-BUY votes (HOLD/WATCH/AVOID/...) are COUNTED per model
+    (coverage) but NOT scored — a direction-vs-move axis is a later build.
+
+    READ-ONLY: touches neither predictions.jsonl, the pruner, nor the consensus-
+    verdict scoring. Returns the SAME shape as compute_per_model_stats (so the
+    Track Record matrix render is unchanged) plus 'unresolved' and 'non_buy_count'.
+
+    Resolution cache (resolution_cache_path, a small json keyed by
+    'TICKER|ts|model'): CLOSED outcomes (target/stop/expired) are final and
+    reused; OPEN / not-yet-cached rows are re-resolved each call. So the first
+    open resolves the backlog once; later opens only re-touch still-open rows.
+
+    Never raises — returns [] on any structural failure (caller can fall back)."""
+    import json as _json
+    import os as _os
+    import sqlite3 as _sqlite
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    from collections import Counter as _Counter, defaultdict as _dd
+
+    _CLOSED = {'target_hit', 'stop_hit', 'expired'}
+
+    def _num(v):
+        if v is None:
+            return None
+        try:
+            return float(str(v).replace('$', '').replace(',', '').strip())
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        # 1. read per_model_* signal rows, dedup by (ticker, ts, model)
+        raw = []
+        try:
+            with open(signals_path, encoding='utf-8') as f:
+                for ln in f:
+                    if 'per_model' not in ln:
+                        continue
+                    try:
+                        d = _json.loads(ln)
+                    except Exception:
+                        continue
+                    if d.get('kind') not in (
+                            'per_model_owned', 'per_model_fresh_buy'):
+                        continue
+                    raw.append(d)
+        except FileNotFoundError:
+            return []
+        seen = set()
+        rows = []
+        for d in raw:
+            model = (d.get('model') or '').strip()
+            if not model:
+                continue
+            if exclude_algo and model.lower() in ('algorithm', 'algo'):
+                continue
+            key = ((d.get('ticker') or '').upper(), d.get('ts') or '',
+                   model.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(d)
+
+        # 2. resolution cache (json: 'TICKER|ts|model' -> status)
+        rcache = {}
+        if resolution_cache_path and _os.path.exists(resolution_cache_path):
+            try:
+                with open(resolution_cache_path, encoding='utf-8') as f:
+                    rcache = _json.load(f) or {}
+            except Exception:
+                rcache = {}
+
+        # cache.db daily bars (per-ticker memo)
+        conn = _sqlite.connect(cache_db_path)
+        _bars = {}
+
+        def _ticker_bars(t):
+            if t not in _bars:
+                try:
+                    cur = conn.execute(
+                        'SELECT date, high, low, close FROM daily_bars '
+                        'WHERE ticker=? ORDER BY date', (t,))
+                    _bars[t] = [
+                        {'date': r[0], 'high': r[1], 'low': r[2],
+                         'close': r[3]}
+                        for r in cur.fetchall() if r[3] is not None]
+                except Exception:
+                    _bars[t] = []
+            return _bars[t]
+
+        def history_fn(t):
+            return _ticker_bars(t)
+
+        def quote_fn(t):
+            b = _ticker_bars(t)
+            return {'price': b[-1]['close']} if b else None
+
+        # 3. partition BUY rows: cached-closed vs needs-resolve vs unresolvable;
+        #    count NON-BUY per model.
+        buy_results = []        # (model, status)
+        non_buy = _Counter()
+        to_resolve = []         # scratch prediction rows
+        # v4.14.6.111 AVOID axis: AVOID-class rows collected here (counted in
+        # non_buy too, so non_buy_count stays byte-identical). Distinct cache
+        # key suffix '|avoid' → never collides with the BUY cache entries.
+        avoid_results = []      # (model, status)
+        avoid_to_resolve = []   # (model, ticker, ts, avoid_cache_key)
+        # v4.14.6.111 HOLD axis: owned-position HOLD votes (tolerant, post-rule).
+        # Distinct cache key '|hold' → no collision with BUY/AVOID.
+        hold_results = []       # (model, status)
+        hold_to_resolve = []    # (model, ticker, ts, hold_cache_key)
+        hold_pre_rule = _Counter()  # old neutral HOLDs (pre-epoch) — excluded
+        for d in rows:
+            model = (d.get('model') or '').strip()
+            direction = (d.get('direction') or '').strip().upper()
+            if direction != 'BUY':
+                non_buy[model] += 1
+                if direction in _AVOID_CLASS:
+                    a_ticker = (d.get('ticker') or '').upper()
+                    a_ts = d.get('ts') or ''
+                    ack = f'{a_ticker}|{a_ts}|{model.lower()}|avoid'
+                    a_cached = rcache.get(ack)
+                    if a_cached in _AVOID_CLOSED:
+                        avoid_results.append((model, a_cached))
+                    else:
+                        avoid_to_resolve.append((model, a_ticker, a_ts, ack))
+                elif (direction == 'HOLD'
+                        and d.get('kind') == 'per_model_owned'):
+                    h_ts = d.get('ts') or ''
+                    if h_ts[:10] >= HOLD_RULE_EPOCH:
+                        # post-redefinition → score on the room-left rule
+                        h_ticker = (d.get('ticker') or '').upper()
+                        hck = f'{h_ticker}|{h_ts}|{model.lower()}|hold'
+                        h_cached = rcache.get(hck)
+                        if h_cached in _HOLD_CLOSED:
+                            hold_results.append((model, h_cached))
+                        else:
+                            hold_to_resolve.append((model, h_ticker, h_ts, hck))
+                    else:
+                        # pre-redefinition (OLD neutral meaning) → NOT scored
+                        hold_pre_rule[model] += 1
+                continue
+            ticker = (d.get('ticker') or '').upper()
+            ts = d.get('ts') or ''
+            tgt = _num(d.get('target'))
+            stp = _num(d.get('stop_loss'))
+            ck = f'{ticker}|{ts}|{model.lower()}'
+            if tgt is None or stp is None or not _ticker_bars(ticker):
+                # no levels or no bars → genuinely unresolvable (NOT a miss)
+                buy_results.append((model, 'unresolved'))
+                continue
+            cached = rcache.get(ck)
+            if cached in _CLOSED:
+                buy_results.append((model, cached))
+                continue
+            to_resolve.append({
+                'id': ck, 'ticker': ticker, 'model': model,
+                'direction': 'BUY', 'target': tgt, 'stop': stp,
+                'timeframe_days': d.get('timeframe_days'),
+                'timestamp': ts, 'path': d.get('path') or '',
+                'status': OUTCOME_OPEN, 'closed_at': None,
+                'close_price': None, 'notes': '',
+            })
+
+        # 4. resolve the to-do set via check_outcomes (scratch log, no writes to
+        #    the real predictions.jsonl)
+        if to_resolve:
+            tmp_path = _os.path.join(
+                _tempfile.gettempdir(), '_tm_readbridge_scratch.jsonl')
+            try:
+                with open(tmp_path, 'w', encoding='utf-8'):
+                    pass
+                scratch = PredictionsLog(_Path(tmp_path))
+                scratch._cache = [dict(r) for r in to_resolve]
+                try:
+                    scratch.check_outcomes(quote_fn, history_fn=history_fn)
+                except Exception:
+                    pass
+                for cp in scratch._cache:
+                    st = (cp.get('status') or OUTCOME_OPEN)
+                    buy_results.append((cp.get('model'), st))
+                    if st in _CLOSED:
+                        rcache[cp.get('id')] = st  # final, cache it
+            finally:
+                try:
+                    _os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        # 4b. resolve the AVOID-class backlog via the price-walk (A1 absolute
+        #     decline, 20td). Runs BEFORE conn.close() since _ticker_bars uses
+        #     the connection. Closed (decided) outcomes are cached under the
+        #     '|avoid' key; undecided (<20td elapsed) re-resolve next open.
+        for (a_model, a_ticker, a_ts, ack) in avoid_to_resolve:
+            a_st, _c0, _c1 = _avoid_outcome(_ticker_bars(a_ticker), a_ts)
+            avoid_results.append((a_model, a_st))
+            if a_st in _AVOID_CLOSED:
+                rcache[ack] = a_st
+
+        # v4.14.6.111 HOLD axis: resolve the (post-rule) HOLD backlog tolerantly.
+        for (h_model, h_ticker, h_ts, hck) in hold_to_resolve:
+            h_st, _hc0, _hc1 = _hold_outcome(_ticker_bars(h_ticker), h_ts)
+            hold_results.append((h_model, h_st))
+            if h_st in _HOLD_CLOSED:
+                rcache[hck] = h_st
+
+        conn.close()
+
+        # persist the resolution cache (closed outcomes only matter)
+        if resolution_cache_path:
+            try:
+                with open(resolution_cache_path, 'w', encoding='utf-8') as f:
+                    _json.dump(rcache, f)
+            except Exception:
+                pass
+
+        # 5. aggregate by model NAME — same shape as compute_per_model_stats
+        agg = _dd(lambda: {'target_hits': 0, 'stop_hits': 0, 'expired': 0,
+                           'open': 0, 'unresolved': 0, 'buy_total': 0})
+        for model, st in buy_results:
+            a = agg[model]
+            a['buy_total'] += 1
+            if st == 'target_hit':
+                a['target_hits'] += 1
+            elif st == 'stop_hit':
+                a['stop_hits'] += 1
+            elif st == 'expired':
+                a['expired'] += 1
+            elif st == 'unresolved':
+                a['unresolved'] += 1
+            else:
+                a['open'] += 1
+
+        # v4.14.6.111 AVOID axis: aggregate AVOID-class outcomes per model NAME.
+        avoid_agg = _dd(lambda: {'correct': 0, 'incorrect': 0, 'undecided': 0})
+        for model, st in avoid_results:
+            aa = avoid_agg[model]
+            if st == 'avoid_correct':
+                aa['correct'] += 1
+            elif st == 'avoid_incorrect':
+                aa['incorrect'] += 1
+            else:
+                aa['undecided'] += 1
+
+        # v4.14.6.111 HOLD axis aggregation (tolerant, post-rule only).
+        hold_agg = _dd(lambda: {'correct': 0, 'incorrect': 0, 'undecided': 0})
+        for model, st in hold_results:
+            hh = hold_agg[model]
+            if st == 'hold_correct':
+                hh['correct'] += 1
+            elif st == 'hold_incorrect':
+                hh['incorrect'] += 1
+            else:
+                hh['undecided'] += 1
+
+        out = []
+        for model in (set(agg) | set(non_buy)):
+            a = agg.get(model, {'target_hits': 0, 'stop_hits': 0,
+                                'expired': 0, 'open': 0, 'unresolved': 0,
+                                'buy_total': 0})
+            nb = int(non_buy.get(model, 0))
+            decided = a['target_hits'] + a['stop_hits']
+            # AVOID axis (separate metric — never merged into BUY accuracy).
+            aa = avoid_agg.get(model, {'correct': 0, 'incorrect': 0,
+                                       'undecided': 0})
+            avoid_decided = aa['correct'] + aa['incorrect']
+            avoid_pct = ((aa['correct'] / avoid_decided * 100)
+                         if avoid_decided else 0.0)
+            # HOLD axis (separate metric — tolerant held-or-rose, post-rule).
+            hh = hold_agg.get(model, {'correct': 0, 'incorrect': 0,
+                                      'undecided': 0})
+            hold_decided = hh['correct'] + hh['incorrect']
+            hold_pct = ((hh['correct'] / hold_decided * 100)
+                        if hold_decided else 0.0)
+            # unresolved rows are EXCLUDED from the rate denominator (a vote we
+            # can't resolve is not a miss).
+            tr = (a['target_hits'] / decided * 100) if decided else 0.0
+            sr = (a['stop_hits'] / decided * 100) if decided else 0.0
+            out.append({
+                'model': model,
+                'total': a['buy_total'] + nb,
+                'directions': {'BUY': a['buy_total'], 'non_BUY': nb},
+                'confidences': {},
+                'closed': decided + a['expired'],
+                'target_hits': a['target_hits'],
+                'stop_hits': a['stop_hits'],
+                'expired': a['expired'],
+                'open': a['open'],
+                'target_hit_rate_pct': tr,
+                'stop_hit_rate_pct': sr,
+                'decided': decided,
+                'superseded': 0,
+                'contradicted': 0,
+                'retract_rate_pct': 0.0,
+                'has_meaningful_outcomes': decided >= 5,
+                # bridge extras (additive — old consumers ignore them)
+                'unresolved': a['unresolved'],
+                'non_buy_count': nb,
+                # v4.14.6.111 AVOID axis (Phase 1) — SEPARATE metric from BUY.
+                'avoid_decided': avoid_decided,
+                'avoid_correct': aa['correct'],
+                'avoid_incorrect': aa['incorrect'],
+                'avoid_undecided': aa['undecided'],
+                'avoid_correct_pct': avoid_pct,
+                'avoid_has_meaningful': avoid_decided >= 5,
+                # v4.14.6.111 HOLD axis (tolerant held-or-rose; post-rule only;
+                # old neutral-HOLDs counted in hold_pre_rule, NOT scored).
+                'hold_decided': hold_decided,
+                'hold_correct': hh['correct'],
+                'hold_incorrect': hh['incorrect'],
+                'hold_undecided': hh['undecided'],
+                'hold_pre_rule': int(hold_pre_rule.get(model, 0)),
+                'hold_correct_pct': hold_pct,
+                'hold_has_meaningful': hold_decided >= 5,
+                'source': 'signals_bridge',
+            })
+        out.sort(key=lambda e: -e['total'])
+        return out
+    except Exception:
+        return []
+
+
 def list_consensus_scan_ids(predictions_log,
                               hours: int = 168) -> list[dict]:
     """v4.9.1: Find distinct consensus scan IDs in the predictions log,
@@ -2563,6 +2994,38 @@ CONFIDENCE_MODERATE = "MODERATE"
 CONFIDENCE_HIGH = "HIGH"
 
 # Prediction outcome statuses
+# v4.14.6.111: exclude the tier-1 algo signal funnel (model=='Algorithm') from
+# the prediction-ACCURACY headline (OVERALL/per-path/per-confidence). Default ON;
+# cfg['exclude_algo_from_accuracy']=False restores the prior algo-included rate.
+# Set from cfg at startup + on Settings save (tired_market). DISPLAY-ONLY — the
+# per-model comparison matrix (compute_per_model_stats) and the source-weight
+# learning bridge are NOT affected (algo stays in the matrix; learning already
+# ignores unregistered 'Algorithm').
+_EXCLUDE_ALGO_FROM_ACCURACY = True
+
+
+def set_exclude_algo_from_accuracy(enabled: bool) -> None:
+    """Module gate for excluding algo rows from the accuracy headline."""
+    global _EXCLUDE_ALGO_FROM_ACCURACY
+    _EXCLUDE_ALGO_FROM_ACCURACY = bool(enabled)
+
+
+def _is_algo_row(p) -> bool:
+    """True for a tier-1 algo signal-funnel prediction. model=='Algorithm' is the
+    primary marker (set only by the algo writer); source=='algo_tier1' /
+    canonical_model=='algo' are secondary guards for rows missing 'model'."""
+    try:
+        if str((p or {}).get('model') or '').strip().lower() == 'algorithm':
+            return True
+        if str((p or {}).get('source') or '').strip().lower() == 'algo_tier1':
+            return True
+        if str((p or {}).get('canonical_model') or '').strip().lower() == 'algo':
+            return True
+    except Exception:
+        pass
+    return False
+
+
 OUTCOME_OPEN = "open"               # still in window
 OUTCOME_TARGET_HIT = "target_hit"   # price reached target before stop/expiry
 OUTCOME_STOP_HIT = "stop_hit"       # price reached stop before target
@@ -3176,6 +3639,112 @@ def parse_prediction(text: str, ticker: str, current_price: float | None = None)
         pred['earnings_importance'] = None
 
     return pred
+
+
+# ── v4.14.6.111 AI price-target aggregate (shared helper) ──────────────────
+# Replaces the misleading ALGO/ATR "best case" on the cards with the AI
+# consensus's own targets. The algo is a SCREENER (price+4*ATR), not a
+# predictor; its ATR math must never be presented as a price expectation. The
+# number the user acts on comes from the JUDGE (the models), aggregated here.
+# OPTION A: the models ALREADY emit "TARGET: $X.XX" and it's already parsed by
+# parse_prediction() above — this is pure parse + aggregate, zero added tokens.
+
+def _coerce_vote_target(vote, ticker=None):
+    """One model's NUMERIC price target from a consensus vote OR a per-model
+    prediction record, or None if it gave no usable number. Bearish votes
+    (AVOID/SELL) carry no bullish target -> None. Never zero-fills: a missing /
+    "?" / declined target is None, never 0."""
+    d = (vote.get('direction') or '').upper()
+    if d in ('AVOID', 'SELL'):
+        return None
+    t = vote.get('target')
+    if isinstance(t, bool):
+        return None
+    if isinstance(t, (int, float)):
+        return float(t) if t and t > 0 else None
+    if isinstance(t, str) and t.strip():
+        s = t.replace('$', '').replace(',', '').strip()
+        try:
+            val = float(s)
+            return val if val > 0 else None
+        except ValueError:
+            pass
+    # Fall back to re-parsing the raw response (the robust, None-safe path).
+    txt = vote.get('response') or vote.get('raw_text') or ''
+    if txt:
+        try:
+            pt = parse_prediction(txt, ticker or vote.get('ticker') or '').get('target')
+            return float(pt) if (pt and pt > 0) else None
+        except Exception:
+            return None
+    return None
+
+
+def _is_real_vote(vote):
+    """A model that actually weighed in (has a direction or a response), not an
+    error/skipped slot. Used to count M = models that voted."""
+    if not isinstance(vote, dict):
+        return False
+    if vote.get('error') or vote.get('skipped'):
+        return False
+    return bool(vote.get('direction')) or bool(vote.get('response') or vote.get('raw_text'))
+
+
+def aggregate_ai_target(votes, current_price=None, ticker=None, spread_pct=0.25):
+    """Pure responders-only aggregate of per-model AI price targets (Mike's spec).
+
+    Rules:
+      - average ONLY the models that returned a NUMBER; exclude "?"/declines/
+        bearish votes (never zero-fill);
+      - NO FLOOR (n >= 1 is enough to return a target);
+      - report N of M (M = models that voted, N = those that gave a number);
+      - WIDE-SPREAD guard: if the numeric targets disagree widely, use the MEDIAN
+        instead of the mean. "Widely" = (high - low) > spread_pct * the
+        RESPONDERS' MEAN target. This measures disagreement AMONG the targets
+        themselves, so it is count- AND price-independent (Mike: "independent of
+        count") and matches his settled examples: a tight cluster 12/13/15
+        (spread 3 = 22.5% of the 13.33 mean < 25%) → MEAN 13.33; a 2x
+        disagreement 7/14 (spread 7 = 67% > 25%) → MEDIAN. (Substitution noted
+        for Mike: his words were "~20% of price"; measuring vs the mean target —
+        not the current price — is what makes BOTH his A/B examples come out as
+        he wrote them, and keeps the guard scale-free. spread_pct is the single
+        tunable knob; current_price is accepted for API parity but not used by
+        the guard.)
+      - if NO model gave a number (n == 0) return a no-target result so the card
+        shows NOTHING (the caller must NOT fall back to the algo number).
+
+    Pure / stateless: no I/O, no provider calls, no re-ask. `votes` may be live
+    consensus vote dicts (carrying 'response'/'target'/'direction') or per-model
+    prediction records (numeric 'target'). The CALLER excludes algo/ATR rows
+    before calling (the algo target must never enter the AI aggregate).
+
+    Returns {target, low, high, n, m, spread_wide, method}; target/low/high are
+    None when n == 0; method is 'mean' | 'median' | None.
+    """
+    reals = [v for v in (votes or []) if _is_real_vote(v)]
+    m = len(reals)
+    nums = []
+    for v in reals:
+        t = _coerce_vote_target(v, ticker)
+        if t is not None:
+            nums.append(t)
+    n = len(nums)
+    if n == 0:
+        return {'target': None, 'low': None, 'high': None,
+                'n': 0, 'm': m, 'spread_wide': False, 'method': None}
+    low, high = min(nums), max(nums)
+    mean_t = sum(nums) / n
+    spread_wide = bool(mean_t and (high - low) > spread_pct * mean_t)
+    if spread_wide:
+        srt = sorted(nums)
+        mid = n // 2
+        central = srt[mid] if (n % 2) else (srt[mid - 1] + srt[mid]) / 2.0
+        method = 'median'
+    else:
+        central = sum(nums) / n
+        method = 'mean'
+    return {'target': central, 'low': low, 'high': high,
+            'n': n, 'm': m, 'spread_wide': spread_wide, 'method': method}
 
 
 def _classify_sold_outcome(p: dict) -> str:
@@ -4312,12 +4881,14 @@ class PredictionsLog:
         """Walk through open predictions and update any that have hit
         target / stop / expired. Returns list of updated entries.
 
-        v4.13.15: WICK-AWARE evaluation. If history_fn is provided, it
-        is used to get daily OHLC candles (returning a list of dicts
-        with 'date', 'close' fields, sorted oldest-first). Target/stop
-        hits then require a DAILY CLOSE beyond the level, not just
-        an intraday wick. Falls back to spot quote_fn if history_fn
-        not provided (legacy behavior, less accurate).
+        v4.13.15: CLOSE-ONLY evaluation (wick-guarded by design). If
+        history_fn is provided, it is used to get daily candles
+        (returning a list of dicts with 'date', 'close' fields, sorted
+        oldest-first). Target/stop hits require a DAILY CLOSE beyond the
+        level; intraday high/low are deliberately NOT considered, so an
+        unreachable wick that fades by the close is never counted as a
+        hit or stop. Falls back to spot quote_fn if history_fn not
+        provided (legacy behavior, less accurate).
 
         v4.13.15: Per-path expiration fallback. If prediction has no
         timeframe_days, falls back to PATH_EXPIRATION_DAYS based on
@@ -4341,7 +4912,7 @@ class PredictionsLog:
             open_by_ticker.setdefault(t, []).append(p)
 
         for ticker, preds in open_by_ticker.items():
-            # Try to get daily history for wick-aware evaluation
+            # Try to get daily history for close-only evaluation
             history = None
             if history_fn is not None:
                 try:
@@ -4373,7 +4944,8 @@ class PredictionsLog:
                 close_price_for_record = current_price
 
                 if direction == DIRECTION_BUY:
-                    # Wick-aware path: walk daily candles since made_at
+                    # Close-only path: walk daily candles since made_at
+                    # (daily CLOSE vs level; intraday wicks ignored)
                     if history and isinstance(history, list):
                         for candle in history:
                             try:
@@ -4433,7 +5005,7 @@ class PredictionsLog:
                     # in its band. A target OR stop breach means HOLD was
                     # the wrong call (BUY or SELL would have done better) →
                     # hold_broken. Surviving to expiry → hold_held (in the
-                    # expiry block below). Same wick-aware walk as BUY.
+                    # expiry block below). Same close-only walk as BUY.
                     if history and isinstance(history, list):
                         for candle in history:
                             try:
@@ -4489,7 +5061,7 @@ class PredictionsLog:
                     # position." Soft-bearish, so correct on a decline (stop)
                     # or an in-band plateau (graded at expiry below); wrong
                     # only if the price SURGES past target (the upside the
-                    # user gave up by trimming). Same wick-aware daily-close
+                    # user gave up by trimming). Same close-only daily-close
                     # walk as BUY/HOLD; target is checked first so a surge
                     # registers as incorrect.
                     if history and isinstance(history, list):
@@ -4548,7 +5120,7 @@ class PredictionsLog:
                     # reached → correct, stop reached → incorrect. Expiring
                     # in-band is INCONCLUSIVE (OUTCOME_EXPIRED below), not a
                     # loss — neither the added conviction nor the doubt was
-                    # confirmed. Same wick-aware walk as BUY.
+                    # confirmed. Same close-only walk as BUY.
                     if history and isinstance(history, list):
                         for candle in history:
                             try:
@@ -5259,7 +5831,24 @@ class PredictionsLog:
     def _compute_stats_dict(self, preds: list[dict]) -> dict:
         """Helper: turn a filtered prediction list into a stats dict.
         Same return shape as aggregate_stats. Factored out so
-        compute_all_stats can re-use it without re-filtering."""
+        compute_all_stats can re-use it without re-filtering.
+
+        v4.14.6.111: when _EXCLUDE_ALGO_FROM_ACCURACY is on (default), tier-1
+        algo signal-funnel rows (model=='Algorithm') are skipped here so the
+        OVERALL / per-path / per-confidence headline reflects only reasoned
+        tier-2 AI calls. The algo is a candidate funnel, not a reasoned
+        predictor; counting its fast-resolving flags dominated and distorted the
+        rate. DISPLAY-ONLY and deliberately NOT routed through is_attributable
+        (which the per-model matrix + the source-weight learning bridge share),
+        so algo STAYS in the comparison matrix and no learning behavior changes.
+        cfg['exclude_algo_from_accuracy']=False restores the algo-included rate."""
+        # v4.14.6.111: drop algo funnel rows UP FRONT (when enabled) so EVERY
+        # count below — total / open / closed / decided — is consistently
+        # reasoned-only. (Filtering only inside the loop would leave `total` and
+        # thus `open` counting the algo rows, inflating the "reasoned calls still
+        # open" message.) Flag OFF -> no filter -> prior algo-included behavior.
+        if _EXCLUDE_ALGO_FROM_ACCURACY:
+            preds = [p for p in preds if not _is_algo_row(p)]
         total = len(preds)
         n_closed = 0
         n_target = 0
@@ -5921,9 +6510,11 @@ def format_track_record_context(prediction_log: PredictionsLog,
                       f"({_retr} predictions superseded/contradicted by "
                       f"re-analysis before price could rule — these do NOT "
                       f"count against the hit rate)")
-    lines.append("- NOTE: stop_hit on a paper prediction means price "
-                  "*touched* stop intraday; many of those would have "
-                  "recovered. Do NOT read this as the user losing trades.")
+    lines.append("- NOTE: resolution is close-only — stop_hit means a daily "
+                  "CLOSE finished at or below the stop (a completed loss; "
+                  "intraday wicks alone do not count), and target_hit means a "
+                  "daily CLOSE at or above target. These are auto-tracked paper "
+                  "predictions, not the user's executed trades.")
 
     if ticker:
         ticker_recent = prediction_log.get_recent_for_ticker(ticker, limit=3)

@@ -204,7 +204,7 @@ class GossipRemovalTask(Task):
       - row whose published_at is within GOSSIP_RECENT_DAYS
 
     Plus the 8 known MAMA test rows from 2026-06-12T19:07:24 (added by
-    Claude's smoke test before v4.14.6.22 shipped) are explicitly
+    the smoke test before v4.14.6.22 shipped) are explicitly
     targeted via a separate rule.
 
     Dry-run produces per-ticker counts + sample headlines especially for
@@ -310,7 +310,7 @@ class GossipRemovalTask(Task):
         return per_ticker
 
     def _gather_mama_test(self, app):
-        """The 8 specific MAMA test rows from Claude's pre-v4.14.6.22
+        """The 8 specific MAMA test rows from the pre-v4.14.6.22
         smoke test."""
         try:
             tm_db = _open_tired_market_db(app)
@@ -347,7 +347,7 @@ class GossipRemovalTask(Task):
         if mama_test:
             m['notes'].append(
                 f"Plus {len(mama_test)} known MAMA test rows from "
-                f"{self._MAMA_TEST_TS} (Claude's pre-v4.14.6.22 smoke "
+                f"{self._MAMA_TEST_TS} (pre-v4.14.6.22 smoke "
                 f"test).")
             total_rows += len(mama_test)
         m['would_remove'] = total_rows

@@ -419,6 +419,34 @@ def init_cache_db(db_path: Path | str | None = None) -> sqlite3.Connection:
                             f"ALTER TABLE fundamentals ADD COLUMN {_qc} REAL")
             except Exception:
                 pass
+            # v4.14.6.111 (Tier-2 float): true tradeable float — already in the
+            # Yahoo .info response, previously discarded. Same idempotent ADD
+            # COLUMN pattern; backfill NULL, scorer reads USE-IF-PRESENT (absent
+            # → 0 contribution, never a penalty), next fundamentals fetch fills it.
+            try:
+                _fcols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(fundamentals)")}
+                if 'float_shares' not in _fcols:
+                    conn.execute(
+                        "ALTER TABLE fundamentals ADD COLUMN float_shares INTEGER")
+            except Exception:
+                pass
+            # v4.14.6.111 (Tier-3 short interest): short % of float (key squeeze
+            # field) + the FINRA settlement date (epoch, for the staleness/lag
+            # guard) — already in the Yahoo .info response, previously discarded.
+            # Same idempotent ADD COLUMN pattern; backfill NULL, scorer reads
+            # USE-IF-PRESENT (absent/stale → 0 contribution, never a penalty).
+            try:
+                _scols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(fundamentals)")}
+                if 'short_percent_float' not in _scols:
+                    conn.execute("ALTER TABLE fundamentals "
+                                 "ADD COLUMN short_percent_float REAL")
+                if 'date_short_interest' not in _scols:
+                    conn.execute("ALTER TABLE fundamentals "
+                                 "ADD COLUMN date_short_interest INTEGER")
+            except Exception:
+                pass
             # v4.14.6.25-sec-name-bootstrap: ensure the cik column
             # exists on tickers so the SEC bulk bootstrap can fill it
             # alongside the name. Already present in the original
@@ -464,6 +492,24 @@ def init_cache_db(db_path: Path | str | None = None) -> sqlite3.Connection:
                     conn.execute(
                         "ALTER TABLE cache_metadata "
                         "ADD COLUMN fundfile_index_cursor TEXT")
+            except Exception:
+                pass
+            # v4.14.6.111-last-attempted-filing: additive `last_attempted_filing`
+            # column. Stores the most-recent EDGAR filing_date the fundamentals
+            # daemon already TRIED to ingest for (ticker, lane='fundamentals').
+            # The index-diff re-queue gate compares against
+            # MAX(have_to_period, last_attempted_filing), so a filing we already
+            # attempted — even when the adapter could only extract an OLD period
+            # (have_to_period frozen for delinquent/foreign-20-F/amended filers)
+            # — is NOT re-queued until a genuinely NEWER filing appears. Same
+            # idempotent PRAGMA-check + swallowed-exception pattern as above.
+            try:
+                _cmcols3 = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(cache_metadata)")}
+                if 'last_attempted_filing' not in _cmcols3:
+                    conn.execute(
+                        "ALTER TABLE cache_metadata "
+                        "ADD COLUMN last_attempted_filing TEXT")
             except Exception:
                 pass
             for stmt in _CREATE_INDEXES:
@@ -769,6 +815,12 @@ _FUNDAMENTALS_COLS = [
     "ticker", "fiscal_period_end", "revenue", "net_income", "eps",
     "gross_margin", "operating_margin", "total_assets", "total_liabilities",
     "shares_outstanding", "source",
+    # v4.14.6.111 (Tier-2 float): true tradeable float (Yahoo .info), used by
+    # the algo low-float score contribution. USE-IF-PRESENT (NULL → 0).
+    "float_shares",
+    # v4.14.6.111 (Tier-3 short interest): short % of float + FINRA settlement
+    # date (epoch, for the lag guard). USE-IF-PRESENT (NULL/stale → 0).
+    "short_percent_float", "date_short_interest",
     # v4.14.6.25-fundamentals-row-fetched-at: per-row ingestion stamp.
     # `_upsert_many` reads each row dict via row.get(col); callers that
     # don't pass `fetched_at` leave it NULL (legacy-safe). The
@@ -1349,6 +1401,10 @@ _CACHE_META_FIELDS = {
     # the global sentinel row ticker='__INDEX_CURSOR__',
     # lane='fundamentals').
     "fundfile_index_cursor",
+    # v4.14.6.111-last-attempted-filing: most-recent EDGAR filing_date the
+    # fundamentals daemon already TRIED to ingest (drives the index-diff
+    # re-queue guard in tm_fundfile_fetcher).
+    "last_attempted_filing",
 }
 
 # v4.14.5.80-cache-metadata-hygiene: write-guard helpers.
@@ -1527,6 +1583,19 @@ def backfill_have_to_period() -> dict:
     after the first run."""
     conn = get_connection()
     try:
+        # v4.14.6.110: gate have_to_period backfill (skip when nothing to stamp).
+        # Cheap probe instead of a permanent marker: new tickers are stamped by
+        # the normal fundamentals write path, but a probe stays correct even if a
+        # NULL row ever reappears later. Uses idx_cache_metadata_lane; LIMIT 1
+        # early-exits — avoids the full NULL-SELECT + the informational COUNT(*)
+        # that ran every startup over the fundamentals-lane rows.
+        _probe = conn.execute(
+            "SELECT 1 FROM cache_metadata "
+            "WHERE lane='fundamentals' AND have_to_period IS NULL LIMIT 1"
+        ).fetchone()
+        if _probe is None:
+            return {'stamped': 0, 'no_period_left_null': 0,
+                    'already_filled_skipped': 0, 'skipped': True}
         # Tickers with NULL have_to_period that have rows in fundamentals
         cur = conn.execute(
             "SELECT cm.ticker, "
@@ -1562,7 +1631,8 @@ def backfill_have_to_period() -> dict:
             already = -1
         return {'stamped': stamped,
                 'no_period_left_null': no_period,
-                'already_filled_skipped': int(already)}
+                'already_filled_skipped': int(already),
+                'skipped': False}
     finally:
         try: conn.close()
         except Exception: pass

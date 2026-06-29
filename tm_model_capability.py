@@ -35,6 +35,9 @@ _CAPABILITY = {
     # ── scan-tier, smartest → dumbest ──
     'gpt-4o':                    {'rank': 2,  'tier': 'scan'},
     'gpt-oss-120b':              {'rank': 3,  'tier': 'scan'},
+    # Groq 2026-06-17 survivors (substring-matched: 'openai/gpt-oss-120b' etc.).
+    'gpt-oss-20b':               {'rank': 6,  'tier': 'scan'},
+    'qwen3.6-27b':               {'rank': 6,  'tier': 'scan'},
     'deepseek-v3.1':             {'rank': 4,  'tier': 'scan'},
     'llama-3.3-70b-versatile':   {'rank': 5,  'tier': 'scan'},
     'llama-3.3-70b':             {'rank': 5,  'tier': 'scan'},

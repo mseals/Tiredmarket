@@ -359,9 +359,22 @@ def _adapter_log(msg: str, color: str = 'muted') -> None:
     try:
         import tm_data_router as _r
         rt = _r.get_router()
-        if rt is not None:
+        if rt is not None and getattr(rt, '_log', None) is not None:
             rt._note(msg, color)
             return
+    except Exception:
+        pass
+    # v4.14.6.111: the router logger isn't wired during very early startup, so
+    # this line used to vanish to the stdout console (invisible in the logs —
+    # which is exactly why the ">18mo stale" churn went undiagnosed across 136
+    # daemon starts). Best-effort append it to data/activity.log in the standard
+    # "[iso] msg" format so the event is AUDITABLE from disk. Never raises.
+    try:
+        import tm_paths
+        from datetime import datetime as _dt
+        _lp = tm_paths.get_data_dir() / "activity.log"
+        with open(_lp, 'a', encoding='utf-8') as _f:
+            _f.write(f"[{_dt.now().isoformat(timespec='seconds')}] {msg}\n")
     except Exception:
         pass
     try:

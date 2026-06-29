@@ -285,6 +285,19 @@ def yahoo_adapter(profile, data_type: str, **kwargs):
             'industry':     info.get('industry') or '',
             'market_cap':   info.get('marketCap'),
             'shares_outstanding': info.get('sharesOutstanding'),
+            # v4.14.6.111 (Tier-2 float): true tradeable float — ALREADY in the
+            # same .info response (no extra fetch), previously discarded. Feeds
+            # the algo's low-float score contribution; None when Yahoo has no
+            # float for the ticker (→ stored NULL → 0 contribution downstream).
+            'float_shares': info.get('floatShares'),
+            # v4.14.6.111 (Tier-3 short interest): squeeze/positioning fields —
+            # ALREADY in the same .info response, previously discarded. short_
+            # percent_float is the KEY field (short % of float, a FRACTION e.g.
+            # 0.0098); date_short_interest (epoch) drives the staleness/lag
+            # guard (FINRA bi-monthly settlement → can be ~2 weeks stale). None
+            # when absent (→ NULL → 0 contribution downstream, use-if-present).
+            'short_percent_float': info.get('shortPercentOfFloat'),
+            'date_short_interest': info.get('dateShortInterest'),
             # trailingPE preferred; fall back to forwardPE for tickers
             # with no trailing earnings (e.g. recent IPOs, RIG-style
             # loss-makers).
@@ -727,6 +740,11 @@ def _v415_cache_write_fundamentals_yahoo(ticker: str, data: dict) -> None:
         'total_assets': None,
         'total_liabilities': None,
         'shares_outstanding': _i(data.get('shares_outstanding')),
+        # v4.14.6.111 (Tier-2 float): persist the float carried in `data`.
+        'float_shares': _i(data.get('float_shares')),
+        # v4.14.6.111 (Tier-3 short interest): persist the short fields in `data`.
+        'short_percent_float': _f(data.get('short_percent_float')),
+        'date_short_interest': _i(data.get('date_short_interest')),
         'source': 'yahoo',
     }
 

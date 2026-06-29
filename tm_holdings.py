@@ -1934,8 +1934,9 @@ class HoldingsWindow:
     def _build_history_fn():
         """v4.13.15: Returns a callable that fetches daily OHLC history
         for a ticker, formatted for PredictionsLog.check_outcomes.
-        Used so outcome evaluation can be WICK-AWARE - only daily
-        closes count, not intraday wicks. Returns None on failure.
+        Used so outcome evaluation is CLOSE-ONLY (wick-guarded) - only
+        daily closes count, intraday wicks are deliberately ignored.
+        Returns None on failure.
         """
         def _fetch(ticker: str):
             try:
@@ -4817,7 +4818,15 @@ class HoldingsWindow:
         # the per-path honest-numbers table below. Previously it divided
         # by ALL closures (incl. superseded/contradicted/expired/sold),
         # which showed ~6% instead of the true ~38%.
-        if overall.get('n_decided', 0) > 0:
+        # v4.14.6.111: with the algo funnel excluded from the headline (it's a
+        # tier-1 screen, not a reasoned predictor), the reasoned-AI decided sample
+        # is small and long-horizon, so it sits mostly OPEN. Below a meaningful
+        # bar (5+ decided, matching the per-model card's threshold) show an honest
+        # "building track record" message instead of a noisy 2-of-3 rate. This
+        # sparse state is the CORRECT state for a young long-horizon system.
+        _MEANINGFUL_MIN_DECIDED = 5
+        _nd = overall.get('n_decided', 0)
+        if _nd >= _MEANINGFUL_MIN_DECIDED:
             acc = overall['target_rate_pct']
             # Color-code: green if >50%, amber if 30-50, red if <30
             if acc >= 50:
@@ -4833,9 +4842,12 @@ class HoldingsWindow:
         else:
             num_color = c['dim']
             big_text = "—"
-            sub_text = (f"{overall['open']} open, {overall['closed']} resolved "
-                        f"but none reached target/stop yet — accuracy "
-                        f"populates as predictions hit their target or stop")
+            _open_n = overall.get('open', 0)
+            _decided_tail = (f"{_nd} decided so far" if _nd > 0
+                             else "none decided yet")
+            sub_text = ("Building track record — accuracy populates as the AI's "
+                        "longer-horizon calls resolve. "
+                        f"({_open_n} reasoned calls still open, {_decided_tail})")
 
         tk.Label(headline_card,
                  text="AI PREDICTION ACCURACY (paper-trade auto-detected, not real trades)",
@@ -5187,7 +5199,8 @@ class HoldingsWindow:
             stats_hdr.pack(side='top', fill='x', pady=(0, 2))
             tk.Label(stats_hdr,
                      text=("MODEL                TOTAL  BUY/HOLD/AVOID/NO-CALL"
-                           "       OPEN  CLOSED  TARGET-HIT  STOP-HIT"),
+                           "       OPEN  CLOSED  TARGET-HIT  STOP-HIT"
+                           "   AVOID-OK   HOLD-OK"),
                      bg=c['card'], fg=c['dim'],
                      font=('Consolas', 7, 'bold')
                      ).pack(side='left')
@@ -5196,8 +5209,16 @@ class HoldingsWindow:
                 row = tk.Frame(stats_card, bg=c['card'])
                 row.pack(side='top', fill='x', pady=1)
 
-                model_short = (s['model'][:18] + '…') if len(s['model']) > 19 \
-                              else s['model']
+                # v4.14.6.111: relabel the algo row so a reader doesn't compare
+                # its hit-rate apples-to-apples with the reasoned AI models — it's
+                # a tier-1 signal funnel, kept here for comparison only. Data key
+                # stays 'Algorithm'; only the displayed label changes. "Algorithm
+                # (funnel)" is 18 chars — fits the column without truncation.
+                _disp_model = ('Algorithm (funnel)'
+                               if str(s.get('model') or '').strip().lower()
+                               == 'algorithm' else s['model'])
+                model_short = (_disp_model[:18] + '…') if len(_disp_model) > 19 \
+                              else _disp_model
                 tk.Label(row, text=f"  {model_short:20}",
                          bg=c['card'], fg=c['text'],
                          font=('Consolas', 9, 'bold')
@@ -5248,6 +5269,58 @@ class HoldingsWindow:
                          bg=c['card'], fg=sh_color,
                          font=('Consolas', 9)
                          ).pack(side='left')
+
+                # v4.14.6.111 (AVOID axis, Phase 1): SEPARATE metric — "AVOID
+                # correct%" = did the avoided stock fall over 20 trading days
+                # (A1). Distinct column, own decided-count, ≥5 gate ("—" for
+                # thin axes). NEVER merged into the BUY hit-rates above (they
+                # measure different things). .get() defaults so the predictions-
+                # based fallback (no avoid fields) degrades to "—".
+                _av_dec = int(s.get('avoid_decided', 0) or 0)
+                if s.get('avoid_has_meaningful') and _av_dec >= 5:
+                    _av_str = (f"  {s.get('avoid_correct', 0)}/{_av_dec} "
+                               f"({s.get('avoid_correct_pct', 0.0):.0f}%)")
+                    _av_color = (c['green'] if s.get('avoid_correct_pct', 0)
+                                 >= 50 else c['amber'])
+                else:
+                    _av_str = "   — "
+                    _av_color = c['dim']
+                tk.Label(row, text=_av_str,
+                         bg=c['card'], fg=_av_color,
+                         font=('Consolas', 9)
+                         ).pack(side='left')
+
+                # v4.14.6.111 (HOLD axis, Phase 2): SEPARATE metric — "HOLD-OK"
+                # = held-or-rose % over 20td (tolerant; owned positions; scored
+                # only for post-redefinition votes). ≥5-decided gate; "—" while
+                # only pre-rule (old neutral) HOLDs exist. .get() defaults so the
+                # predictions fallback (no hold fields) degrades to "—".
+                _h_dec = int(s.get('hold_decided', 0) or 0)
+                if s.get('hold_has_meaningful') and _h_dec >= 5:
+                    _h_str = (f"  {s.get('hold_correct', 0)}/{_h_dec} "
+                              f"({s.get('hold_correct_pct', 0.0):.0f}%)")
+                    _h_color = (c['green'] if s.get('hold_correct_pct', 0)
+                                >= 50 else c['amber'])
+                else:
+                    _h_str = "   — "
+                    _h_color = c['dim']
+                tk.Label(row, text=_h_str,
+                         bg=c['card'], fg=_h_color,
+                         font=('Consolas', 9)
+                         ).pack(side='left')
+
+            # v4.14.6.111: clarify the algo row is a non-reasoning baseline so its
+            # hit-rate isn't read as peer to the reasoned models. Shown for
+            # comparison only; it is excluded from the headline accuracy above.
+            if any(str(s.get('model') or '').strip().lower() == 'algorithm'
+                   for s in model_stats):
+                tk.Label(stats_card,
+                         text=("  funnel = tier-1 signal screen (no reasoning) — "
+                               "shown for comparison only; excluded from the "
+                               "accuracy headline above"),
+                         bg=c['card'], fg=c['dim'],
+                         font=('Segoe UI', 8, 'italic')
+                         ).pack(side='top', anchor='w', pady=(4, 0))
 
         # v4.13.62: yield after PER-MODEL STATS card
         try:

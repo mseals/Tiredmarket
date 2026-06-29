@@ -386,8 +386,27 @@ def _resolve_provider_cap(provider: dict,
                 _mdl = None
         learned = (_tpl.get_learned_cap(fam, model=_mdl)
                    if _mdl else _tpl.get_learned_cap(fam))
-        if learned and learned > 0:
-            return int(learned)
+        # v4.14.6.111-token-learner (Part B): also consider a header-sourced
+        # learned TOKEN-day budget, RE-DERIVED through the CURRENT avg tokens/
+        # call (so it tracks call-size growth — the never-stale fix — instead of
+        # a frozen request count from a token-429). The effective learned cap is
+        # the MIN of the request cap and the token-derived cap (equal-or-tighter;
+        # a token budget can only ADD a constraint, never loosen the request
+        # cap). This makes the learner AGREE with R1's token math instead of
+        # overriding it with a stale request count.
+        tok_budget = (_tpl.get_learned_token_budget_day(fam, model=_mdl)
+                      if _mdl else _tpl.get_learned_token_budget_day(fam))
+        tok_derived = None
+        if tok_budget and tok_budget > 0:
+            try:
+                tok_derived = max(1, int(tok_budget)
+                                  // _avg_total_tokens_for(fam))
+            except Exception:
+                tok_derived = None
+        _candidates = [c for c in (learned, tok_derived)
+                       if c and c > 0]
+        if _candidates:
+            return min(_candidates)
     except Exception:
         pass
 
@@ -803,8 +822,14 @@ def _url_detected_cap(ep: str) -> Optional[int]:
         if GITHUB_PATTERN in ep:
             return 40      # source: GitHub Models free = 50 RPD
         if CEREBRAS_PATTERN in ep:
-            return 1500    # source: Cerebras = 1M tok/day, 30 RPM,
-            #                no fixed RPD (~500 calls/day at 2K/call)
+            # R1 (token-pacing): Cerebras is TOKEN-bound (1M tok/day). The old
+            # fixed 1500 ignored the token budget — at today's ~2.4K tok/call
+            # that's ~3.6M tok/day, ~3.6x over the 1M budget (it 429'd on tokens
+            # at ~420 calls and the learner re-discovered it daily). Derive the
+            # day-cap from budget ÷ avg-tokens/call instead. EQUAL-OR-TIGHTER:
+            # min(legacy 1500, token-derived ~420). Auto-shrinks via R3.
+            _bud = _PROVIDER_DAILY_TOKEN_BUDGET.get('cerebras', 1_000_000)
+            return min(1500, max(1, _bud // _avg_total_tokens_for('cerebras')))
         if GROQ_PATTERN in ep:
             return 14000   # source: Groq Llama-3.1-8B = 14,400 RPD
         if GEMINI_PATTERN in ep:
@@ -838,6 +863,61 @@ _RPM_SEED = {
     'openai':    60,   # paid
 }
 _RPM_SAFETY = 1  # don't ride the exact edge — skip when remaining <= SAFETY
+
+# ── v4.14.6.111-token-pacing (R1+R2+R3): pace on TOKENS, not just calls ──
+# The minute gate + day-caps were REQUEST-count only, blind to the TOKEN budgets
+# the free tiers actually enforce (Groq TPM, Cerebras 1M tok/day). As prompts
+# grew (~2.4K tok/call now), token caps tripped long before the request caps the
+# gate watched. These derive an EQUAL-OR-TIGHTER ceiling from each provider's
+# token budget ÷ a LIVE rolling avg tokens/call (R3), so caps auto-shrink when
+# calls grow and never go stale again. Every use is min(existing, derived) and
+# fail-open — the gate can only get tighter, never more permissive; the learner
+# still wins on any real 429. VALUES are documented free-tier estimates —
+# TUNABLE; if a provider is over-throttled, bump its number here.
+_PROVIDER_TPM = {            # tokens/min (free tier). Fams ABSENT = RPM-only.
+    'groq':     6000,        # Groq free 70b is TPM-bound (~6K) — the tight one
+    'cerebras': 60000,       # ~1M/day spread; the DAY budget below is binding
+}
+_PROVIDER_DAILY_TOKEN_BUDGET = {   # tokens/day (free tier)
+    'cerebras': 1_000_000,
+}
+_AVG_TOKENS_FALLBACK = 2400        # measured median→p90 TOTAL tok/call (warm-up
+                                   # + a conservative FLOOR so a small rolling
+                                   # avg can never OVER-permit)
+_COMPLETION_TOKENS_MARGIN = 500    # input counts toward TPM; add expected output
+_AVG_TOKENS_EMA_ALPHA = 0.2
+_avg_prompt_tokens_ema: dict = {}  # fam -> EMA of prompt est_tokens (R3)
+
+
+def _record_prompt_tokens(fam, est_tokens) -> None:
+    """R3: update the per-family rolling EMA of prompt est_tokens. Fed by the
+    context-guard (which already estimates tokens for every dispatch). Never
+    raises."""
+    try:
+        if not fam or not est_tokens or est_tokens <= 0:
+            return
+        cur = _avg_prompt_tokens_ema.get(fam)
+        _avg_prompt_tokens_ema[fam] = (
+            float(est_tokens) if cur is None
+            else _AVG_TOKENS_EMA_ALPHA * est_tokens
+            + (1 - _AVG_TOKENS_EMA_ALPHA) * cur)
+    except Exception:
+        pass
+
+
+def _avg_total_tokens_for(fam) -> int:
+    """R3: rolling avg TOTAL tokens/call (prompt EMA + completion margin),
+    FLOORED at _AVG_TOKENS_FALLBACK so the divisor is never too small (a small
+    divisor would OVER-permit). Grows above the floor as prompts grow → caps
+    auto-shrink. Warm-up (no EMA yet) → the fallback. Never raises."""
+    try:
+        ema = _avg_prompt_tokens_ema.get(fam)
+        if ema:
+            return max(int(ema + _COMPLETION_TOKENS_MARGIN),
+                       _AVG_TOKENS_FALLBACK)
+    except Exception:
+        pass
+    return _AVG_TOKENS_FALLBACK
 
 
 # v4.14.6.52-cerebras-context-guard: hard context-window ceilings per
@@ -912,6 +992,30 @@ def _minute_gate_check(provider: dict, fam: str, model,
             rpm_ceiling = None
         if rpm_ceiling is None:
             rpm_ceiling = _RPM_SEED.get(fam)
+        # R2 (token-pacing): for a TPM-bound family, tighten the per-minute call
+        # ceiling to TPM ÷ avg-tokens/call. EQUAL-OR-TIGHTER (min) — only ever
+        # LOWERS the ceiling, never raises it; fail-open. e.g. Groq ~6K TPM ÷
+        # ~2.4K ≈ 2-3 calls/min vs the seeded 30 — the "built for small calls"
+        # fix. Auto-tracks call growth via the R3 rolling avg.
+        try:
+            # v4.14.6.111-token-learner (Part C): PREFER the provider-reported
+            # TPM (header-sourced, ground truth) over the hardcoded seed — so
+            # the 8 providers without a hardcoded entry AUTO-FILL once they
+            # return a token header, changing limits track automatically, and
+            # Groq's possibly-low 6K self-corrects to its real header value.
+            # Falls back to the hardcoded _PROVIDER_TPM, else RPM-only.
+            _tpm = None
+            try:
+                _tpm = _tpl_rpm.get_learned_tpm(fam, model=model)
+            except Exception:
+                _tpm = None
+            if not _tpm:
+                _tpm = _PROVIDER_TPM.get(fam)
+            if _tpm and rpm_ceiling:
+                _tpm_ceiling = max(1, int(_tpm / _avg_total_tokens_for(fam)))
+                rpm_ceiling = min(rpm_ceiling, _tpm_ceiling)
+        except Exception:
+            pass
         if rpm_ceiling:
             try:
                 used = _tpl_rpm.minute_calls_in_window(
@@ -947,10 +1051,16 @@ def _context_guard_check(provider: dict, fam: str,
     try:
         if not estimated_chars or estimated_chars <= 0:
             return None  # no estimate available -> fail-open, send
+        est_tokens = int(estimated_chars / _CHAR_PER_TOKEN_DIVISOR)
+        # R3 (token-pacing): record this dispatch's prompt tokens into the
+        # per-family rolling avg that R1/R2 consume. Done for EVERY fam (before
+        # the context-cap early-return) so token-budgeted providers like Groq —
+        # which may have no context-cap entry — still feed the avg. Side-effect
+        # only; never affects the guard's pass/skip decision.
+        _record_prompt_tokens(fam, est_tokens)
         cap_tokens = _PROVIDER_MAX_CONTEXT_TOKENS.get(fam)
         if not cap_tokens:
             return None  # no cap configured for this family -> unlimited
-        est_tokens = int(estimated_chars / _CHAR_PER_TOKEN_DIVISOR)
         if est_tokens <= cap_tokens:
             return None  # fits
         # Skip this provider for THIS prompt; existing backfill picks
@@ -1324,7 +1434,20 @@ def _classify_and_record_quota(state, provider_id, canonical_model,
                                 _mdl = canonical_model
                         except Exception:
                             _mdl = None
-                    if _mdl:
+                    # v4.14.6.111-token-learner (Part B): route by RESOURCE axis.
+                    # A TOKEN-axis daily 429 must NOT tighten the persistent
+                    # REQUEST daily_cap (that's the wrong axis — a frozen request
+                    # count that drifts when call sizes change). The correct-axis
+                    # token budget is learned from the provider's token headers
+                    # (Part C) and consumed by _resolve_provider_cap. The
+                    # in-memory observed_max_per_day backstop above already
+                    # tightened (request-based, equal-or-tighter), so skipping
+                    # the persistent request write here can only ever stay
+                    # equal-or-tighter, never loosen. request/unknown axis →
+                    # tighten daily_cap exactly as before.
+                    if cls.get('resource') == 'tokens':
+                        pass  # token-429 → learned via headers, not daily_cap
+                    elif _mdl:
                         _tpl.note_daily_429(fam, trip, model=_mdl)
                     else:
                         _tpl.note_daily_429(fam, trip)

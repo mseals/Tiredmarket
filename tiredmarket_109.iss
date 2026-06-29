@@ -14,10 +14,10 @@
 ; ============================================================================
 
 #define MyAppName "Tired Market"
-#define MyAppVersion "4.14.6.109"
+#define MyAppVersion "4.14.6.112"
 #define MyAppPublisher "mseals"
 #define MyAppExeName "TiredMarket.exe"
-#define SourceDir "D:\TiredMarket\dist\TiredMarket-portable-v4.14.6.109"
+#define SourceDir "D:\TiredMarket\dist\TiredMarket-portable-v4.14.6.112"
 
 [Setup]
 ; Stable AppId so future versions upgrade-in-place instead of installing twice.

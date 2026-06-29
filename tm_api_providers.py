@@ -64,21 +64,23 @@ PRESETS = {
         'name': 'Groq',
         'format': 'openai_compat',
         'default_endpoint': 'https://api.groq.com/openai/v1/chat/completions',
-        'default_model': 'llama-3.1-8b-instant',
+        'default_model': 'openai/gpt-oss-20b',
         'sample_models': [
-            'llama-3.1-8b-instant',  # Highest quota: 14,400 RPD
-            'llama-3.3-70b-versatile',  # 1,000 RPD
-            'mixtral-8x7b-32768',
-            'gemma2-9b-it',
+            # Groq deprecated llama-3.3-70b-versatile / llama-3.1-8b-instant /
+            # qwen3-32b / llama-4-scout (announced 2026-06-17). Seeded with the
+            # survivors so the app is correct before the first add-enabled
+            # discovery sync. Exact IDs should be re-confirmed against the live
+            # Groq /v1/models for the account; discovery self-corrects them.
+            'openai/gpt-oss-20b',    # higher-throughput survivor
+            'openai/gpt-oss-120b',   # most capable survivor
+            'qwen/qwen3.6-27b',
         ],
-        'note': ('Free tier with model-dependent quotas. Default model '
-                 '(llama-3.1-8b-instant) gets 14,400 RPD; larger models '
-                 'like 70B get 1,000 RPD.'),
+        'note': ('Free tier with model-dependent quotas. Survivor models '
+                 'after the 2026-06-17 Groq deprecation (gpt-oss-20b/120b, '
+                 'qwen3.6-27b). Smaller models carry higher RPD.'),
         'signup_url': 'https://console.groq.com/keys',
         # v4.13.58.1: Quota varies dramatically by model (verified
-        # May 2026 against console.groq.com/docs/rate-limits):
-        #   - llama-3.1-8b-instant: 14,400 RPD
-        #   - llama-3.3-70b-versatile: 1,000 RPD
+        # May 2026 against console.groq.com/docs/rate-limits).
         # Defaulting to 5000 splits the difference. The smart router's
         # observed-quota learning will tune this for the actual
         # configured model after first 429.
@@ -310,9 +312,11 @@ PRESETS = {
 # consensus diversity only. Any preset not named here defaults to its
 # existing `sample_models` so the dialog still has suggestions.
 _RECOMMENDED_MODELS_V414ROT = {
-    'groq': ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
-             'mixtral-8x7b-32768', 'gemma2-9b-it',
-             'deepseek-r1-distill-llama-70b'],
+    # Groq 2026-06-17 deprecation: 70b-versatile / 8b-instant / qwen3-32b /
+    # llama-4-scout removed; survivors seeded. Discovery (add-and-remove) keeps
+    # this current going forward.
+    'groq': ['openai/gpt-oss-120b', 'openai/gpt-oss-20b',
+             'qwen/qwen3.6-27b'],
     'google': ['gemini-2.5-flash-lite', 'gemini-2.5-flash',
                'gemini-2.5-pro'],
     'mistral': ['mistral-small-latest', 'mistral-medium-latest',

@@ -98,9 +98,11 @@ KNOWN_PROVIDERS: list[ProviderInfo] = [
             'Free: 30 RPM, 14,400 RPD on small models, 1,000 RPD on '
             '70B+ models. No credit card. Very fast inference.'),
         sample_models=[
-            'llama-3.1-8b-instant',
-            'llama-3.3-70b-versatile',
-            'mixtral-8x7b-32768',
+            # Survivors after Groq's 2026-06-17 deprecation (old llama/qwen3-32b/
+            # llama-4-scout ids removed). Fallback only when the live probe fails.
+            'openai/gpt-oss-20b',
+            'openai/gpt-oss-120b',
+            'qwen/qwen3.6-27b',
         ],
     ),
     ProviderInfo(
@@ -1264,54 +1266,321 @@ def prune_model_from_config(provider_id, model_str, data_dir=None,
         return False
 
 
+# ════════════════════════════════════════════════════════════════════════
+# v4.14.6.111 — self-healing ADD-path (text-capability filtered)
+# ════════════════════════════════════════════════════════════════════════
+# Discovery becomes ADD-and-remove: prune dead models (above, unchanged) AND
+# adopt newly-offered models that can take a text prompt and return text. So a
+# vendor deprecation (Groq 2026-06-17) self-heals — dead ids pruned, survivors
+# adopted. A model is ADDED only if it passes the text-capability filter:
+#   TAG-FIRST  — use the provider's modality/type field (no API call).
+#   PROBE-FALLBACK — for untagged, never-seen models, ONE tiny "reply OK"
+#                    completion. PASS = non-empty text reply; timeout/empty/
+#                    error/non-text = did NOT pass (PATIENT: a later run
+#                    re-probes — never a removal, never a requeue of real work).
+# Audio/TTS/embedding/vision/moderation models are the WRONG TYPE and must never
+# enter the voting pool. Probe results cache by (provider, model) so a new model
+# is probed at most once per run (pass cached permanently; fail re-probed later).
+
+# Type/modality tokens that mark a model the WRONG type for text voting.
+_NONTEXT_TYPE_TOKENS = (
+    'audio', 'speech', 'tts', 'whisper', 'transcrib', 'voice',
+    'embed', 'rerank', 'vision', 'image', 'img', 'video', 'diffusion',
+    'dall', 'imagen', 'moderation', 'guard', 'safety',
+)
+_TEXT_TYPE_TOKENS = ('chat', 'text', 'completion', 'language', 'llm', 'instruct')
+# Model-ID substrings that betray a non-text model when no type tag is present.
+_NONTEXT_ID_TOKENS = (
+    'whisper', 'tts', 'embed', 'rerank', 'guard', 'vision', 'image',
+    'dall-e', 'dalle', 'stable-diffusion', 'sdxl', 'imagen', 'moderation',
+    'playai-tts', 'distil-whisper',
+)
+
+
+def _extract_models_meta(data) -> list:
+    """Like _extract_models but PRESERVES each entry's type/modality tag.
+    Returns [{'id': str, 'type': str}] (type='' when the API gives no tag)."""
+    candidates = []
+    if isinstance(data, dict):
+        for key in ('data', 'models'):
+            if key in data and isinstance(data[key], list):
+                candidates = data[key]
+                break
+    elif isinstance(data, list):
+        candidates = data
+    out, seen = [], set()
+    for item in candidates:
+        mid, mtype = '', ''
+        if isinstance(item, str):
+            mid = item
+        elif isinstance(item, dict):
+            for k in ('id', 'name', 'model_id', 'modelId'):
+                if isinstance(item.get(k), str):
+                    mid = item[k]
+                    break
+            for tk in ('type', 'object', 'modality', 'category', 'task',
+                       'model_type', 'capabilities', 'supported_modalities',
+                       'architecture'):
+                v = item.get(tk)
+                if v:
+                    mtype = (mtype + ' ' + str(v)).strip()
+        mid = (mid or '').strip()
+        if mid and mid not in seen:
+            seen.add(mid)
+            out.append({'id': mid, 'type': mtype.lower()})
+    return out
+
+
+def discover_models_meta(provider, api_key='', timeout=8.0) -> list:
+    """discover_models + type tags. Returns [{'id','type'}]; [] on failure
+    (NOT sample_models — callers must never 'add' a fabricated fallback)."""
+    try:
+        if not getattr(provider, 'models_endpoint', ''):
+            return []
+        url = provider.models_endpoint
+        headers = {}
+        if provider.auth_style == 'bearer' and api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        elif provider.auth_style == 'x-api-key' and api_key:
+            headers[provider.auth_param_name or 'x-api-key'] = api_key
+        elif provider.auth_style == 'query-param' and api_key:
+            param = provider.auth_param_name or 'key'
+            sep = '&' if '?' in url else '?'
+            url = f"{url}{sep}{param}={api_key}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8', errors='replace'))
+        return _extract_models_meta(data)
+    except Exception:
+        return []
+
+
+def _classify_model_type(meta: dict) -> str:
+    """'text' / 'nontext' / 'unknown' from a meta entry (tag-first; id-token
+    fallback marks obvious non-text). 'unknown' -> caller probes."""
+    try:
+        t = str((meta or {}).get('type') or '').lower()
+        mid = str((meta or {}).get('id') or '').lower()
+        if t:
+            if any(tok in t for tok in _NONTEXT_TYPE_TOKENS):
+                return 'nontext'
+            if any(tok in t for tok in _TEXT_TYPE_TOKENS):
+                return 'text'
+        if any(tok in mid for tok in _NONTEXT_ID_TOKENS):
+            return 'nontext'
+        return 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def _textcap_cache_path(data_dir=None):
+    from pathlib import Path as _P
+    if data_dir is not None:
+        return _P(data_dir) / 'model_textcap_cache.json'
+    try:
+        return (__import__('tm_paths').get_data_dir()
+                / 'model_textcap_cache.json')
+    except Exception:
+        return _P('data') / 'model_textcap_cache.json'
+
+
+def _load_textcap_cache(data_dir=None) -> dict:
+    try:
+        p = _textcap_cache_path(data_dir)
+        if p.exists():
+            d = json.loads(p.read_text(encoding='utf-8'))
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_textcap_cache(cache, data_dir=None):
+    try:
+        p = _textcap_cache_path(data_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(cache, indent=2), encoding='utf-8')
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _probe_text_capability(provider, api_key, model_id, timeout=6.0) -> bool:
+    """ONE tiny chat completion ('Reply with the word OK'). PASS = non-empty
+    text reply. Timeout/empty/error/non-text = did NOT pass (patient: re-probe
+    on a later run). openai-compat only; other formats -> not-pass (defer)."""
+    try:
+        if str(getattr(provider, 'api_format', '') or '') not in (
+                'openai_compat', ''):
+            return False
+        ep = getattr(provider, 'chat_endpoint', '') or ''
+        if not ep or not model_id:
+            return False
+        headers = {'Content-Type': 'application/json'}
+        if getattr(provider, 'auth_style', '') == 'bearer' and api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        elif getattr(provider, 'auth_style', '') == 'x-api-key' and api_key:
+            headers[getattr(provider, 'auth_param_name', None)
+                    or 'x-api-key'] = api_key
+        body = json.dumps({
+            'model': model_id,
+            'messages': [{'role': 'user', 'content': 'Reply with the word OK.'}],
+            'max_tokens': 5, 'temperature': 0,
+        }).encode('utf-8')
+        req = urllib.request.Request(ep, data=body, headers=headers,
+                                     method='POST')
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8', errors='replace'))
+        txt = ''
+        ch = (data or {}).get('choices')
+        if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+            msg = ch[0].get('message')
+            if isinstance(msg, dict):
+                txt = str(msg.get('content') or '')
+            if not txt:
+                txt = str(ch[0].get('text') or '')
+        return bool(txt.strip())
+    except Exception:
+        return False
+
+
+def _add_new_text_models(provider_cfg, info, live_meta, api_key,
+                         data_dir=None, log_fn=None) -> list:
+    """Return NEW model ids (not already in the provider's pool) from the live
+    catalog that pass the text-capability filter. Tag-first, probe-fallback for
+    untagged never-seen models (cached). NEVER removes; a non-pass just defers
+    adoption to a later run. Never raises."""
+    try:
+        existing = provider_cfg.get('models')
+        existing_set = {str(m).strip().lower() for m in existing
+                        if str(m).strip()} if isinstance(
+                            existing, (list, tuple)) else set()
+        cur_model = str(provider_cfg.get('model') or '').strip().lower()
+        if cur_model:
+            existing_set.add(cur_model)
+        canon = str(provider_cfg.get('preset')
+                    or provider_cfg.get('name') or '').strip().lower()
+        cache = _load_textcap_cache(data_dir)
+        cache_dirty = False
+        added = []
+        for meta in (live_meta or []):
+            mid = str((meta or {}).get('id') or '').strip()
+            if not mid or mid.lower() in existing_set:
+                continue
+            ck = f"{canon}::{mid.lower()}"
+            cached = cache.get(ck)
+            if isinstance(cached, dict) and cached.get('status') == 'pass':
+                added.append(mid)
+                existing_set.add(mid.lower())
+                continue
+            kind = _classify_model_type(meta)
+            if kind == 'nontext':
+                continue                      # wrong type — never add
+            if kind == 'text':
+                cache[ck] = {'status': 'pass', 'via': 'tag'}
+                cache_dirty = True
+                added.append(mid)
+                existing_set.add(mid.lower())
+                continue
+            # unknown -> probe-fallback (only possible with a key + provider info)
+            if not (api_key and info is not None):
+                continue
+            if _probe_text_capability(info, api_key, mid):
+                cache[ck] = {'status': 'pass', 'via': 'probe'}
+                added.append(mid)
+                existing_set.add(mid.lower())
+            else:
+                cache[ck] = {'status': 'fail', 'via': 'probe'}  # re-probe later
+            cache_dirty = True
+        if cache_dirty:
+            _save_textcap_cache(cache, data_dir)
+        if added and log_fn:
+            for m in added:
+                try:
+                    log_fn(f"[model-scan] added {m} to "
+                           f"{provider_cfg.get('name') or canon} "
+                           f"(text-capable, live catalog)", 'muted')
+                except Exception:
+                    pass
+        return added
+    except Exception:
+        return []
+
+
 def validate_and_prune_models(discover_fn=None, data_dir=None, log_fn=None):
-    """STARTUP: for each enabled provider with a multi-entry models[], probe
-    its live model list and prune dead entries. discover_fn(provider_cfg) ->
-    list[str] | None is injectable for tests; default uses discover_models via
-    lookup(). None/empty probe -> skip (no prune). Returns count pruned."""
+    """STARTUP: sync each enabled provider's rotation models[] to its LIVE
+    catalog — PRUNE dead entries AND ADD newly-offered text-capable models
+    (v4.14.6.111 add-path; tag-first + probe-fallback). discover_fn(provider_cfg)
+    -> list[str]|None is injectable for tests (prune-only, preserves prior
+    behavior — no add). None/empty live -> skip (no prune, no add). Returns the
+    count PRUNED (adds are logged via log_fn). Never raises."""
     try:
         raw, provs, path = _load_providers_file(data_dir)
         if not provs:
             return 0
-
-        def _default_discover(pcfg):
-            try:
-                info = lookup(str(pcfg.get('preset') or pcfg.get('name') or ''))
-                key = (pcfg.get('api_key') or pcfg.get('key') or '')
-                if info is None or not key:
-                    return None
-                return discover_models(info, key)
-            except Exception:
-                return None
-
-        df = discover_fn or _default_discover
         total = 0
         changed = False
         for p in provs:
             if not isinstance(p, dict) or not p.get('enabled'):
                 continue
             ms = p.get('models')
-            if not isinstance(ms, (list, tuple)) or len(ms) <= 1:
-                continue
+            ms = list(ms) if isinstance(ms, (list, tuple)) else []
+            key = (p.get('api_key') or p.get('key') or '')
+            info = None
             try:
-                live = df(p)
+                info = lookup(str(p.get('preset') or p.get('name') or ''))
             except Exception:
-                live = None
+                info = None
+            # Live catalog: injected string list (tests, prune-only) or meta.
+            if discover_fn is not None:
+                try:
+                    _ids = discover_fn(p) or []
+                except Exception:
+                    _ids = []
+                live_meta = [{'id': str(x), 'type': ''} for x in _ids]
+            elif info is not None and key:
+                live_meta = discover_models_meta(info, key)
+            else:
+                live_meta = []
+            live = [m['id'] for m in live_meta]
             if not live:
                 continue
-            res = reconcile_rotation_models(ms, live)
-            if res['pruned']:
-                p['models'] = res['kept'] or list(ms)  # never strand to empty
-                changed = True
-                total += len(res['pruned'])
-                if log_fn:
-                    for m in res['pruned']:
-                        try:
-                            log_fn(f"[model-scan] pruned {m} from "
-                                   f"{p.get('name') or p.get('id')} "
-                                   f"(not in live model list)", 'amber')
-                        except Exception:
-                            pass
+            # ── PRUNE (unchanged: only multi-entry lists, failed probe never
+            #    prunes — guaranteed by the `if not live: continue` above) ──
+            if len(ms) > 1:
+                res = reconcile_rotation_models(ms, live)
+                if res['pruned']:
+                    p['models'] = res['kept'] or list(ms)  # never strand empty
+                    ms = p['models']
+                    changed = True
+                    total += len(res['pruned'])
+                    if log_fn:
+                        for m in res['pruned']:
+                            try:
+                                log_fn(f"[model-scan] pruned {m} from "
+                                       f"{p.get('name') or p.get('id')} "
+                                       f"(not in live model list)", 'amber')
+                            except Exception:
+                                pass
+            # ── ADD (v4.14.6.111): adopt live text-capable models not in our
+            #    pool. Real (meta) path only; the injected-string test path
+            #    stays prune-only so existing tests are byte-identical. ──
+            if discover_fn is None:
+                try:
+                    added = _add_new_text_models(
+                        p, info, live_meta, key,
+                        data_dir=data_dir, log_fn=log_fn)
+                    if added:
+                        cur = p.get('models')
+                        cur = list(cur) if isinstance(
+                            cur, (list, tuple)) else []
+                        low = {str(x).strip().lower() for x in cur}
+                        p['models'] = cur + [a for a in added
+                                             if a.lower() not in low]
+                        changed = True
+                except Exception:
+                    pass
         if changed:
             _save_providers_file(raw, path)
         return total

@@ -868,6 +868,18 @@ def _news_block(ticker: str, path: str, cache) -> str:
         title = h.get("title", "") if isinstance(h, dict) else str(h)
         if title:
             lines.append(f"  - {title[:120]}")
+    # v4.14.6.111 (market-neutrality guardrail): read social/political/
+    # regulatory news as MARKET FORCES (demand/revenue/price), NOT as an
+    # occasion to apply the model's own values. Bias-agnostic (names no
+    # position) — threads both failure modes: "judge them" (a boycott IS priced
+    # in) and "only by market impact, never your own values" (no editorializing).
+    # Renders only when news exists (this block early-returns "" otherwise), so
+    # the tokens are paid exactly when a boycott/backlash headline could be
+    # present. Shared block → reaches BOTH board + owned prompts + every model
+    # in a consensus uniformly.
+    lines.append(
+        "  NOTE: Judge social, political and regulatory events only by their "
+        "market impact (demand, revenue, price) — never by your own values.")
     # v4.14.2 stage 7: epistemic humility — flag meaningful per-source
     # directional disagreement so the AI reasons about uncertainty
     # explicitly. Detection consumes the per-article (source,

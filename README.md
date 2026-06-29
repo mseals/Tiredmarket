@@ -14,42 +14,7 @@ AVOID verdicts, and groups them into deployment baskets (ALL IN / A FEW /
 DIVERSIFY) for a budget you set. Educational / research tool — not
 financial advice.
 
-## Download
-
-Most people: grab a ready-to-run build from the [Releases page](https://github.com/mseals/Tiredmarket/releases/latest).
-
-- **All-in-One** (`TiredMarket-AllInOne-v4.14.6.108.exe`) — one file. Download, double-click, it runs. No install, no unzip. Simplest option.
-- **Installer** (`TiredMarket-Setup-v4.14.6.108.exe`) — installs like a normal program (Start Menu shortcut, clean uninstall that can remove your data). Recommended if you want it installed properly.
-- **Portable** (`TiredMarket-portable-v4.14.6.108.zip`) — unzip the folder anywhere and run `TiredMarket.exe` inside. No install. Good for a USB stick.
-- **Source** (for developers) — see "Running from source" below.
-
-> ⚠️ **Unsigned software.** These builds are unsigned, so Windows SmartScreen may say "Windows protected your PC" → click **More info → Run anyway**. Some antivirus may flag it (a false positive — normal for independent free apps built with PyInstaller). The All-in-One single file trips this a bit more than the others.
-
-### System requirements
-- **Windows 10 or 11, 64-bit.** (Not macOS, Linux, older Windows, or 32-bit.)
-- **No GPU needed** — the AI runs in the cloud (bring your own free keys), and the app itself is CPU-only.
-- **Minimum:** ~4 GB RAM, dual-core, ~3 GB free disk.
-- **Recommended:** 8 GB RAM + SSD.
-- The first hour of data-loading is the heavy part (price + news cache fill from scratch); it's light after that. Data grows over time toward ~2 GB.
-- **AI is optional:** bring your own free API keys for smarter, validated picks — or run on the built-in algorithm with no keys at all.
-
-## Where your data lives
-
-Your market cache, predictions, settings, **saved API keys, and
-portfolio** are stored in a `data` folder:
-
-- **Installer:** beside the install (e.g. `C:\TiredMarket\data`).
-- **Portable:** the location you pick on first run.
-- A tiny pointer file in your Windows user profile records that location;
-  the app finds it on every launch. See **Settings → Data Location** in
-  the app.
-- **Uninstalling** (installer) offers to remove the data folder — which
-  includes your saved API keys and portfolio. Choose "No" to keep it for
-  a reinstall.
-- **Multi-user note:** the pointer is per-Windows-user, so a *different*
-  OS user on the same PC is asked for a data location on their first run.
-
-## Running from source
+## Requirements
 
 - Windows + Python 3.10 or newer (`python --version`).
 - One or more free API keys. The simplest start is Groq's free tier
@@ -59,7 +24,7 @@ portfolio** are stored in a `data` folder:
   Zhipu (Z.AI), GitHub Models, Cloudflare Workers AI.
 - Internet (for model calls + Yahoo Finance / Stooq price data).
 
-### Install (from source)
+## Install
 
 1. Clone or download the repo anywhere (folder name and drive don't
    matter — the app resolves its own paths at runtime).

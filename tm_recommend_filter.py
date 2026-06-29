@@ -217,8 +217,9 @@ def _fetch_bars(conn, tickers: list) -> dict:
 
 
 def _raw_momentum(bars: list) -> float:
-    """abs(5-day % close change). Needs >=5 bars (newest-first). <5 bars
-    -> 0.0 (keeps the ticker rankable, just neutral)."""
+    """5-day % close change, up-moves only (fallers clamp to 0). Needs >=5
+    bars (newest-first). <5 bars -> 0.0 (keeps the ticker rankable, just
+    neutral)."""
     if len(bars) < 5:
         return 0.0
     try:
@@ -228,7 +229,8 @@ def _raw_momentum(bars: list) -> float:
         return 0.0
     if close_then <= 0:
         return 0.0
-    return abs((close_now - close_then) / close_then)
+    # v4.14.6.110: directional momentum (no abs; clamp negatives to 0)
+    return max(0.0, (close_now - close_then) / close_then)
 
 
 def _raw_rel_volume(bars: list) -> float:
